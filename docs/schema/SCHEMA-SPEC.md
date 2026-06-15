@@ -20,29 +20,29 @@
 
 ---
 
-### SCHEMA_VERSION = 2（分配给：Ploy / P1a 高亮+颜色）🟢 已发号
+### SCHEMA_VERSION = 2（分配给：Boris / P1b 图片 image node）🟢 已发号·已提 PR #2
+**变更类型**：新增 1 个 node。
+**新增 Node**：
+- `image`（block 或 inline，按前端 NodeView 定）— attrs: `{ attachId, src, alt, title, width, align }`；**红线：src 严禁 base64 入 Y.Doc,只存 attachId + presign 换发的 URL**（backend §3.5）
+**前端 stub**：`SCHEMA_VERSION = 2` + nodes 加 `image`（NodeView 实现 alt/缩放/对齐）
+**后端 stub**：`buildSchema()` nodes 加 `image` + bump `SCHEMA_VERSION = 2`；Agent 写回须认识 image node 否则丢内容
+**依赖**：后端 §3.5 presign 端点 + §3.4 doc_attachment 表
+**关联 PR**：后端 `feat/p1b-attachments-presign`（Boris，PR #2 已提）+ 前端 image NodeView（Ploy，待提）
+
+> 发号调整说明：image 原拟 v3、highlight/color 原拟 v2。因 Boris image PR 先落地、highlight/color 尚未开 PR，按「落 main 线性顺序」改为 image=2、highlight/color=3，避免 Boris 返工。版本号累加：v3 须含 v2 的 image node。
+
+---
+
+### SCHEMA_VERSION = 3（分配给：Ploy / P1a 高亮+颜色）🟢 已发号
 **变更类型**：新增 2 个 mark，无新 node。
 **新增 Marks**：
 - `highlight`（`@tiptap/extension-highlight`，multicolor）— attrs: `{ color }`；parseDOM `<mark>`；toDOM `<mark style="background-color:...">`
 - `textStyle`（`@tiptap/extension-text-style`）— 作为 `color`（`@tiptap/extension-color`）的载体；attrs: `{ color }`；parseDOM/toDOM `<span style="color:...">`
 
 > `@tiptap/extension-color` 不新增 node/mark，仅给 `textStyle` 挂 `color` attr。
-**前端 stub**：`SCHEMA_VERSION = 2` + marks 加 `highlight`、`textStyle`
-**后端 stub**：`buildSchema()` marks 加 `highlight`、`textStyle`（toDOM/parseDOM 与前端字节对齐）+ 新增 `export const SCHEMA_VERSION = 2`
-**关联 PR**：前端 `feat/text-highlight-color`（待提）；后端同步适配 PR（Boris/Ploy 协调）
-
----
-
-### SCHEMA_VERSION = 3（分配给：Boris / P1b 图片）🟢 已发号
-**变更类型**：新增 1 个 node。
-**新增 Node**：
-- `image`（block 或 inline，按前端 NodeView 定）— attrs: `{ attach_id, src, alt, width, align }`；**红线：src 严禁 base64 入 Y.Doc，只存 attach_id + presign 换发的 URL**（backend §3.5）
-**前端 stub**：`SCHEMA_VERSION = 3` + nodes 加 `image`（NodeView 实现 alt/缩放/对齐）
-**后端 stub**：`buildSchema()` nodes 加 `image` + bump `SCHEMA_VERSION = 3`；Agent 写回须认识 image node 否则丢内容
-**依赖**：后端 §3.5 presign 端点 + §3.4 doc_attachment 表
-**关联 PR**：后端 `feat/p1b-attachments-presign`（Boris，待提）+ 前端 image NodeView（Ploy）
-
-> ⚠️ v2 与 v3 并行开发：版本号已分别锁定（Ploy=2 / Boris=3），不会撞号。谁先合并不影响号位，但合并后另一方 rebase 时确认 stub 版本号与本 spec 一致。
+**前端 stub**：`SCHEMA_VERSION = 3` + marks 加 `highlight`、`textStyle`（**累加保留 v2 的 image node**）
+**后端 stub**：`buildSchema()` marks 加 `highlight`、`textStyle`（toDOM/parseDOM 与前端字节对齐，**累加保留 image node**）+ `SCHEMA_VERSION = 3`
+**关联 PR**：前端 `feat/text-highlight-color`（待提）；后端同步适配
 
 ---
 
