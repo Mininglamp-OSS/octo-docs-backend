@@ -46,9 +46,22 @@
 
 ---
 
-### SCHEMA_VERSION = 4+（预留：表格 / callout / toggle）
-- 表格 `table`/`tableRow`/`tableCell`/`tableHeader`（Ploy P1a，工作量最大，单独报号）
+### SCHEMA_VERSION = 4+（预留：callout / toggle）
 - Callout / Toggle（P2，报号时分配）
+
+---
+
+### SCHEMA_VERSION = 4（分配给：Ploy / P1a 表格）🟢 已发号
+**变更类型**：新增表格类 4 个 node。
+**新增 Nodes**（对齐 @tiptap/extension-table 系列 2.27.2 的 ProseMirror schema）：
+- `table`（group block，content `tableRow+`）
+- `tableRow`（content `(tableCell | tableHeader)+`）
+- `tableCell`（attrs: `{ colspan, rowspan, colwidth }`，content block+）
+- `tableHeader`（attrs: `{ colspan, rowspan, colwidth }`，content block+）
+**前端 stub**：`SCHEMA_VERSION = 4` + SCHEMA_NODES 累加 table/tableRow/tableCell/tableHeader（**保留 v2 image + v3 的两个 mark**）
+**后端 stub**：`buildSchema()` nodes 累加表格四 node（parseDOM/toDOM `<table>/<tr>/<td>/<th>` 与前端字节对齐）+ `SCHEMA_VERSION = 4`；Agent 写回须认识表格 node 否则丢内容
+**协作注意**：表格需自研 NodeView 处理协作下单元格选区/列宽（ignoreMutation/stopEvent）防远端光标错位
+**关联 PR**：前端 `feat/table`（待提）+ 后端同步适配 PR
 
 ---
 
