@@ -21,12 +21,14 @@ export const COLLAB_FIELD = 'default'
  * Schema version (§7.1 / §9.2). MUST stay in lockstep with the frontend
  * `@octo/docs-schema` package: the server schema and the Tiptap configuration
  * have to define the same node/mark set, or Y.Doc <-> ProseMirror conversion
- * drops or corrupts content. P1b bumps this from an implied 1 to 2 because the
+ * drops or corrupts content. P1b bumped this from an implied 1 to 2 because the
  * `image` node was added below; the frontend half of the same coordination
  * (P1a) adds the matching Tiptap image extension and bumps the shared package.
- * Bump this whenever the node/mark set changes.
+ * P1a (v3) adds the `highlight` and `textStyle` marks below (SCHEMA-SPEC §3),
+ * carrying the v2 `image` node forward cumulatively. Bump this whenever the
+ * node/mark set changes.
  */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 /**
  * Build the ProseMirror schema used for server-side Y.Doc <-> ProseMirror
@@ -111,6 +113,55 @@ export function buildSchema(): Schema {
       italic: {
         parseDOM: [{ tag: 'em' }, { tag: 'i' }],
         toDOM: () => ['em', 0],
+      },
+      // v3 marks (SCHEMA-SPEC §3, P1a): `highlight` + `textStyle`. Their
+      // toDOM/parseDOM are byte-aligned to the frontend Tiptap output
+      // (@tiptap/extension-highlight multicolor -> `<mark style="background-color:…">`
+      // and @tiptap/extension-text-style + @tiptap/extension-color ->
+      // `<span style="color:…">`) so server-side Agent write-back (§7.1)
+      // round-trips them without loss. The v2 `image` node above is carried
+      // forward cumulatively (v3 ⊇ v2 — additive, nothing removed).
+      highlight: {
+        attrs: { color: { default: null } },
+        parseDOM: [
+          {
+            tag: 'mark',
+            getAttrs: (dom) => {
+              // Structural typing: server build has no DOM lib types.
+              const el = dom as { style?: { backgroundColor?: string } }
+              const color = el.style?.backgroundColor || null
+              return { color }
+            },
+          },
+          {
+            style: 'background-color',
+            getAttrs: (value) => ({ color: (value as string) || null }),
+          },
+        ],
+        toDOM: (mark) => {
+          const color = mark.attrs.color as string | null
+          return ['mark', color ? { style: `background-color: ${color}` } : {}, 0]
+        },
+      },
+      textStyle: {
+        attrs: { color: { default: null } },
+        parseDOM: [
+          {
+            tag: 'span',
+            getAttrs: (dom) => {
+              const el = dom as { style?: { color?: string } }
+              const color = el.style?.color
+              // A plain `<span>` with no color must NOT match, or this mark
+              // would swallow every span on parse.
+              if (!color) return false
+              return { color }
+            },
+          },
+        ],
+        toDOM: (mark) => {
+          const color = mark.attrs.color as string | null
+          return ['span', color ? { style: `color: ${color}` } : {}, 0]
+        },
       },
     },
   })
