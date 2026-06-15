@@ -25,10 +25,61 @@ export const COLLAB_FIELD = 'default'
  * `image` node was added below; the frontend half of the same coordination
  * (P1a) adds the matching Tiptap image extension and bumps the shared package.
  * P1a (v3) adds the `highlight` and `textStyle` marks below (SCHEMA-SPEC §3),
- * carrying the v2 `image` node forward cumulatively. Bump this whenever the
- * node/mark set changes.
+ * carrying the v2 `image` node forward cumulatively. P1a (v4) adds the four
+ * table nodes (`table`/`tableRow`/`tableCell`/`tableHeader`, SCHEMA-SPEC §4),
+ * carrying the v2 image node + v3 marks forward cumulatively. Bump this
+ * whenever the node/mark set changes.
  */
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
+
+/**
+ * Shared attrs + DOM mapping for `tableCell` / `tableHeader` (SCHEMA-SPEC §4).
+ *
+ * Byte-aligned to prosemirror-tables (the schema @tiptap/extension-table
+ * 2.27.2 builds on) so server-side Agent write-back (§7.1) round-trips tables
+ * without loss. `getCellAttrs` mirrors prosemirror-tables' parse helper:
+ * colspan/rowspan come from the matching attributes (default 1), colwidth from
+ * a comma-separated `data-colwidth` attribute parsed to `number[]` (only when
+ * its length matches colspan, else null). `setCellAttrs` mirrors the serialize
+ * helper: colspan/rowspan are emitted only when != 1, and `data-colwidth` only
+ * when colwidth is set.
+ */
+const cellAttrs = {
+  colspan: { default: 1 },
+  rowspan: { default: 1 },
+  colwidth: { default: null as number[] | null },
+}
+
+function getCellAttrs(dom: unknown): {
+  colspan: number
+  rowspan: number
+  colwidth: number[] | null
+} {
+  // Structural typing: server build has no DOM lib types.
+  const el = dom as { getAttribute(name: string): string | null }
+  const widthAttr = el.getAttribute('data-colwidth')
+  const widths =
+    widthAttr && /^\d+(,\d+)*$/.test(widthAttr)
+      ? widthAttr.split(',').map((s) => Number(s))
+      : null
+  const colspan = Number(el.getAttribute('colspan') ?? 1)
+  return {
+    colspan,
+    rowspan: Number(el.getAttribute('rowspan') ?? 1),
+    colwidth: widths && widths.length === colspan ? widths : null,
+  }
+}
+
+function setCellAttrs(node: { attrs: Record<string, unknown> }): Record<string, string> {
+  const colspan = node.attrs.colspan as number
+  const rowspan = node.attrs.rowspan as number
+  const colwidth = node.attrs.colwidth as number[] | null
+  const attrs: Record<string, string> = {}
+  if (colspan !== 1) attrs.colspan = String(colspan)
+  if (rowspan !== 1) attrs.rowspan = String(rowspan)
+  if (colwidth) attrs['data-colwidth'] = colwidth.join(',')
+  return attrs
+}
 
 /**
  * Build the ProseMirror schema used for server-side Y.Doc <-> ProseMirror
@@ -102,6 +153,43 @@ export function buildSchema(): Schema {
           if (align != null) attrs['data-align'] = String(align)
           return ['img', attrs]
         },
+      },
+      // v4 table nodes (SCHEMA-SPEC §4, P1a), byte-aligned to
+      // @tiptap/extension-table 2.27.2 / prosemirror-tables so server-side
+      // Agent write-back (§7.1) round-trips tables without loss. The v2 `image`
+      // node and v3 `highlight`/`textStyle` marks are carried forward
+      // cumulatively (v4 ⊇ v3 ⊇ v2 — additive, nothing removed). `table` is in
+      // group 'block', so it nests under doc's 'block+'; cells hold 'block+',
+      // so paragraphs/headings/images/tables can live inside them.
+      table: {
+        group: 'block',
+        content: 'tableRow+',
+        tableRole: 'table',
+        isolating: true,
+        parseDOM: [{ tag: 'table' }],
+        toDOM: () => ['table', ['tbody', 0]],
+      },
+      tableRow: {
+        content: '(tableCell | tableHeader)+',
+        tableRole: 'row',
+        parseDOM: [{ tag: 'tr' }],
+        toDOM: () => ['tr', 0],
+      },
+      tableCell: {
+        content: 'block+',
+        attrs: cellAttrs,
+        tableRole: 'cell',
+        isolating: true,
+        parseDOM: [{ tag: 'td', getAttrs: getCellAttrs }],
+        toDOM: (node) => ['td', setCellAttrs(node), 0],
+      },
+      tableHeader: {
+        content: 'block+',
+        attrs: cellAttrs,
+        tableRole: 'header_cell',
+        isolating: true,
+        parseDOM: [{ tag: 'th', getAttrs: getCellAttrs }],
+        toDOM: (node) => ['th', setCellAttrs(node), 0],
       },
       text: { group: 'inline' },
     },
