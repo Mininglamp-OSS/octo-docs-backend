@@ -23,7 +23,7 @@
 ### SCHEMA_VERSION = 2（分配给：Boris / P1b 图片 image node）🟢 已发号·已提 PR #2
 **变更类型**：新增 1 个 node。
 **新增 Node**：
-- `image`（block 或 inline，按前端 NodeView 定）— attrs: `{ attachId, src, alt, title, width, align }`；**红线：src 严禁 base64 入 Y.Doc,只存 attachId + presign 换发的 URL**（backend §3.5）
+- `image`（block 或 inline，按前端 NodeView 定）— attrs: `{ attach_id, src, alt, width, align }`（snake_case 对齐 doc_attachment 列名，无 title）；parseDOM/toDOM 用 `data-attach-id`；**红线：src 严禁 base64 入 Y.Doc,只存 attach_id + presign 换发的 URL**（backend §3.5）
 **前端 stub**：`SCHEMA_VERSION = 2` + nodes 加 `image`（NodeView 实现 alt/缩放/对齐）
 **后端 stub**：`buildSchema()` nodes 加 `image` + bump `SCHEMA_VERSION = 2`；Agent 写回须认识 image node 否则丢内容
 **依赖**：后端 §3.5 presign 端点 + §3.4 doc_attachment 表
