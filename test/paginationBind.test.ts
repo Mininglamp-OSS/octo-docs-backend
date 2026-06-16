@@ -44,6 +44,14 @@ describe('paginated repos inline a validated integer LIMIT/OFFSET (no numeric `?
     expect(params).not.toContain(20)
   })
 
+  it('docVersionRepo.listByDoc falls back to the default integer on a fractional limit', async () => {
+    await docVersionRepo.listByDoc('d_1', { limit: 20.5 } as never)
+    // 20.5 is not an integer → falls back to default 20 → fetch limit+1 = 21.
+    expect(lastCall().sql).toMatch(/LIMIT 21\b/)
+    expect(lastCall().sql).not.toMatch(/LIMIT 21\.5/)
+    expect(lastCall().sql).not.toMatch(/LIMIT \?/)
+  })
+
   it('docCommentRepo.listRoots inlines LIMIT and clamps an untrusted value', async () => {
     await docCommentRepo.listRoots('d_1', { includeResolved: true, limit: 50 } as never)
     const { sql, params } = lastCall()

@@ -149,7 +149,7 @@ export const docVersionRepo = {
     docId: string,
     opts: ListVersionsOptions = {},
   ): Promise<{ items: DocVersion[]; nextCursor: number | null }> {
-    const limit = Math.min(100, Math.max(1, opts.limit ?? 20))
+    const limit = Math.min(100, Math.max(1, Number.isInteger(opts.limit) ? opts.limit! : 20))
     const conds = ['doc_id = ?']
     const args: unknown[] = [docId]
     if (!opts.includeAuto) {
