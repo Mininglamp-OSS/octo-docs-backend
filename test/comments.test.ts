@@ -375,6 +375,9 @@ describe('DELETE soft / hard', () => {
     expect(res.statusCode).toBe(200)
     const del = txQ.mock.calls.find((c) => String(c[0]).includes('DELETE FROM doc_comment'))
     expect(del).toBeTruthy()
+    // The cascade is bounded by the authoritative doc_id from the guard.
+    expect(String(del![0])).toContain('AND doc_id = ?')
+    expect(del![1]).toEqual([10, 10, 'd_1'])
   })
 })
 
@@ -592,18 +595,36 @@ describe('docCommentRepo (§3.4)', () => {
       fn({ query: txQ })) as never)
 
     // Root target (id=10): the statement removes the root AND any row whose
-    // parent_id is 10 (its replies) — no orphans left behind.
-    await docCommentRepo.hardDelete(10)
+    // parent_id is 10 (its replies) — no orphans left behind. Scoped to doc_id.
+    await docCommentRepo.hardDelete(10, 'd_1')
     expect(txQ).toHaveBeenCalledTimes(1)
     const sql = String(txQ.mock.calls[0]![0])
     expect(sql).toContain('DELETE FROM doc_comment')
-    expect(sql).toContain('id = ? OR parent_id = ?')
-    expect(txQ.mock.calls[0]![1]).toEqual([10, 10])
+    expect(sql).toContain('(id = ? OR parent_id = ?) AND doc_id = ?')
+    expect(txQ.mock.calls[0]![1]).toEqual([10, 10, 'd_1'])
 
     // Reply target (id=11): same statement; since no row has parent_id = 11
     // (single-level nesting), only the reply row itself is deleted.
     txQ.mockClear()
-    await docCommentRepo.hardDelete(11)
-    expect(txQ.mock.calls[0]![1]).toEqual([11, 11])
+    await docCommentRepo.hardDelete(11, 'd_1')
+    expect(txQ.mock.calls[0]![1]).toEqual([11, 11, 'd_1'])
+  })
+
+  it('hardDelete cascade is doc-scoped: the doc_id bound makes it impossible to touch another doc', async () => {
+    // Defense-in-depth: deleting root A in doc d_1 can only ever match rows in
+    // d_1. The doc_id is part of the WHERE bound and a param — so root B and its
+    // replies living in another doc can never be caught by this cascade, even if
+    // an id collided. The statement is structurally incapable of crossing docs.
+    const txQ = vi.fn(async () => [])
+    vi.mocked(transaction).mockImplementation((async (fn: (tx: unknown) => unknown) =>
+      fn({ query: txQ })) as never)
+
+    await docCommentRepo.hardDelete(10, 'd_1')
+    const sql = String(txQ.mock.calls[0]![0])
+    const params = txQ.mock.calls[0]![1] as unknown[]
+    expect(sql).toContain('AND doc_id = ?')
+    expect(params).toContain('d_1')
+    // No other doc's id appears in the bound — the delete cannot reach d_OTHER.
+    expect(params).not.toContain('d_OTHER')
   })
 })

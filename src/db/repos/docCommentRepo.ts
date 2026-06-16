@@ -205,10 +205,18 @@ export const docCommentRepo = {
    * Runs both the root row and its replies in one transaction. When the target
    * is a reply (its id is never another row's parent_id under single-level
    * nesting), the `parent_id = ?` arm matches nothing and only that one row goes.
+   *
+   * Scoped to `doc_id` as defense-in-depth: a destructive cascade must not rely
+   * solely on the caller having pre-bounded the doc. The `(id = ? OR parent_id
+   * = ?) AND doc_id = ?` form removes the root + its replies within the doc and
+   * can never touch another doc's rows.
    */
-  async hardDelete(id: number): Promise<void> {
+  async hardDelete(id: number, docId: string): Promise<void> {
     await transaction(async (tx) => {
-      await tx.query('DELETE FROM doc_comment WHERE id = ? OR parent_id = ?', [id, id])
+      await tx.query(
+        'DELETE FROM doc_comment WHERE (id = ? OR parent_id = ?) AND doc_id = ?',
+        [id, id, docId],
+      )
     })
   },
 }

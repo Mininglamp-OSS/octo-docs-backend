@@ -283,7 +283,8 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
       res.status(403).json({ error: 'forbidden' })
       return
     }
-    await docCommentRepo.hardDelete(id)
+    // doc_id from the guard is authoritative; scopes the destructive cascade.
+    await docCommentRepo.hardDelete(id, guard.meta.doc_id)
     res.status(200).json({ id })
     return
   }
