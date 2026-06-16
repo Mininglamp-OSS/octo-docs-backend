@@ -138,9 +138,15 @@ export const docCommentRepo = {
       where.push('id > ?')
       args.push(opts.cursor)
     }
+    // `query()` runs on mysql2 `.execute()` (a prepared statement), which rejects
+    // a numeric LIMIT bound via `?` with ER_WRONG_ARGUMENTS (errno 1210) — a
+    // guaranteed 500. `opts.limit` is not clamped at the call site, so coerce and
+    // clamp it to a positive integer in 1..100 here; the result is provably an
+    // integer and is therefore safe to inline directly (no injection surface).
+    const lim = Math.min(100, Math.max(1, Number.isInteger(opts.limit) ? opts.limit : 20))
     const rows = await query<DocCommentRow>(
-      `SELECT * FROM doc_comment WHERE ${where.join(' AND ')} ORDER BY id ASC LIMIT ?`,
-      [...args, opts.limit],
+      `SELECT * FROM doc_comment WHERE ${where.join(' AND ')} ORDER BY id ASC LIMIT ${lim}`,
+      [...args],
     )
     return rows.map(mapRow)
   },

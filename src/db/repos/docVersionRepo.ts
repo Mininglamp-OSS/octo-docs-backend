@@ -161,12 +161,17 @@ export const docVersionRepo = {
       args.push(opts.cursor)
     }
     // Fetch one extra row to decide whether a further page exists.
+    // `query()` runs on mysql2 `.execute()` (a prepared statement), which rejects
+    // a numeric LIMIT/OFFSET bound via `?` with ER_WRONG_ARGUMENTS (errno 1210) —
+    // a guaranteed 500. `limit` is clamped to an integer in 1..100 above, so
+    // `limit + 1` is provably a positive integer and is safe to inline directly.
+    const lim = limit + 1
     const rows = await query<DocVersionMetaRow>(
       `SELECT ${META_COLS} FROM doc_version
        WHERE ${conds.join(' AND ')}
        ORDER BY id DESC
-       LIMIT ?`,
-      [...args, limit + 1],
+       LIMIT ${lim}`,
+      [...args],
     )
     const hasMore = rows.length > limit
     const items = (hasMore ? rows.slice(0, limit) : rows).map(mapRow)
