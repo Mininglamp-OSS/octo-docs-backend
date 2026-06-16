@@ -154,6 +154,21 @@ export const docCommentRepo = {
     return rows.map(mapRow)
   },
 
+  /**
+   * Non-deleted replies for many thread roots in a single query, oldest first.
+   * Lets the list path avoid an N+1 (one listReplies per root); callers group
+   * the flat result by parentId. Returns [] without querying when given no ids.
+   * mysql2 expands the `IN (?)` placeholder from the array argument.
+   */
+  async listRepliesForRoots(rootIds: number[]): Promise<DocComment[]> {
+    if (rootIds.length === 0) return []
+    const rows = await query<DocCommentRow>(
+      'SELECT * FROM doc_comment WHERE parent_id IN (?) AND deleted = 0 ORDER BY id ASC',
+      [rootIds],
+    )
+    return rows.map(mapRow)
+  },
+
   async updateBody(id: number, body: string): Promise<void> {
     await query('UPDATE doc_comment SET body = ? WHERE id = ?', [body, id])
   },

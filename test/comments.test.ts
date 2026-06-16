@@ -156,6 +156,62 @@ describe('POST create (reader can comment)', () => {
     expect(res.statusCode).toBe(400)
   })
 
+  it('rejects a malformed base64 anchor with 400 invalid_anchor (not stored as empty)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorStart: '@@@@', anchorEnd: 'AA==' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_anchor')
+    // Malformed anchor is rejected before any INSERT.
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('rejects an anchor with embedded whitespace with 400 invalid_anchor', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorStart: 'AA ==', anchorEnd: 'AA==' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_anchor')
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('rejects an oversized anchor (> MAX_ANCHOR_BYTES) with 400 invalid_anchor', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    mockInsertId(1)
+    // 4097 decoded bytes — one over the 4096 cap.
+    const oversized = Buffer.alloc(4097).toString('base64')
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorStart: oversized, anchorEnd: 'AA==' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_anchor')
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('accepts a valid base64 anchor at the size cap and creates the root', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    mockInsertId(321)
+    // Exactly 4096 decoded bytes — at the cap, still allowed.
+    const atCap = Buffer.alloc(4096).toString('base64')
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorStart: atCap, anchorEnd: 'AA==' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(201)
+    expect((res.body as { id: number }).id).toBe(321)
+  })
+
   it('creates a reply and stores NULL anchors (reply anchor invariant)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     // getById(parent) -> an existing root in this doc.
@@ -413,6 +469,52 @@ describe('GET list', () => {
     // limit was filled (1 root) => nextCursor is the last root id.
     expect(body.nextCursor).toBe(10)
   })
+
+  it('batches replies for multiple roots in ONE query and groups them by parent', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    // First query: listRoots -> two roots. Second query: listRepliesForRoots ->
+    // all replies for both roots in a single flat result (id asc).
+    vi.mocked(query)
+      .mockResolvedValueOnce([rootRow({ id: 10 }), rootRow({ id: 20 })] as never)
+      .mockResolvedValueOnce([
+        rootRow({ id: 11, parent_id: 10, anchor_start: null, anchor_end: null }),
+        rootRow({ id: 12, parent_id: 10, anchor_start: null, anchor_end: null }),
+        rootRow({ id: 21, parent_id: 20, anchor_start: null, anchor_end: null }),
+      ] as never)
+    const res = mockRes()
+    await listCommentsHandler(
+      req({ params: { docId: 'd_1' }, query: { limit: '50' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    // Exactly two queries total: one for roots, one batched for ALL replies (no N+1).
+    expect(vi.mocked(query).mock.calls).toHaveLength(2)
+    const batchSql = String(vi.mocked(query).mock.calls[1]![0])
+    expect(batchSql).toContain('parent_id IN (?)')
+    expect(vi.mocked(query).mock.calls[1]![1]).toEqual([[10, 20]])
+
+    const body = res.body as { items: Array<{ id: number; replies: Array<{ id: number }> }> }
+    expect(body.items).toHaveLength(2)
+    // Root 10 gets its two replies in id-asc order; root 20 gets its one.
+    expect(body.items[0]!.replies.map((r) => r.id)).toEqual([11, 12])
+    expect(body.items[1]!.replies.map((r) => r.id)).toEqual([21])
+  })
+
+  it('does not query for replies when there are no roots', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([] as never)
+    const res = mockRes()
+    await listCommentsHandler(
+      req({ params: { docId: 'd_1' }, query: { limit: '50' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { items: unknown[]; nextCursor: number | null }
+    expect(body.items).toHaveLength(0)
+    expect(body.nextCursor).toBeNull()
+    // No roots => listRepliesForRoots short-circuits without a second query.
+    expect(vi.mocked(query).mock.calls).toHaveLength(1)
+  })
 })
 
 describe('docCommentRepo (§3.4)', () => {
@@ -445,5 +547,18 @@ describe('docCommentRepo (§3.4)', () => {
     const sql = String(vi.mocked(query).mock.calls[0]![0])
     expect(sql).toContain('parent_id IS NULL')
     expect(sql).toContain('resolved = 0')
+  })
+
+  it('listRepliesForRoots batches with IN (?) and returns [] for no ids', async () => {
+    // Empty input short-circuits without touching the DB.
+    expect(await docCommentRepo.listRepliesForRoots([])).toEqual([])
+    expect(vi.mocked(query)).not.toHaveBeenCalled()
+    // Non-empty input passes the id array as a single bound parameter.
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10 })] as never)
+    const replies = await docCommentRepo.listRepliesForRoots([10, 20])
+    const sql = String(vi.mocked(query).mock.calls[0]![0])
+    expect(sql).toContain('parent_id IN (?)')
+    expect(vi.mocked(query).mock.calls[0]![1]).toEqual([[10, 20]])
+    expect(replies[0]!.parentId).toBe(10)
   })
 })

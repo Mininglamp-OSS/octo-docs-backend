@@ -23,6 +23,16 @@ export const commentsRouter = Router()
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
 
+/**
+ * Decoded anchor size cap. A Yjs RelativePosition encodes to a few dozen bytes;
+ * 4KB is a very generous ceiling that keeps malformed/oversized payloads out of
+ * the anchor BLOB columns.
+ */
+const MAX_ANCHOR_BYTES = 4096
+
+/** Sentinel: anchor was present on the wire but is not well-formed/usable. */
+const INVALID_ANCHOR = Symbol('invalid_anchor')
+
 /** Parse a positive integer id from a path/body value, or null when malformed. */
 function parseId(raw: unknown): number | null {
   if (typeof raw === 'number') {
@@ -35,10 +45,28 @@ function parseId(raw: unknown): number | null {
   return null
 }
 
-/** Decode a base64 anchor string to a Buffer; returns undefined when absent/invalid. */
-function decodeAnchor(raw: unknown): Buffer | undefined {
-  if (typeof raw !== 'string' || raw === '') return undefined
-  return Buffer.from(raw, 'base64')
+/**
+ * Decode a base64 anchor string to a Buffer.
+ *   - `undefined`        => anchor absent (caller maps to the "required" error)
+ *   - `INVALID_ANCHOR`   => anchor present but malformed / empty / oversized
+ *   - `Buffer`           => well-formed, within the size cap
+ *
+ * `Buffer.from(_, 'base64')` is too lax on its own — it silently drops invalid
+ * characters (e.g. '@@@@' yields a near-empty buffer). We validate the input is
+ * strict, canonical base64 BEFORE decoding, then bound the decoded size.
+ */
+function decodeAnchor(raw: unknown): Buffer | undefined | typeof INVALID_ANCHOR {
+  if (raw === undefined || raw === null) return undefined
+  // Present but not a usable string => reject (an anchor must be non-empty).
+  if (typeof raw !== 'string' || raw === '') return INVALID_ANCHOR
+  // Strict base64: only the alphabet, optional 1-2 '=' padding, length a
+  // multiple of 4. This rejects '@@@@', embedded spaces, bad padding, etc.
+  if (raw.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(raw)) return INVALID_ANCHOR
+  const buf = Buffer.from(raw, 'base64')
+  // Re-encode check catches any remaining lax/non-canonical decodes.
+  if (buf.toString('base64') !== raw) return INVALID_ANCHOR
+  if (buf.length === 0 || buf.length > MAX_ANCHOR_BYTES) return INVALID_ANCHOR
+  return buf
 }
 
 /** Serialize a stored comment for the wire (anchors -> base64). */
@@ -72,11 +100,19 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
   const limit = Math.min(MAX_LIMIT, Math.max(1, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : DEFAULT_LIMIT))
 
   const roots = await docCommentRepo.listRoots(guard.meta.doc_id, { includeResolved, cursor, limit })
-  const items = []
-  for (const root of roots) {
-    const replies = await docCommentRepo.listReplies(root.id)
-    items.push({ ...serialize(root), replies: replies.map(serialize) })
+  // Batch all replies for this page of roots in ONE query, then group by
+  // parent in memory — avoids an N+1 (one listReplies per root, up to ~101).
+  const replies = await docCommentRepo.listRepliesForRoots(roots.map((r) => r.id))
+  const byParent = new Map<number, DocComment[]>()
+  for (const reply of replies) {
+    const group = byParent.get(reply.parentId!)
+    if (group) group.push(reply)
+    else byParent.set(reply.parentId!, [reply])
   }
+  const items = roots.map((root) => ({
+    ...serialize(root),
+    replies: (byParent.get(root.id) ?? []).map(serialize),
+  }))
   const nextCursor = roots.length === limit ? roots[roots.length - 1]!.id : null
 
   res.status(200).json({ items, nextCursor })
@@ -134,6 +170,12 @@ export async function createCommentHandler(req: Request, res: Response): Promise
   // ── Root: both anchors are required (opaque base64 -> Buffer). ──
   const start = decodeAnchor(anchorStart)
   const end = decodeAnchor(anchorEnd)
+  // Present-but-malformed/oversized is rejected distinctly from absent, so a
+  // bad anchor is never silently stored as empty.
+  if (start === INVALID_ANCHOR || end === INVALID_ANCHOR) {
+    res.status(400).json({ error: 'invalid_anchor' })
+    return
+  }
   if (!start || !end) {
     res.status(400).json({ error: 'anchorStart and anchorEnd required for a root comment' })
     return
