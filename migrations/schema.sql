@@ -18,6 +18,7 @@
 --   yjs_snapshot          OPTIONAL baseline snapshot (incremental-log model only)
 --   yjs_update_log        OPTIONAL incremental log (incremental-log model only)
 --   doc_attachment        OPTIONAL attachment reference table (§3.5)
+--   doc_version           version history snapshots (snapshot + restore, §4 #4)
 
 -- 文档元数据（业务库）
 CREATE TABLE doc_meta (
@@ -162,4 +163,27 @@ CREATE TABLE doc_comment (
     OR
     (parent_id IS NOT NULL AND anchor_start IS NULL AND anchor_end IS NULL)
   )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 版本历史（快照 + 恢复，见 §4 feature #4）。每条记录是某一时刻文档的完整 Yjs
+-- 权威态（Y.encodeStateAsUpdate），gzip 压缩落 state_blob。id 由 DB 单一权威分配
+-- （AUTO_INCREMENT），即对外的 version_seq，禁止应用层 MAX+1。
+--   kind: 1=auto(自动) 2=named(命名快照) 3=restore-marker(恢复前自动安全快照)
+-- 恢复语义见 src/api/routes/versions.ts：前向、非破坏性地把目标版本内容 reconcile
+-- 回当前 live 态（联合安全，不触发 persistence union 回退）。
+CREATE TABLE doc_version (
+  id             BIGINT       NOT NULL AUTO_INCREMENT,  -- DB 单一权威分配，即 version_seq
+  doc_id         VARCHAR(64)  NOT NULL,                 -- 关联 doc_meta.doc_id
+  document_name  VARCHAR(256) NOT NULL,                 -- 快照时的持久化/路由键（取 doc_meta.document_name）
+  kind           TINYINT      NOT NULL,                 -- 1=auto 2=named 3=restore-marker
+  name           VARCHAR(256) NOT NULL DEFAULT '',      -- 命名快照的用户标签
+  state_blob     LONGBLOB     NOT NULL,                 -- 快照时文档完整 Yjs 态（gzip(encodeStateAsUpdate)）
+  compressed     TINYINT      NOT NULL DEFAULT 1,       -- 1 = state_blob 为 gzip(encodeStateAsUpdate)
+  size_bytes     BIGINT       NOT NULL DEFAULT 0,       -- 未压缩态字节数（保留/度量用）
+  schema_version INT          NOT NULL,                 -- 快照时的 SCHEMA_VERSION（前向兼容闸）
+  created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  created_by     VARCHAR(64)  NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_doc_ver (doc_id, id),                         -- 列表/游标分页（按 id 倒序）
+  KEY idx_doc_kind (doc_id, kind, id)                   -- 按 kind 过滤（如排除 auto）
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
