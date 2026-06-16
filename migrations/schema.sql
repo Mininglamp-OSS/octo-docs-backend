@@ -130,3 +130,36 @@ CREATE TABLE doc_attachment (
   PRIMARY KEY (attach_id),
   KEY idx_doc (doc_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 行内评论（feature #3, inline comments）。完全独立于 Y.Doc：评论正文与定位都
+-- 落在本表，不进协同文档二进制态。一个线程由一条 root（parent_id IS NULL，携带
+-- 锚点）加若干 reply（parent_id 指向 root；单层嵌套，reply 不再有子级、不带锚点）
+-- 组成。锚点是编码后的 Yjs RelativePosition 字节（不透明），服务端只存取不解析；
+-- anchor_text 是创建时的文本快照，仅供展示/审计，绝不据此派生权限或定位。
+CREATE TABLE doc_comment (
+  id            BIGINT       NOT NULL AUTO_INCREMENT, -- 单一权威分配（DB 自增），禁止应用层 MAX+1
+  doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id（权限以此为准）
+  document_name VARCHAR(256) NOT NULL,            -- 反范式快照值；绝不据此派生权限
+  parent_id     BIGINT       NULL,                -- NULL=线程根；否则指向所回复的 root id（仅单层嵌套）
+  author_uid    VARCHAR(64)  NOT NULL,            -- 作者 uid，来自鉴权上下文 req.uid，绝非请求体
+  body          MEDIUMTEXT   NOT NULL,            -- 评论正文
+  anchor_start  BLOB         NULL,                -- 编码后的 Yjs RelativePosition 字节（不透明）
+  anchor_end    BLOB         NULL,                -- 同上，区间末端
+  anchor_text   VARCHAR(512) NOT NULL DEFAULT '', -- 创建时文本快照，仅展示/审计
+  resolved      TINYINT      NOT NULL DEFAULT 0,  -- 仅线程根有意义：0=open 1=resolved
+  resolved_by   VARCHAR(64)  NULL,                -- 解决人 uid
+  resolved_at   DATETIME(3)  NULL,                -- 解决时间
+  deleted       TINYINT      NOT NULL DEFAULT 0,  -- 软删
+  created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY idx_doc_open (doc_id, resolved, deleted, id), -- 「某文档的未解决评论」列表/分页
+  KEY idx_thread (parent_id, id),                   -- 拉取某 root 的回复
+  -- 不变式：root（parent_id IS NULL）必须带两端锚点；reply（parent_id NOT NULL）两端锚点必须为 NULL。
+  -- 代码层也强制此规则（见 docCommentRepo / comments 路由），CHECK 作为最后一道防线。
+  CONSTRAINT chk_doc_comment_anchor CHECK (
+    (parent_id IS NULL AND anchor_start IS NOT NULL AND anchor_end IS NOT NULL)
+    OR
+    (parent_id IS NOT NULL AND anchor_start IS NULL AND anchor_end IS NULL)
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

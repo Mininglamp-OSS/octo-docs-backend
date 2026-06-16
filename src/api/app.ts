@@ -15,6 +15,7 @@ import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
 import { invitesRouter, acceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
+import { commentsRouter } from './routes/comments.js'
 
 export function createApp(): Express {
   const app = express()
@@ -39,6 +40,7 @@ export function createApp(): Express {
   api.use(membersRouter) // /:docId/members ...
   api.use(invitesRouter) // /:docId/invites ... (admin)
   api.use(attachmentsRouter) // /:docId/attachments/presign , /:docId/attachments/:attachId
+  api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
 
   app.use('/api/v1/docs', api)
 
