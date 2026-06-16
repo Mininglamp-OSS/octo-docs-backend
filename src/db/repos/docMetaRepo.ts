@@ -110,7 +110,14 @@ export const docMetaRepo = {
     }
     const whereSql = where.join(' AND ')
     const order = params.sort === 'updatedAt:asc' ? 'ASC' : 'DESC'
-    const offset = (params.page - 1) * params.pageSize
+    // `query()` runs on mysql2 `.execute()` (a prepared statement), which rejects
+    // numeric LIMIT/OFFSET bound via `?` with ER_WRONG_ARGUMENTS (errno 1210) — a
+    // guaranteed 500. Coerce and clamp pageSize to a positive integer in 1..100
+    // and offset to a non-negative integer; both are then provably integers and
+    // safe to inline directly (no injection surface).
+    const pageSize = Math.min(100, Math.max(1, Number.isInteger(params.pageSize) ? params.pageSize : 20))
+    const offsetRaw = (params.page - 1) * pageSize
+    const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0
 
     const base = `
       FROM doc_meta m
@@ -124,8 +131,8 @@ export const docMetaRepo = {
       `SELECT m.*, CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END AS role
        ${base}
        ORDER BY m.updated_at ${order}
-       LIMIT ? OFFSET ?`,
-      [params.uid, ...args, params.pageSize, offset],
+       LIMIT ${pageSize} OFFSET ${offset}`,
+      [params.uid, ...args],
     )
     return { total, items }
   },
