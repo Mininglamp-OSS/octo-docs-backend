@@ -70,6 +70,14 @@ function forbidGuard() {
   }) as never)
 }
 
+/** Make requireDocRole emulate a doc-status block (404 missing/deleted, 409 archived). */
+function blockGuard(code: number, error: string) {
+  vi.mocked(requireDocRole).mockImplementation((async (res: MockRes) => {
+    res.status(code).json({ error })
+    return null
+  }) as never)
+}
+
 /** Mock create()'s transaction so it returns a fixed insert id; capture INSERT args. */
 let txQuery: ReturnType<typeof vi.fn>
 function mockInsertId(id: number) {
@@ -192,16 +200,20 @@ describe('POST create (reader can comment)', () => {
 })
 
 describe('PATCH resolve / body edit', () => {
-  it('requires writer to resolve a thread', async () => {
+  it('requires writer to resolve a thread (reader blocked above the floor)', async () => {
+    // Caller clears the reader floor but lacks writer for the resolve branch.
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow()] as never)
-    forbidGuard()
     const res = mockRes()
     await patchCommentHandler(
       req({ uid: 'u_reader', params: { docId: 'd_1', id: '10' }, body: { resolved: true } }),
       res as never,
     )
     expect(res.statusCode).toBe(403)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
+    // Single guard call: the floor gate with the reader minimum; writer is
+    // enforced from guard.role, not a second requireDocRole call.
+    expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('resolves a thread for a writer and stamps resolved_by', async () => {
@@ -218,6 +230,7 @@ describe('PATCH resolve / body edit', () => {
   })
 
   it('requires the author to edit the body', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
     const res = mockRes()
     await patchCommentHandler(
@@ -228,6 +241,7 @@ describe('PATCH resolve / body edit', () => {
   })
 
   it('lets the author edit the body', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
     const res = mockRes()
     await patchCommentHandler(
@@ -240,6 +254,7 @@ describe('PATCH resolve / body edit', () => {
   })
 
   it('404s a cross-doc comment id (no leak)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ doc_id: 'd_OTHER' })] as never)
     const res = mockRes()
     await patchCommentHandler(
@@ -252,6 +267,7 @@ describe('PATCH resolve / body edit', () => {
 
 describe('DELETE soft / hard', () => {
   it('lets the author soft-delete their own comment', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
     const res = mockRes()
     await deleteCommentHandler(
@@ -264,6 +280,7 @@ describe('DELETE soft / hard', () => {
   })
 
   it('rejects a soft delete by a non-author', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
     const res = mockRes()
     await deleteCommentHandler(
@@ -273,16 +290,18 @@ describe('DELETE soft / hard', () => {
     expect(res.statusCode).toBe(403)
   })
 
-  it('requires admin for a hard delete', async () => {
+  it('requires admin for a hard delete (reader blocked above the floor)', async () => {
+    // Caller clears the reader floor but lacks admin for the hard-delete branch.
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
-    forbidGuard()
     const res = mockRes()
     await deleteCommentHandler(
       req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, query: { hard: '1' } }),
       res as never,
     )
     expect(res.statusCode).toBe(403)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('admin')
+    expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('hard-deletes for an admin', async () => {
@@ -296,6 +315,80 @@ describe('DELETE soft / hard', () => {
     expect(res.statusCode).toBe(200)
     const del = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('DELETE FROM doc_comment'))
     expect(del).toBeTruthy()
+  })
+})
+
+describe('reader floor gate on body-edit / soft-delete (revoked author + doc status)', () => {
+  it('403s a revoked (role:none) author editing their OWN comment body', async () => {
+    // requireDocRole writes 403 and returns null for a role:'none' caller.
+    // The floor gate must run BEFORE the author check, so even the author is blocked.
+    forbidGuard()
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'edit after revoke' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(403)
+    // The floor gate fired (reader minimum) and short-circuited before getById.
+    expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    // No DB read of the comment happened — the gate blocked first.
+    expect(vi.mocked(query)).not.toHaveBeenCalled()
+  })
+
+  it('403s a revoked (role:none) author soft-deleting their OWN comment', async () => {
+    forbidGuard()
+    const res = mockRes()
+    await deleteCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(403)
+    expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    expect(vi.mocked(query)).not.toHaveBeenCalled()
+  })
+
+  it('still lets a current reader author edit their own comment (200)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'still allowed' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+  })
+
+  it('still lets a current reader author soft-delete their own comment (200)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    const res = mockRes()
+    await deleteCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+  })
+
+  it('404s a body edit on a missing/deleted doc (doc-status semantics restored)', async () => {
+    blockGuard(404, 'not_found')
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'edit' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(404)
+  })
+
+  it('409s a soft delete on an archived doc (doc-status semantics restored)', async () => {
+    blockGuard(409, 'conflict')
+    const res = mockRes()
+    await deleteCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
   })
 })
 

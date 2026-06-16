@@ -15,6 +15,7 @@
  */
 import { Router, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
+import { roleAtLeast } from '../../permission/role.js'
 import { docCommentRepo, type DocComment } from '../../db/repos/docCommentRepo.js'
 
 export const commentsRouter = Router()
@@ -154,6 +155,13 @@ commentsRouter.patch('/:docId/comments/:id', patchCommentHandler)
 
 export async function patchCommentHandler(req: Request, res: Response): Promise<void> {
   const docId = req.params.docId!
+  // Doc-access floor: a reader role is the minimum to touch any comment here.
+  // This runs FIRST so it 404s on missing/deleted docs, 409s on archived ones,
+  // and 403s a caller whose role is 'none' (e.g. revoked author) — before the
+  // author check below ever gets a chance to allow a write.
+  const guard = await requireDocRole(res, req.uid!, docId, 'reader')
+  if (!guard) return
+
   const id = parseId(req.params.id)
   if (id === null) {
     res.status(404).json({ error: 'not_found' })
@@ -168,10 +176,12 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
 
   const { body, resolved } = req.body ?? {}
 
-  // Resolve / reopen a thread root — requires writer.
+  // Resolve / reopen a thread root — requires writer (elevated above the floor).
   if (resolved !== undefined) {
-    const guard = await requireDocRole(res, req.uid!, docId, 'writer')
-    if (!guard) return
+    if (!roleAtLeast(guard.role, 'writer')) {
+      res.status(403).json({ error: 'forbidden' })
+      return
+    }
     if (comment.parentId !== null) {
       res.status(400).json({ error: 'only a thread root can be resolved' })
       return
@@ -185,7 +195,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
     return
   }
 
-  // Body edit — requires the author.
+  // Body edit — requires the author (the reader floor above is already enforced).
   if (body !== undefined) {
     if (comment.authorUid !== req.uid) {
       res.status(403).json({ error: 'forbidden' })
@@ -207,6 +217,11 @@ commentsRouter.delete('/:docId/comments/:id', deleteCommentHandler)
 
 export async function deleteCommentHandler(req: Request, res: Response): Promise<void> {
   const docId = req.params.docId!
+  // Doc-access floor (see patchCommentHandler): blocks revoked authors and
+  // enforces doc-status 404/409 semantics before the author check below.
+  const guard = await requireDocRole(res, req.uid!, docId, 'reader')
+  if (!guard) return
+
   const id = parseId(req.params.id)
   if (id === null) {
     res.status(404).json({ error: 'not_found' })
@@ -222,8 +237,10 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
 
   if (hard) {
     // Hard delete is a moderator action — needs admin (admin/owner).
-    const guard = await requireDocRole(res, req.uid!, docId, 'admin')
-    if (!guard) return
+    if (!roleAtLeast(guard.role, 'admin')) {
+      res.status(403).json({ error: 'forbidden' })
+      return
+    }
     await docCommentRepo.hardDelete(id)
     res.status(200).json({ id })
     return
