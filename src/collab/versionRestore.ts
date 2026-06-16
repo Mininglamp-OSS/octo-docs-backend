@@ -71,9 +71,24 @@ export function restoreReconcile(liveState: Uint8Array | null, targetState: Uint
     const targetYDoc = new Y.Doc()
     Y.applyUpdate(targetYDoc, targetState)
     const targetJSON = yDocToProsemirrorJSON(targetYDoc, COLLAB_FIELD)
-    targetPMDoc = PMNode.fromJSON(schema, targetJSON as Parameters<typeof PMNode.fromJSON>[1])
-    // check() surfaces content-expression violations that fromJSON alone misses.
-    targetPMDoc.check()
+    const decoded = PMNode.fromJSON(schema, targetJSON as Parameters<typeof PMNode.fromJSON>[1])
+    if (decoded.childCount === 0) {
+      // A brand-new doc snapshotted before any edit stores an empty Y.Doc, which
+      // decodes to a contentless `doc` node. That violates the top node's
+      // `block+` content expression, but it is NOT a schema incompatibility —
+      // substitute the canonical empty document instead of throwing. createAndFill
+      // supplies the required content (e.g. a single empty paragraph) so the
+      // restore yields a valid empty doc rather than a spurious 409.
+      const empty = schema.topNodeType.createAndFill()
+      if (!empty) throw new Error('schema defines no canonical empty document')
+      targetPMDoc = empty
+    } else {
+      // check() surfaces content-expression violations that fromJSON alone misses
+      // — genuine incompatibility from a newer/incompatible schema must still
+      // throw (only the empty-content case above is reclassified as valid).
+      decoded.check()
+      targetPMDoc = decoded
+    }
   } catch (err) {
     throw new SchemaIncompatibleError(err)
   }

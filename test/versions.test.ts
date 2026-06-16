@@ -23,6 +23,7 @@ import {
 } from '../src/api/routes/versions.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
+import { restoreVersion } from '../src/api/services/restoreVersion.js'
 import { query, transaction } from '../src/db/pool.js'
 import {
   gateSchema,
@@ -334,5 +335,168 @@ describe('restoreReconcile — union-safe forward restore (the core, §4)', () =
     })
     const badState = Y.encodeStateAsUpdate(bad)
     expect(() => restoreReconcile(null, badState)).toThrow(SchemaIncompatibleError)
+  })
+
+  // ── empty-snapshot restore: canonical empty doc, NOT a 409 (BUG1) ───────────
+  it('restores an empty snapshot as the canonical empty doc (not version_schema_incompatible)', () => {
+    // A brand-new doc snapshotted before any edit stores an empty Y.Doc (see
+    // createVersionHandler). Decoding it yields a contentless `doc`, which
+    // violates the top node's `block+` expression — but that is a valid empty
+    // document, not a schema incompatibility.
+    const emptyState = Y.encodeStateAsUpdate(new Y.Doc())
+    let reconciled: Uint8Array | undefined
+    expect(() => {
+      reconciled = restoreReconcile(null, emptyState)
+    }).not.toThrow()
+
+    const out = new Y.Doc()
+    Y.applyUpdate(out, reconciled!)
+    const json = yDocToProsemirrorJSON(out, COLLAB_FIELD) as { content?: unknown[] }
+    // Canonical empty doc: createAndFill supplies a single empty paragraph.
+    expect(json.content).toHaveLength(1)
+    expect(paragraphTexts(json)).toEqual([''])
+  })
+
+  it('restoring an empty snapshot over a populated live doc reduces it to the canonical empty doc', () => {
+    const liveState = stateFromPM({ type: 'doc', content: [para('A'), para('B')] })
+    const emptyState = Y.encodeStateAsUpdate(new Y.Doc())
+
+    const reconciled = restoreReconcile(liveState, emptyState)
+    const out = new Y.Doc()
+    Y.applyUpdate(out, reconciled)
+    expect(paragraphTexts(yDocToProsemirrorJSON(out, COLLAB_FIELD))).toEqual([''])
+
+    // Still union-safe: reconciled ⊇ live, so no union reback (Steve's invariant).
+    const { usedUnion } = computeFinalState(liveState, reconciled)
+    expect(usedUnion).toBe(false)
+  })
+
+  it('non-empty content that is genuinely incompatible still throws (empty-case fix does not swallow real incompatibility)', () => {
+    // A fragment with a known node wrapping an unknown one: not empty, but cannot
+    // load under the current schema → must still be SchemaIncompatibleError.
+    const bad = new Y.Doc()
+    const frag = bad.get(COLLAB_FIELD, Y.XmlFragment)
+    bad.transact(() => {
+      const el = new Y.XmlElement('paragraph')
+      el.insert(0, [new Y.XmlElement('frobnicate')])
+      frag.insert(0, [el])
+    })
+    const badState = Y.encodeStateAsUpdate(bad)
+    expect(() => restoreReconcile(null, badState)).toThrow(SchemaIncompatibleError)
+  })
+})
+
+// ── safety snapshot rolls back on a failed restore (BUG2) ─────────────────────
+// The safety-snapshot insert must happen only after the fallible reconcile +
+// size check succeed. transaction() rolls back only on a THROW, and the failure
+// branches `return { ok: false }` (not throw) — so an early safety insert would
+// be committed, leaking an orphan "Auto-safety before restore" row. Assert ZERO
+// safety rows are inserted on the failure path, and exactly one on success.
+describe('restoreVersion service — safety snapshot (BUG2 rollback)', () => {
+  const documentName = 'octo:s1:f_default:d_1'
+
+  function metaRow() {
+    // owner_id === uid ⇒ admin under the lock without a docMemberRepo lookup.
+    return { owner_id: 'u_1', permission_epoch: 7, status: 1 }
+  }
+
+  /** transaction() mock that runs the callback against an SQL-routed tx. */
+  function mockTx(captured?: string[]) {
+    vi.mocked(transaction).mockImplementation(async (fn: never) => {
+      const tx = {
+        query: vi.fn(async (sql: string) => {
+          captured?.push(sql)
+          if (sql.includes('FROM yjs_document')) return [] // cold live state
+          if (sql.includes('FROM doc_meta')) return [metaRow()]
+          if (sql.includes('LAST_INSERT_ID')) return [{ id: 99 }]
+          return []
+        }),
+      }
+      return (fn as unknown as (t: typeof tx) => Promise<unknown>)(tx)
+    })
+  }
+
+  it('inserts NO safety row when the reconcile fails after the auth/epoch checks', async () => {
+    // Target snapshot holding an unknown node ⇒ restoreReconcile throws
+    // SchemaIncompatibleError AFTER the FOR UPDATE auth/epoch checks — exactly
+    // where the old code had already inserted the safety row.
+    const bad = new Y.Doc()
+    const frag = bad.get(COLLAB_FIELD, Y.XmlFragment)
+    bad.transact(() => {
+      frag.insert(0, [new Y.XmlElement('frobnicate')])
+    })
+    const badState = Y.encodeStateAsUpdate(bad)
+
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: {
+        id: 5,
+        docId: 'd_1',
+        documentName,
+        kind: 2,
+        name: '',
+        compressed: 1,
+        sizeBytes: badState.length,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: new Date(0),
+        createdBy: 'u_1',
+      },
+      state: badState,
+    })
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx()
+
+    const result = await restoreVersion({
+      uid: 'u_1',
+      docId: 'd_1',
+      documentName,
+      versionId: 5,
+      authorizedEpoch: 7,
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('version_schema_incompatible')
+    // The orphan safety row is never inserted ⇒ nothing to leak on rollback.
+    expect(createSpy).not.toHaveBeenCalled()
+
+    createSpy.mockRestore()
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  it('inserts exactly one safety row and persists on a successful restore', async () => {
+    const targetState = stateFromPM({ type: 'doc', content: [para('A')] })
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: {
+        id: 5,
+        docId: 'd_1',
+        documentName,
+        kind: 2,
+        name: '',
+        compressed: 1,
+        sizeBytes: targetState.length,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: new Date(0),
+        createdBy: 'u_1',
+      },
+      state: targetState,
+    })
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(99)
+    const captured: string[] = []
+    mockTx(captured)
+
+    const result = await restoreVersion({
+      uid: 'u_1',
+      docId: 'd_1',
+      documentName,
+      versionId: 5,
+      authorizedEpoch: 7,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(createSpy).toHaveBeenCalledTimes(1)
+    // The restore was actually persisted to the authoritative row.
+    expect(captured.some((q) => q.includes('INSERT INTO yjs_document'))).toBe(true)
+
+    createSpy.mockRestore()
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
   })
 })

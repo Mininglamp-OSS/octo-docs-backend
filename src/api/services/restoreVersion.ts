@@ -88,19 +88,13 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
       return { ok: false, status: 409, error: 'epoch_changed' }
     }
 
-    // 5. Auto safety snapshot of the CURRENT live state (undo for the restore).
-    const safetyState = currentState ?? Y.encodeStateAsUpdate(new Y.Doc())
-    const safetyVersionId = await docVersionRepo.createTx(tx, {
-      docId: input.docId,
-      documentName: input.documentName,
-      kind: KIND_RESTORE_MARKER,
-      name: 'Auto-safety before restore',
-      state: safetyState,
-      schemaVersion: SCHEMA_VERSION,
-      createdBy: input.uid,
-    })
-
-    // 6. Forward, union-safe reconcile of the target into the live state.
+    // 5. Forward, union-safe reconcile of the target into the live state. Do the
+    //    fallible work BEFORE recording the safety snapshot: the failure branches
+    //    below `return { ok: false }` (an error object, not a throw), and
+    //    transaction() only rolls back on a THROW — so an already-inserted safety
+    //    row would be COMMITTED, leaking an orphan "Auto-safety before restore"
+    //    version on every failed restore. Insert the safety row only once the
+    //    restore is known-good (step 6), so a failure rolls back to zero rows.
     let update: Uint8Array
     try {
       update = restoreReconcile(currentState, target.state)
@@ -113,6 +107,19 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     if (update.length > config.maxDocBytes) {
       return { ok: false, status: 413, error: 'doc_too_large' }
     }
+
+    // 6. Auto safety snapshot of the CURRENT live state (undo for the restore),
+    //    recorded only after the reconcile + size check have passed.
+    const safetyState = currentState ?? Y.encodeStateAsUpdate(new Y.Doc())
+    const safetyVersionId = await docVersionRepo.createTx(tx, {
+      docId: input.docId,
+      documentName: input.documentName,
+      kind: KIND_RESTORE_MARKER,
+      name: 'Auto-safety before restore',
+      state: safetyState,
+      schemaVersion: SCHEMA_VERSION,
+      createdBy: input.uid,
+    })
 
     // 7. Persist via merge-on-write. The reconcile output is a superset of the
     //    existing state, so this takes the direct-write path (no union reback).
