@@ -77,4 +77,35 @@ describe('paginated repos inline a validated integer LIMIT/OFFSET (no numeric `?
     await docMetaRepo.listForUser({ uid: 'u_1', page: 1, pageSize: 9999, sort: 'updatedAt:asc' })
     expect(lastCall().sql).toMatch(/LIMIT 100 OFFSET 0\b/)
   })
+
+  // The production 500 fired on requests that carried no limit at all, not just
+  // on out-of-range values. These assert the omitted-limit path still inlines a
+  // safe integer LIMIT (the default) rather than falling back to a `?` bind.
+  it('docVersionRepo.listByDoc with no opts inlines the default LIMIT', async () => {
+    await docVersionRepo.listByDoc('d_1')
+    const { sql, params } = lastCall()
+    // default limit 20 → fetch limit+1 = 21.
+    expect(sql).toMatch(/LIMIT 21\b/)
+    expect(sql).not.toMatch(/LIMIT \?/)
+    expect(params).not.toContain(21)
+    expect(params).not.toContain(20)
+  })
+
+  it('docCommentRepo.listRoots with no limit field inlines the default LIMIT', async () => {
+    await docCommentRepo.listRoots('d_1', { includeResolved: true } as never)
+    const { sql } = lastCall()
+    expect(sql).toMatch(/LIMIT 20\b/)
+    expect(sql).not.toMatch(/LIMIT \?/)
+  })
+
+  it('docMetaRepo.listForUser with pageSize omitted inlines the default LIMIT/OFFSET', async () => {
+    await docMetaRepo.listForUser({ uid: 'u_1', page: 3, sort: 'updatedAt:desc' } as never)
+    const { sql, params } = lastCall()
+    // default pageSize 20 → offset = (3-1)*20 = 40.
+    expect(sql).toMatch(/LIMIT 20 OFFSET 40\b/)
+    expect(sql).not.toMatch(/LIMIT \?/)
+    expect(sql).not.toMatch(/OFFSET \?/)
+    expect(params).not.toContain(20)
+    expect(params).not.toContain(40)
+  })
 })
