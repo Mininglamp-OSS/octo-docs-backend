@@ -54,19 +54,15 @@ export function gateSchema(
 }
 
 /**
- * Reconcile the target version's content into a doc hydrated from the current
- * live state, returning the full encoded state to persist.
- *
- * `liveState` MUST be the current authoritative state (not a blank doc) so the
- * result is a forward continuation: the in-place reconcile records deletions as
- * tombstones relative to live, keeping the write on the union-safe direction.
+ * Decode a target snapshot's binary state into a schema-validated ProseMirror
+ * document under the CURRENT schema.
  *
  * Throws SchemaIncompatibleError if the target content does not load under the
- * current schema.
+ * current schema. A snapshot taken before any edit decodes to a contentless
+ * `doc` (violates the top node's `block+` expression) — that is NOT an
+ * incompatibility, so it is substituted with the canonical empty document.
  */
-export function restoreReconcile(liveState: Uint8Array | null, targetState: Uint8Array): Uint8Array {
-  // Decode the target snapshot into a ProseMirror doc under the current schema.
-  let targetPMDoc: PMNode
+export function decodeTargetSnapshot(targetState: Uint8Array): PMNode {
   try {
     const targetYDoc = new Y.Doc()
     Y.applyUpdate(targetYDoc, targetState)
@@ -81,17 +77,42 @@ export function restoreReconcile(liveState: Uint8Array | null, targetState: Uint
       // restore yields a valid empty doc rather than a spurious 409.
       const empty = schema.topNodeType.createAndFill()
       if (!empty) throw new Error('schema defines no canonical empty document')
-      targetPMDoc = empty
-    } else {
-      // check() surfaces content-expression violations that fromJSON alone misses
-      // — genuine incompatibility from a newer/incompatible schema must still
-      // throw (only the empty-content case above is reclassified as valid).
-      decoded.check()
-      targetPMDoc = decoded
+      return empty
     }
+    // check() surfaces content-expression violations that fromJSON alone misses
+    // — genuine incompatibility from a newer/incompatible schema must still
+    // throw (only the empty-content case above is reclassified as valid).
+    decoded.check()
+    return decoded
   } catch (err) {
     throw new SchemaIncompatibleError(err)
   }
+}
+
+/**
+ * Reconcile a decoded target document INTO a live Yjs XmlFragment, in place.
+ * MUST be called inside a Yjs transaction (the caller owns the transaction so
+ * the deletions land as causal tombstones on the live struct store). This is
+ * the single shared reconcile primitive used by both the pure/DB-side encode
+ * (restoreReconcile) and the live-document apply (liveRestore.ts).
+ */
+export function reconcileFragment(targetPMDoc: PMNode, liveFragment: Y.XmlFragment): void {
+  prosemirrorToYXmlFragment(targetPMDoc, liveFragment)
+}
+
+/**
+ * Reconcile the target version's content into a doc hydrated from the current
+ * live state, returning the full encoded state to persist.
+ *
+ * `liveState` MUST be the current authoritative state (not a blank doc) so the
+ * result is a forward continuation: the in-place reconcile records deletions as
+ * tombstones relative to live, keeping the write on the union-safe direction.
+ *
+ * Throws SchemaIncompatibleError if the target content does not load under the
+ * current schema.
+ */
+export function restoreReconcile(liveState: Uint8Array | null, targetState: Uint8Array): Uint8Array {
+  const targetPMDoc = decodeTargetSnapshot(targetState)
 
   // Hydrate from the live state so the reconcile is a forward edit on the
   // authoritative instance, not a rebuild of a blank doc.
@@ -104,7 +125,7 @@ export function restoreReconcile(liveState: Uint8Array | null, targetState: Uint
   // the deletions land as causal tombstones — DO NOT build a separate doc and
   // union it (that path triggers the union reback).
   liveDoc.transact(() => {
-    prosemirrorToYXmlFragment(targetPMDoc, liveFragment)
+    reconcileFragment(targetPMDoc, liveFragment)
   }, RESTORE_ORIGIN)
 
   return Y.encodeStateAsUpdate(liveDoc)

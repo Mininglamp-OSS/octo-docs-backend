@@ -24,6 +24,8 @@ export interface DocVersion {
   documentName: string
   kind: number
   name: string
+  /** For a restore-marker row: the source version_seq it was restored from; null otherwise. */
+  restoredFrom: number | null
   compressed: number
   sizeBytes: number
   schemaVersion: number
@@ -38,6 +40,7 @@ interface DocVersionMetaRow {
   document_name: string
   kind: number
   name: string
+  restored_from: number | null
   compressed: number
   size_bytes: number
   schema_version: number
@@ -57,6 +60,7 @@ function mapRow(row: DocVersionMetaRow): DocVersion {
     documentName: row.document_name,
     kind: Number(row.kind),
     name: row.name,
+    restoredFrom: row.restored_from == null ? null : Number(row.restored_from),
     compressed: Number(row.compressed),
     sizeBytes: Number(row.size_bytes),
     schemaVersion: Number(row.schema_version),
@@ -68,13 +72,15 @@ function mapRow(row: DocVersionMetaRow): DocVersion {
 // Metadata projection used by every read path except getStateById, so the
 // LONGBLOB is never pulled into memory for listings / ownership checks.
 const META_COLS =
-  'id, doc_id, document_name, kind, name, compressed, size_bytes, schema_version, created_at, created_by'
+  'id, doc_id, document_name, kind, name, restored_from, compressed, size_bytes, schema_version, created_at, created_by'
 
 export interface CreateVersionInput {
   docId: string
   documentName: string
   kind: number
   name?: string
+  /** Source version_seq for a restore-marker row; omitted (null) for normal snapshots. */
+  restoredFrom?: number
   /** Raw (uncompressed) Yjs state = Y.encodeStateAsUpdate(doc) at snapshot time. */
   state: Uint8Array
   schemaVersion: number
@@ -97,13 +103,14 @@ export const docVersionRepo = {
     const blob = gzipSync(Buffer.from(input.state))
     await tx.query(
       `INSERT INTO doc_version
-         (doc_id, document_name, kind, name, state_blob, compressed, size_bytes, schema_version, created_by)
-       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+         (doc_id, document_name, kind, name, restored_from, state_blob, compressed, size_bytes, schema_version, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
       [
         input.docId,
         input.documentName,
         input.kind,
         input.name ?? '',
+        input.restoredFrom ?? null,
         blob,
         input.state.length,
         input.schemaVersion,

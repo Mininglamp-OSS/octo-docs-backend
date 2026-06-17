@@ -177,6 +177,7 @@ CREATE TABLE doc_version (
   document_name  VARCHAR(256) NOT NULL,                 -- 快照时的持久化/路由键（取 doc_meta.document_name）
   kind           TINYINT      NOT NULL,                 -- 1=auto 2=named 3=restore-marker
   name           VARCHAR(256) NOT NULL DEFAULT '',      -- 命名快照的用户标签
+  restored_from  BIGINT       NULL DEFAULT NULL,        -- restore-marker(kind=3) 行：被恢复来源版本 version_seq；其余 NULL
   state_blob     LONGBLOB     NOT NULL,                 -- 快照时文档完整 Yjs 态（gzip(encodeStateAsUpdate)）
   compressed     TINYINT      NOT NULL DEFAULT 1,       -- 1 = state_blob 为 gzip(encodeStateAsUpdate)
   size_bytes     BIGINT       NOT NULL DEFAULT 0,       -- 未压缩态字节数（保留/度量用）

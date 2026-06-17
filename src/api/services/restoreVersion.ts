@@ -1,8 +1,7 @@
 /**
- * Version restore orchestration (§4 feature #4, design §5.6) — the DB-bound
- * half of the union-safe forward restore. The pure mechanics (schema gate,
- * in-place reconcile) live in src/collab/versionRestore.ts; this service wraps
- * them in the single FOR UPDATE transaction that makes the restore safe.
+ * Version restore orchestration (§4 feature #4, design §5.6). Restore has two
+ * halves: a DB-bound transaction (authorization recheck + safety snapshot) and
+ * an authoritative content write onto the LIVE Hocuspocus document.
  *
  * N1 TOCTOU guard: the route's requireDocRole(admin) is only the first check.
  * Here we re-read the doc rows FOR UPDATE and re-check the caller's role +
@@ -11,23 +10,31 @@
  * the backend is the authority, the frontend gate is only UX.
  *
  * Lock order matches persistence.store (yjs_document first, then doc_meta) so
- * the two write paths cannot deadlock. Before the forward write we record an
- * auto safety snapshot of the current live state in the same transaction, so
- * the restore is itself undoable (returned as safetyVersionId).
+ * the two write paths cannot deadlock. Before the restore we record an auto
+ * safety snapshot of the current live state in the same transaction, so the
+ * restore is itself undoable (returned as newDocVersionSeq).
+ *
+ * The content write does NOT touch yjs_document directly. After the transaction
+ * commits we apply the reconcile onto the live in-memory document via
+ * openDirectConnection (see src/collab/liveRestore.ts): this broadcasts the
+ * restore to connected clients in real time AND is the single authoritative
+ * persisted write. A separate transient-doc write would diverge by clientId and
+ * force the union fallback in persistence.store, duplicating the restored
+ * content — so it is deliberately omitted.
  */
 import { transaction, type Tx } from '../../db/pool.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../../db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
-import { computeFinalState } from '../../collab/persistence.js'
-import { gateSchema, restoreReconcile, SchemaIncompatibleError } from '../../collab/versionRestore.js'
+import { restoreReconcile, gateSchema, SchemaIncompatibleError } from '../../collab/versionRestore.js'
+import { applyRestoreToLiveDoc } from '../../collab/liveRestore.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
 import { roleAtLeast } from '../../permission/role.js'
 import * as Y from 'yjs'
 
 export type RestoreResult =
-  | { ok: true; restoredFromVersionId: number; safetyVersionId: number }
+  | { ok: true; restoredFrom: number; newDocVersionSeq: number }
   | { ok: false; status: number; error: string }
 
 export interface RestoreInput {
@@ -64,7 +71,7 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     return { ok: false, status: gate.status, error: gate.code }
   }
 
-  return transaction(async (tx) => {
+  const txResult = await transaction(async (tx) => {
     // 1. Lock the authoritative state row FIRST (same order as
     //    persistence.store: yjs_document -> doc_meta) and read current state.
     const currentState = await yjsDocumentRepo.selectForUpdateTx(tx, input.documentName)
@@ -75,37 +82,37 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
       [input.docId],
     )
     const meta = metaRows[0]
-    if (!meta || Number(meta.status) === 0) return { ok: false, status: 404, error: 'not_found' }
-    if (Number(meta.status) === 2) return { ok: false, status: 409, error: 'conflict' }
+    if (!meta || Number(meta.status) === 0) return { ok: false as const, status: 404, error: 'not_found' }
+    if (Number(meta.status) === 2) return { ok: false as const, status: 409, error: 'conflict' }
 
     // 3. Re-check role INSIDE the lock — server authority, not just frontend UX.
     if (!(await isAdminTx(tx, input.docId, input.uid, meta.owner_id))) {
-      return { ok: false, status: 403, error: 'forbidden' }
+      return { ok: false as const, status: 403, error: 'forbidden' }
     }
 
     // 4. Re-check permission_epoch: if it moved since authorization, abort.
     if (Number(meta.permission_epoch) !== input.authorizedEpoch) {
-      return { ok: false, status: 409, error: 'epoch_changed' }
+      return { ok: false as const, status: 409, error: 'epoch_changed' }
     }
 
-    // 5. Forward, union-safe reconcile of the target into the live state. Do the
-    //    fallible work BEFORE recording the safety snapshot: the failure branches
-    //    below `return { ok: false }` (an error object, not a throw), and
-    //    transaction() only rolls back on a THROW — so an already-inserted safety
-    //    row would be COMMITTED, leaking an orphan "Auto-safety before restore"
-    //    version on every failed restore. Insert the safety row only once the
-    //    restore is known-good (step 6), so a failure rolls back to zero rows.
-    let update: Uint8Array
+    // 5. Validate the forward reconcile against the CURRENT state: this surfaces
+    //    schema incompatibility (a target that cannot load) and enforces the
+    //    size cap BEFORE we record the safety snapshot or touch the live doc.
+    //    The encoded result is used only for validation here — the authoritative
+    //    content write happens on the LIVE document after this transaction
+    //    commits (see below), never as a second yjs_document write, which would
+    //    diverge by clientId and force the union fallback in persistence.store.
+    let validated: Uint8Array
     try {
-      update = restoreReconcile(currentState, target.state)
+      validated = restoreReconcile(currentState, target.state)
     } catch (err) {
       if (err instanceof SchemaIncompatibleError) {
-        return { ok: false, status: 409, error: 'version_schema_incompatible' }
+        return { ok: false as const, status: 409, error: 'version_schema_incompatible' }
       }
       throw err
     }
-    if (update.length > config.maxDocBytes) {
-      return { ok: false, status: 413, error: 'doc_too_large' }
+    if (validated.length > config.maxDocBytes) {
+      return { ok: false as const, status: 413, error: 'doc_too_large' }
     }
 
     // 6. Auto safety snapshot of the CURRENT live state (undo for the restore),
@@ -116,20 +123,32 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
       documentName: input.documentName,
       kind: KIND_RESTORE_MARKER,
       name: 'Auto-safety before restore',
+      restoredFrom: input.versionId,
       state: safetyState,
       schemaVersion: SCHEMA_VERSION,
       createdBy: input.uid,
     })
 
-    // 7. Persist via merge-on-write. The reconcile output is a superset of the
-    //    existing state, so this takes the direct-write path (no union reback).
-    const { finalState } = computeFinalState(currentState, update)
-    await yjsDocumentRepo.upsertStateTx(tx, input.documentName, finalState)
+    // 7. Touch doc_meta so the restore is reflected immediately; the live-doc
+    //    store path (step 8) writes the authoritative yjs_document state and
+    //    re-stamps updated_by once persisted.
     await tx.query('UPDATE doc_meta SET updated_at = NOW(3), updated_by = ? WHERE document_name = ?', [
       input.uid,
       input.documentName,
     ])
 
-    return { ok: true, restoredFromVersionId: input.versionId, safetyVersionId }
+    return { ok: true as const, restoredFrom: input.versionId, newDocVersionSeq: safetyVersionId }
   })
+
+  if (!txResult.ok) return txResult
+
+  // 8. Apply the reconcile onto the LIVE Hocuspocus document and broadcast it to
+  //    connected clients. This is the authoritative content write: it issues
+  //    real Yjs deletes on the live struct store (so deletions converge to every
+  //    tab and are NOT resurrected by a stale client's union) and durably
+  //    persists via the awaited store flush on disconnect. extension-redis
+  //    propagates the same update to other nodes that have the doc loaded.
+  await applyRestoreToLiveDoc(input.documentName, input.uid, target.state)
+
+  return { ok: true, restoredFrom: txResult.restoredFrom, newDocVersionSeq: txResult.newDocVersionSeq }
 }

@@ -30,24 +30,35 @@ export const versionsRouter = Router()
 
 const MAX_NAME_LEN = 256
 
-/** Shape a version row for the list / item JSON response. */
+/**
+ * Shape a version row for the list / item JSON response.
+ *
+ * Wire contract (FE<->BE): the version identifier the client routes on is
+ * `docVersionSeq` (the doc-scoped sequence stored as the row id) and the human
+ * label is `label`. `restoredFrom` is the source version_seq a restore-marker
+ * row was restored from (null for ordinary snapshots). The internal DB column /
+ * row id stays `id`/`name`; only the serialized keys are renamed here so the
+ * response matches the frontend.
+ */
 function toItem(v: {
   id: number
   kind: number
   name: string
+  restoredFrom: number | null
   sizeBytes: number
   schemaVersion: number
   createdAt: Date
   createdBy: string
 }) {
   return {
-    id: v.id,
+    docVersionSeq: v.id,
     kind: v.kind,
-    name: v.name,
+    label: v.name,
+    createdBy: v.createdBy,
+    createdAt: v.createdAt,
     sizeBytes: v.sizeBytes,
     schemaVersion: v.schemaVersion,
-    createdAt: v.createdAt,
-    createdBy: v.createdBy,
+    restoredFrom: v.restoredFrom,
   }
 }
 
@@ -85,8 +96,11 @@ export async function createVersionHandler(req: Request, res: Response): Promise
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'writer')
   if (!guard) return
 
-  const { name } = req.body ?? {}
-  if (name !== undefined && (typeof name !== 'string' || name.length > MAX_NAME_LEN)) {
+  // Wire contract: the frontend sends the label as `label`. Accept the legacy
+  // `name` as a fallback so older clients keep working.
+  const { label, name } = req.body ?? {}
+  const rawLabel = label ?? name
+  if (rawLabel !== undefined && (typeof rawLabel !== 'string' || rawLabel.length > MAX_NAME_LEN)) {
     res.status(400).json({ error: 'invalid_name' })
     return
   }
@@ -101,12 +115,12 @@ export async function createVersionHandler(req: Request, res: Response): Promise
     docId: guard.meta.doc_id,
     documentName,
     kind: KIND_NAMED,
-    name: typeof name === 'string' ? name : '',
+    name: typeof rawLabel === 'string' ? rawLabel : '',
     state,
     schemaVersion: SCHEMA_VERSION,
     createdBy: req.uid!,
   })
-  res.status(201).json({ id })
+  res.status(201).json({ docVersionSeq: id })
 }
 
 // ── GET /:docId/versions/:versionId/state — raw Yjs bytes (reader) ────────────
@@ -147,8 +161,11 @@ export async function renameVersionHandler(req: Request, res: Response): Promise
     res.status(400).json({ error: 'invalid_version_id' })
     return
   }
-  const { name } = req.body ?? {}
-  if (typeof name !== 'string' || name === '' || name.length > MAX_NAME_LEN) {
+  // Wire contract: the frontend sends the new label as `label`; accept legacy
+  // `name` as a fallback.
+  const { label, name } = req.body ?? {}
+  const rawLabel = label ?? name
+  if (typeof rawLabel !== 'string' || rawLabel === '' || rawLabel.length > MAX_NAME_LEN) {
     res.status(400).json({ error: 'invalid_name' })
     return
   }
@@ -158,8 +175,8 @@ export async function renameVersionHandler(req: Request, res: Response): Promise
     res.status(404).json({ error: 'not_found' })
     return
   }
-  await docVersionRepo.rename(versionId, name)
-  res.status(200).json({ id: versionId })
+  await docVersionRepo.rename(versionId, rawLabel)
+  res.status(200).json({ docVersionSeq: versionId })
 }
 
 // ── DELETE /:docId/versions/:versionId — delete (admin) ───────────────────────
@@ -180,7 +197,7 @@ export async function deleteVersionHandler(req: Request, res: Response): Promise
     return
   }
   await docVersionRepo.deleteById(versionId)
-  res.status(200).json({ id: versionId })
+  res.status(200).json({ docVersionSeq: versionId })
 }
 
 // ── POST /:docId/versions/:versionId/restore — restore (admin) ────────────────
@@ -210,9 +227,12 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
     authorizedEpoch: guard.meta.permission_epoch,
   })
   if (result.ok) {
+    // Wire contract: `restoredFrom` is the version the content was restored
+    // from; `newDocVersionSeq` is the auto-created safety snapshot recorded
+    // before the restore (so the client can reference / undo to it).
     res.status(200).json({
-      restoredFromVersionId: result.restoredFromVersionId,
-      safetyVersionId: result.safetyVersionId,
+      restoredFrom: result.restoredFrom,
+      newDocVersionSeq: result.newDocVersionSeq,
     })
     return
   }

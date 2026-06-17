@@ -71,7 +71,7 @@ export function validateAwarenessStates(
 }
 
 export function createServer() {
-  return new Server({
+  const server = new Server({
     name: `octo-docs-${config.hostname}`,
     port: config.hocuspocusPort,
 
@@ -158,4 +158,21 @@ export function createServer() {
       validateAwarenessStates(data.states, data.context as AuthContext | undefined)
     },
   })
+
+  collabServer = server
+  return server
+}
+
+/**
+ * Process-local handle to the running Hocuspocus server, set by createServer().
+ * Server-side write paths (e.g. REST version restore) need it to call
+ * openDirectConnection and reach the LIVE in-memory document of connected
+ * clients. Single-process scaffold; under multi-node owner routing (§5.2 / §9.1)
+ * the restore must run on the document's owner node, same as agent writes (§7.3).
+ */
+let collabServer: Server | null = null
+
+export function getCollabServer(): Server {
+  if (!collabServer) throw new Error('collab server not initialized')
+  return collabServer
 }
