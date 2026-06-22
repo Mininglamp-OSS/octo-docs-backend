@@ -79,9 +79,29 @@ export const docMetaRepo = {
     await query('UPDATE doc_meta SET title = ? WHERE doc_id = ?', [title, docId])
   },
 
-  /** Soft delete (status=0), §8.4. */
-  async softDelete(docId: string): Promise<void> {
-    await query('UPDATE doc_meta SET status = 0 WHERE doc_id = ?', [docId])
+  /**
+   * Soft delete (status=0), §8.4.
+   *
+   * Flips status AND bumps permission_epoch in the SAME transaction (reusing
+   * bumpEpochTx, §4.5). The epoch bump is what severs live collaboration: a
+   * connected writer's beforeHandleMessage sees the advanced epoch, rechecks,
+   * and resolveRole returns 'none' (status===0) -> 4403 reject + readOnly.
+   * Without the bump the recheck never fires and writers keep editing a deleted
+   * doc. Returns the doc's document_name and the new epoch so the caller can
+   * publish the invalidation event (mirrors acceptInvite); null if no such doc.
+   */
+  async softDelete(docId: string): Promise<{ documentName: string; permissionEpoch: number } | null> {
+    return transaction(async (tx) => {
+      await tx.query('UPDATE doc_meta SET status = 0 WHERE doc_id = ?', [docId])
+      await docMetaRepo.bumpEpochTx(tx, docId)
+      const rows = await tx.query<{ document_name: string; permission_epoch: number }>(
+        'SELECT document_name, permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+        [docId],
+      )
+      const row = rows[0]
+      if (!row) return null
+      return { documentName: row.document_name, permissionEpoch: Number(row.permission_epoch) }
+    })
   },
 
   /**

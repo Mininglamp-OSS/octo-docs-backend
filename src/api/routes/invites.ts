@@ -12,7 +12,6 @@ import { newInviteToken } from '../../util/ids.js'
 import { roleToNumber, type Role } from '../../permission/role.js'
 import { acceptInvite } from '../services/acceptInvite.js'
 import { extractOctoToken } from '../middleware/auth.js'
-import { config } from '../../config/env.js'
 
 export const invitesRouter = Router()
 
@@ -47,9 +46,10 @@ invitesRouter.post('/:docId/invites', async (req: Request, res: Response) => {
     expiresAt: expires,
     createdBy: req.uid!,
   })
+  // The share link is built by the frontend from its own origin. The backend
+  // returns only the token + role (never a Host-derived URL).
   res.status(201).json({
     inviteToken,
-    url: `${publicHost(req)}/docs/invite/${inviteToken}`,
     role: roleVal,
   })
 })
@@ -99,11 +99,3 @@ acceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res
   }
   res.status(200).json(out.body)
 })
-
-function publicHost(req: Request): string {
-  // Best-effort public base URL for the share link. The attachment bucket /
-  // host wiring is environment-specific; default to the request's host.
-  const proto = req.header('x-forwarded-proto') ?? req.protocol
-  const host = req.header('host') ?? `localhost:${config.httpPort}`
-  return `${proto}://${host}`
-}
