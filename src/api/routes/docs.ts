@@ -5,6 +5,7 @@
 import { Router, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
+import { refreshAndPublish } from '../../permission/epoch.js'
 import { newDocId } from '../../util/ids.js'
 import { requireDocRole } from '../guard.js'
 
@@ -126,6 +127,12 @@ docsRouter.delete('/:docId', async (req: Request, res: Response) => {
   const docId = req.params.docId!
   const guard = await requireDocRole(res, uid, docId, 'admin')
   if (!guard) return
-  await docMetaRepo.softDelete(docId)
+  const deleted = await docMetaRepo.softDelete(docId)
+  // Broadcast the epoch invalidation so connected writers recheck and get cut
+  // off (status===0 -> resolveRole 'none'). Doc-wide (no uid): everyone loses
+  // access on delete. Mirrors acceptInvite's refreshAndPublish call.
+  if (deleted) {
+    await refreshAndPublish(deleted.documentName, deleted.permissionEpoch)
+  }
   res.status(200).json({ docId, status: 'deleted' })
 })
