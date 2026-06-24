@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest'
 import { buildSchema, SCHEMA_VERSION } from '../src/schema/index.js'
 
 describe('Schema v3 marks (SCHEMA-SPEC §3: highlight + textStyle)', () => {
-  it('keeps SCHEMA_VERSION at or above 3 (now 4 with v4 tables; v3 marks carried)', () => {
+  it('keeps SCHEMA_VERSION at or above 3 (now 15 after the v15 co-land; v3 marks carried)', () => {
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(3)
-    expect(SCHEMA_VERSION).toBe(4)
+    expect(SCHEMA_VERSION).toBe(15)
   })
 
   it('exposes the v3 marks alongside the carried-forward v2 marks', () => {
@@ -50,12 +50,13 @@ describe('Schema v3 marks (SCHEMA-SPEC §3: highlight + textStyle)', () => {
     expect(JSON.stringify(out)).toContain('color')
   })
 
-  it('does not let a colorless textStyle span match on parse (getAttrs returns false)', () => {
+  it('does not let a colorless/font-sizeless textStyle span match on parse (getAttrs returns false)', () => {
     const schema = buildSchema()
     const rule = schema.marks.textStyle.spec.parseDOM!.find((r) => r.tag === 'span')!
     const colorless = rule.getAttrs!({ style: {} } as never)
     expect(colorless).toBe(false)
+    // textStyle now carries both the v3 `color` and the v7 `fontSize` attr.
     const colored = rule.getAttrs!({ style: { color: 'red' } } as never)
-    expect(colored).toEqual({ color: 'red' })
+    expect(colored).toEqual({ color: 'red', fontSize: null })
   })
 })

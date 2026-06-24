@@ -85,4 +85,18 @@ describe('S3ObjectStore SigV4 presign driver (§3.5)', () => {
     expect(url.host).toBe('cdn.example.com')
     expect(url.protocol).toBe('https:')
   })
+
+  it('signs response-content-disposition into the canonical query for non-inline reads', () => {
+    const store = storeAt(1_700_000_000)
+    const disp = 'attachment; filename="report.zip"'
+    const url = new URL(store.presignGet('d_1/att_1/report.zip', 600, { contentDisposition: disp }))
+    // S3/MinIO replays this query param as the response Content-Disposition; it
+    // must be present and part of the signed (SignedHeaders=host) request.
+    expect(url.searchParams.get('response-content-disposition')).toBe(disp)
+    // Adding a signed query param changes the signature vs the plain GET.
+    const plain = new URL(store.presignGet('d_1/att_1/report.zip', 600))
+    expect(url.searchParams.get('X-Amz-Signature')).not.toBe(
+      plain.searchParams.get('X-Amz-Signature'),
+    )
+  })
 })

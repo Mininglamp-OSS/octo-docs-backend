@@ -53,7 +53,7 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
     return
   }
   // verify target uid exists in octo (anti ghost-member).
-  const user = await getOctoIdentity().getUser(uid)
+  const user = await getOctoIdentity().getUser(uid, req.octoToken)
   if (!user) {
     res.status(404).json({ error: 'user_not_found' })
     return

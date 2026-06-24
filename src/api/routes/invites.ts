@@ -21,22 +21,30 @@ function parseRole(v: unknown): Role {
   return v === 'reader' || v === 'admin' ? v : 'writer' // default writer (§4.6)
 }
 
+const DEFAULT_EXPIRES_IN_DAYS = 3
+const MIN_EXPIRES_IN_DAYS = 1
+const MAX_EXPIRES_IN_DAYS = 7
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Resolve the policy-enforced lifetime (in days) from the request input.
+ * Missing/invalid → default 3; otherwise clamp to [1, 7] (silent, never 400).
+ */
+function resolveExpiresInDays(v: unknown): number {
+  if (!Number.isInteger(v)) return DEFAULT_EXPIRES_IN_DAYS
+  return Math.min(MAX_EXPIRES_IN_DAYS, Math.max(MIN_EXPIRES_IN_DAYS, v as number))
+}
+
 /** POST create invite (needs admin). */
 invitesRouter.post('/:docId/invites', async (req: Request, res: Response) => {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
   if (!guard) return
-  const { role, expiresAt, maxUses } = req.body ?? {}
+  const { role, expiresInDays, maxUses } = req.body ?? {}
   const roleVal = parseRole(role)
   const maxUsesNum = Number.isInteger(maxUses) && maxUses >= 0 ? Number(maxUses) : 0
-  let expires: Date | null = null
-  if (typeof expiresAt === 'string' && expiresAt !== '') {
-    const d = new Date(expiresAt)
-    if (Number.isNaN(d.getTime())) {
-      res.status(400).json({ error: 'invalid expiresAt' })
-      return
-    }
-    expires = d
-  }
+  // Backend-enforced lifetime: always a real Date (never a permanent NULL link).
+  const days = resolveExpiresInDays(expiresInDays)
+  const expires = new Date(Date.now() + days * DAY_MS)
   const inviteToken = newInviteToken()
   await docInviteRepo.create({
     inviteToken,
@@ -47,10 +55,11 @@ invitesRouter.post('/:docId/invites', async (req: Request, res: Response) => {
     createdBy: req.uid!,
   })
   // The share link is built by the frontend from its own origin. The backend
-  // returns only the token + role (never a Host-derived URL).
+  // returns only the token + role + computed expiry (never a Host-derived URL).
   res.status(201).json({
     inviteToken,
     role: roleVal,
+    expiresAt: expires.toISOString(),
   })
 })
 

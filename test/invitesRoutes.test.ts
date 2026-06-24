@@ -88,3 +88,84 @@ describe('POST /api/v1/docs/:docId/invites — create response (#6)', () => {
     expect(JSON.stringify(body)).not.toContain('http')
   })
 })
+
+// Request builder carrying an explicit body (role defaults to writer).
+function reqWith(body: Record<string, unknown>) {
+  return {
+    uid: 'u_admin',
+    params: { docId: 'd_1' },
+    body,
+  } as never
+}
+
+// Pull the expiresAt Date passed to docInviteRepo.create on its last call.
+function lastCreateExpiresAt(): Date {
+  const call = vi.mocked(docInviteRepo.create).mock.calls.at(-1)!
+  return (call[0] as { expiresAt: Date }).expiresAt
+}
+
+describe('POST /api/v1/docs/:docId/invites — expiresInDays policy', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000
+  // Tolerance for the small gap between our `before` stamp and the handler's
+  // own Date.now() (handler + assertion run within the same tick in practice).
+  const TOL_MS = 5_000
+
+  beforeEach(() => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: {}, role: 'admin' } as never)
+  })
+
+  // expectedDays → assert stored expiresAt ≈ now + expectedDays, and never NULL.
+  async function assertDays(body: Record<string, unknown>, expectedDays: number) {
+    const before = Date.now()
+    const res = mockRes()
+    await createInviteHandler()(reqWith(body), res as never)
+    const after = Date.now()
+
+    expect(res.statusCode).toBe(201)
+    const expires = lastCreateExpiresAt()
+    expect(expires).toBeInstanceOf(Date)
+    // Never a permanent (NULL-expiry) link.
+    expect(expires).not.toBeNull()
+    expect(expires.getTime()).toBeGreaterThanOrEqual(before + expectedDays * DAY_MS - TOL_MS)
+    expect(expires.getTime()).toBeLessThanOrEqual(after + expectedDays * DAY_MS + TOL_MS)
+
+    // Create response echoes the computed expiry as ISO.
+    const respExpiresAt = (res.body as Record<string, unknown>).expiresAt
+    expect(typeof respExpiresAt).toBe('string')
+    expect(new Date(respExpiresAt as string).getTime()).toBe(expires.getTime())
+  }
+
+  it('expiresInDays=5 → stores now + 5d', async () => {
+    await assertDays({ role: 'writer', expiresInDays: 5 }, 5)
+  })
+
+  it('no expiresInDays → defaults to now + 3d', async () => {
+    await assertDays({ role: 'writer' }, 3)
+  })
+
+  it('expiresInDays=0 → clamps to now + 1d', async () => {
+    await assertDays({ role: 'writer', expiresInDays: 0 }, 1)
+  })
+
+  it('expiresInDays=99 → clamps to now + 7d', async () => {
+    await assertDays({ role: 'writer', expiresInDays: 99 }, 7)
+  })
+
+  it('expiresInDays="abc" → defaults to now + 3d', async () => {
+    await assertDays({ role: 'writer', expiresInDays: 'abc' }, 3)
+  })
+
+  it('expiresInDays=null → defaults to now + 3d', async () => {
+    await assertDays({ role: 'writer', expiresInDays: null }, 3)
+  })
+
+  it('never creates an invite with a NULL expiry', async () => {
+    const res = mockRes()
+    await createInviteHandler()(reqWith({ role: 'writer' }), res as never)
+    for (const call of vi.mocked(docInviteRepo.create).mock.calls) {
+      const { expiresAt } = call[0] as { expiresAt: Date | null }
+      expect(expiresAt).not.toBeNull()
+      expect(expiresAt).toBeInstanceOf(Date)
+    }
+  })
+})

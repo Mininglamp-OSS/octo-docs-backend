@@ -16,6 +16,7 @@ export interface DocAttachment {
   objectKey: string
   mime: string
   sizeBytes: number
+  fileName: string
   createdBy: string
   createdAt: Date
 }
@@ -26,6 +27,7 @@ interface DocAttachmentRow {
   object_key: string
   mime: string
   size_bytes: number
+  file_name: string
   created_by: string
   created_at: Date
 }
@@ -37,6 +39,7 @@ function mapRow(row: DocAttachmentRow): DocAttachment {
     objectKey: row.object_key,
     mime: row.mime,
     sizeBytes: Number(row.size_bytes),
+    fileName: row.file_name ?? '',
     createdBy: row.created_by,
     createdAt: row.created_at,
   }
@@ -48,6 +51,7 @@ export interface RegisterAttachmentInput {
   objectKey: string
   mime: string
   sizeBytes: number
+  fileName: string
   createdBy: string
 }
 
@@ -56,14 +60,15 @@ export const docAttachmentRepo = {
   async register(input: RegisterAttachmentInput): Promise<void> {
     await query(
       `INSERT INTO doc_attachment
-         (attach_id, doc_id, object_key, mime, size_bytes, created_by)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+         (attach_id, doc_id, object_key, mime, size_bytes, file_name, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         input.attachId,
         input.docId,
         input.objectKey,
         input.mime,
         input.sizeBytes,
+        input.fileName,
         input.createdBy,
       ],
     )

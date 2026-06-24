@@ -15,6 +15,7 @@ import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
 import { invitesRouter, acceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
+import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
 
@@ -41,6 +42,7 @@ export function createApp(): Express {
   api.use(membersRouter) // /:docId/members ...
   api.use(invitesRouter) // /:docId/invites ... (admin)
   api.use(attachmentsRouter) // /:docId/attachments/presign , /:docId/attachments/:attachId
+  api.use(linkCardRouter) // /:docId/link-card (OG fetch, §3.5 ⑰)
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
 

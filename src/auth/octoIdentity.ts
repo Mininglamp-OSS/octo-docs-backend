@@ -29,11 +29,15 @@ export interface OctoIdentity {
   /**
    * (b) Look up a single user by uid. Returns null if the user does not exist
    * (used by §8.4 PUT members to reject ghost members => 404 user_not_found).
+   *
+   * octo-server's GET /v1/users/:uid requires auth, so a token is sent as the
+   * `token` header: the configured service token when set, else the optional
+   * authenticated caller's own octo session token.
    */
-  getUser(uid: string): Promise<OctoUser | null>
+  getUser(uid: string, callerToken?: string): Promise<OctoUser | null>
 
   /** (b) Batch profile lookup for awareness cursors (§4.7(b)). */
-  getUsers(uids: string[]): Promise<OctoUser[]>
+  getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>
 }
 
 /**
@@ -67,10 +71,15 @@ export class HttpOctoIdentity implements OctoIdentity {
     return { uid: body.uid, name: body.name }
   }
 
-  async getUser(uid: string): Promise<OctoUser | null> {
+  async getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
+    // octo-server requires auth on /v1/users/:uid: prefer a configured service
+    // token, else fall back to the caller's own session token. Never logged.
+    const token = config.octoIdentity.serviceToken || callerToken || ''
     let res: Response
     try {
-      res = await fetch(`${this.baseUrl}/v1/users/${encodeURIComponent(uid)}`)
+      res = await fetch(`${this.baseUrl}/v1/users/${encodeURIComponent(uid)}`, {
+        headers: token ? { token } : {},
+      })
     } catch {
       return null
     }
@@ -83,8 +92,8 @@ export class HttpOctoIdentity implements OctoIdentity {
     return { uid: body.uid, name: body.name ?? '', avatar: body.avatar }
   }
 
-  async getUsers(uids: string[]): Promise<OctoUser[]> {
-    const results = await Promise.all(uids.map((u) => this.getUser(u)))
+  async getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
+    const results = await Promise.all(uids.map((u) => this.getUser(u, callerToken)))
     return results.filter((u): u is OctoUser => u !== null)
   }
 }
@@ -110,12 +119,12 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
     return this.delegate.verifyToken(token)
   }
 
-  getUser(uid: string): Promise<OctoUser | null> {
-    return this.delegate.getUser(uid)
+  getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
+    return this.delegate.getUser(uid, callerToken)
   }
 
-  getUsers(uids: string[]): Promise<OctoUser[]> {
-    return this.delegate.getUsers(uids)
+  getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
+    return this.delegate.getUsers(uids, callerToken)
   }
 }
 

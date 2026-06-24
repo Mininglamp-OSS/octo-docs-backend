@@ -71,6 +71,10 @@ export const config = {
   octoIdentity: {
     mode: str('OCTO_IDENTITY_MODE', 'http') as OctoIdentityMode,
     serverBaseUrl: str('OCTO_SERVER_BASE_URL', 'http://127.0.0.1:8080'),
+    // Optional service token sent as the `token` header on octo-server lookups
+    // (e.g. GET /v1/users/:uid, which requires auth). Empty = not configured;
+    // callers then fall back to the authenticated user's own session token.
+    serviceToken: str('OCTO_SERVER_TOKEN', ''),
   },
 
   attachments: {
@@ -98,15 +102,69 @@ export const config = {
     uploadUrlTtlSeconds: num('ATTACHMENT_UPLOAD_URL_TTL_SECONDS', 300),
     // TTL for re-issued signed GET (read) URLs (§3.5 step 5).
     readUrlTtlSeconds: num('ATTACHMENT_READ_URL_TTL_SECONDS', 600),
-    // Hard cap on attachment size accepted at presign time.
-    maxSizeBytes: num('ATTACHMENT_MAX_SIZE_BYTES', 20 * 1024 * 1024),
-    // Comma-separated list of allowed MIME prefixes (e.g. 'image/,application/pdf').
-    allowedMimePrefixes: str('ATTACHMENT_ALLOWED_MIME_PREFIXES', 'image/'),
-    // Comma-separated MIME denylist that takes precedence over the allowed
-    // prefixes. Defaults to blocking image/svg+xml: SVG is an XML document that
-    // can carry inline <script>, so even though it matches the 'image/' prefix
-    // it is an XSS vector when served from our origin (§3.5).
-    blockedMimes: str('ATTACHMENT_BLOCKED_MIMES', 'image/svg+xml'),
+    // Size caps are tiered by MIME (§3.5). The tier is chosen by the backend
+    // from the 'image/' prefix — never trusted from the client — and both tiers
+    // hard-cap. The split exists because images render inline (kept small for
+    // collab/load), while pdf/office/zip files are routinely larger.
+    maxImageSizeBytes: num('ATTACHMENT_MAX_IMAGE_SIZE_BYTES', 10 * 1024 * 1024),
+    maxFileSizeBytes: num('ATTACHMENT_MAX_FILE_SIZE_BYTES', 50 * 1024 * 1024),
+    // Comma-separated allowed MIME list. An entry ending in '/' is a PREFIX
+    // match (e.g. 'image/' matches image/png); an entry without a trailing
+    // slash is an EXACT match (e.g. 'text/plain' must equal the base mime, so
+    // forged 'text/plaintext' is rejected — see attachments.ts:mimeAllowed).
+    allowedMimePrefixes: str(
+      'ATTACHMENT_ALLOWED_MIME_PREFIXES',
+      [
+        'image/',
+        'application/pdf',
+        'text/plain',
+        'application/zip',
+        'application/x-zip-compressed',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.ms-powerpoint',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      ].join(','),
+    ),
+    // Comma-separated MIME denylist that takes precedence over the allowed list.
+    // SVG is an XML document that can carry inline <script>, so even though it
+    // matches the 'image/' prefix it is an XSS vector when served from our
+    // origin. The rest are HTML/script/executable types that must never be
+    // served inline from our origin even if declared as an allowed type (§3.5).
+    blockedMimes: str(
+      'ATTACHMENT_BLOCKED_MIMES',
+      [
+        'image/svg+xml',
+        'text/html',
+        'application/xhtml+xml',
+        'application/x-msdownload',
+        'application/x-msdos-program',
+        'application/x-executable',
+        'application/vnd.microsoft.portable-executable',
+        'application/x-sh',
+        'application/x-csh',
+        'text/javascript',
+        'application/javascript',
+        'application/x-httpd-php',
+        'application/java-archive',
+      ].join(','),
+    ),
+  },
+
+  // §3.5 (⑰) link-card OG fetch. All outbound fetching is SSRF-guarded; these
+  // bound the request (timeout/size) and the result cache. UA is fixed so target
+  // sites can identify the bot.
+  og: {
+    fetchTimeoutMs: num('OG_FETCH_TIMEOUT_MS', 5000),
+    maxResponseBytes: num('OG_MAX_RESPONSE_BYTES', 512 * 1024),
+    maxRedirects: num('OG_MAX_REDIRECTS', 3),
+    userAgent: str('OG_USER_AGENT', 'octo-docs-linkcard/1.0 (+bot)'),
+    // Comma-separated port allowlist; anything else is treated as ssrf_blocked.
+    allowedPorts: str('OG_ALLOWED_PORTS', '80,443'),
+    cacheSuccessTtlSeconds: num('OG_CACHE_SUCCESS_TTL_SECONDS', 24 * 60 * 60),
+    cacheFailureTtlSeconds: num('OG_CACHE_FAILURE_TTL_SECONDS', 300),
   },
 
   // §9.5 single-document Yjs state hard cap.

@@ -126,6 +126,7 @@ CREATE TABLE doc_attachment (
   object_key    VARCHAR(1024) NOT NULL,           -- 对象存储 key
   mime          VARCHAR(128) NOT NULL,
   size_bytes    BIGINT       NOT NULL,
+  file_name     VARCHAR(512) NOT NULL DEFAULT '', -- 原始文件名（已 sanitize），用于下载 Content-Disposition
   created_by    VARCHAR(64)  NOT NULL,
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (attach_id),

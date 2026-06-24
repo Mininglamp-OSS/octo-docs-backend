@@ -15,6 +15,7 @@ declare global {
   namespace Express {
     interface Request {
       uid?: string
+      octoToken?: string
     }
   }
 }
@@ -39,5 +40,8 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
     return
   }
   req.uid = identity.uid
+  // Stash the raw caller token so downstream handlers can authenticate their
+  // own octo-server lookups (e.g. members.ts getUser). Never logged.
+  req.octoToken = token
   next()
 }

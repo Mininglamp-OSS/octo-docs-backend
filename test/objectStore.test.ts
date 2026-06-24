@@ -65,4 +65,32 @@ describe('LocalHmacObjectStore presign driver (§3.5)', () => {
     const asPut = getUrl.replace('X-Method=GET', 'X-Method=PUT')
     expect(store.verify(asPut).valid).toBe(false)
   })
+
+  it('carries a content-disposition param that is bound into the signature', () => {
+    const store = storeAt(1000)
+    const disp = 'attachment; filename="report.zip"'
+    const url = store.presignGet('d_1/att_1/report.zip', 600, { contentDisposition: disp })
+    expect(new URL(url).searchParams.get('response-content-disposition')).toBe(disp)
+    expect(store.verify(url).valid).toBe(true)
+  })
+
+  it('rejects a url whose content-disposition was tampered after signing', () => {
+    const store = storeAt(1000)
+    const url = store.presignGet('d_1/att_1/report.zip', 600, {
+      contentDisposition: 'attachment; filename="report.zip"',
+    })
+    const u = new URL(url)
+    u.searchParams.set('response-content-disposition', 'inline')
+    expect(store.verify(u.toString()).valid).toBe(false)
+    expect(store.verify(u.toString()).reason).toBe('bad_signature')
+  })
+
+  it('keeps the legacy (no-disposition) GET signature unchanged', () => {
+    // A GET without a disposition must verify exactly as before — the extra
+    // signing material is only appended when a disposition is present.
+    const store = storeAt(1000)
+    const url = store.presignGet('d_1/att_1/photo.png', 600)
+    expect(new URL(url).searchParams.has('response-content-disposition')).toBe(false)
+    expect(store.verify(url).valid).toBe(true)
+  })
 })

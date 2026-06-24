@@ -27,8 +27,19 @@ export interface PresignedUpload {
 export interface ObjectStore {
   /** Mint a presigned PUT URL for `objectKey`, valid for `expiresSec`. */
   presignPut(objectKey: string, mime: string, expiresSec: number): PresignedUpload
-  /** Mint a signed, time-limited GET URL for `objectKey` (§3.5 step 5). */
-  presignGet(objectKey: string, expiresSec: number): string
+  /**
+   * Mint a signed, time-limited GET URL for `objectKey` (§3.5 step 5). When
+   * `opts.contentDisposition` is set the value is bound into the signature and
+   * carried as `response-content-disposition` so object storage replays it as
+   * the response `Content-Disposition` header — used to force a download for
+   * non-inline attachment types (§3.5).
+   */
+  presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string
+}
+
+export interface PresignGetOptions {
+  /** Full Content-Disposition value, e.g. `attachment; filename="report.pdf"`. */
+  contentDisposition?: string
 }
 
 export interface VerifyResult {
@@ -38,12 +49,21 @@ export interface VerifyResult {
 }
 
 /**
- * Compute the canonical HMAC signature over (method + objectKey + expiry).
+ * Compute the canonical HMAC signature over (method + objectKey + expiry), plus
+ * any `extra` material (e.g. a content-disposition value) appended only when
+ * present so legacy URLs without it keep their original, unchanged signature.
  * The method is bound so a GET signature can't be replayed as a PUT.
  */
-function sign(method: 'PUT' | 'GET', objectKey: string, expiry: number, secret: string): string {
+function sign(
+  method: 'PUT' | 'GET',
+  objectKey: string,
+  expiry: number,
+  secret: string,
+  extra = '',
+): string {
+  const base = `${method}\n${objectKey}\n${expiry}`
   return createHmac('sha256', secret)
-    .update(`${method}\n${objectKey}\n${expiry}`)
+    .update(extra ? `${base}\n${extra}` : base)
     .digest('hex')
 }
 
@@ -79,12 +99,25 @@ export class LocalHmacObjectStore implements ObjectStore {
     return `https://${this.bucket}.object-store.local/${encodedKey}`
   }
 
-  private signedUrl(method: 'PUT' | 'GET', objectKey: string, expiresSec: number): string {
+  private signedUrl(
+    method: 'PUT' | 'GET',
+    objectKey: string,
+    expiresSec: number,
+    contentDisposition?: string,
+  ): string {
     const expiry = this.nowSec() + expiresSec
-    const signature = sign(method, objectKey, expiry, this.secret)
+    const signature = sign(method, objectKey, expiry, this.secret, contentDisposition ?? '')
     const url = new URL(this.baseUrl(objectKey))
     url.searchParams.set('X-Method', method)
     url.searchParams.set('X-Expiry', String(expiry))
+    // Bound into the HMAC above; the self-hosted gateway in front of this driver
+    // MUST replay it as `Content-Disposition` AND add `X-Content-Type-Options:
+    // nosniff` on every attachment response — signing only proves the value
+    // wasn't tampered with, it does not make the gateway emit the header (§3.5
+    // S1). Without that gateway work the local-hmac path has no XSS defence.
+    if (contentDisposition) {
+      url.searchParams.set('response-content-disposition', contentDisposition)
+    }
     url.searchParams.set('X-Signature', signature)
     return url.toString()
   }
@@ -96,8 +129,8 @@ export class LocalHmacObjectStore implements ObjectStore {
     }
   }
 
-  presignGet(objectKey: string, expiresSec: number): string {
-    return this.signedUrl('GET', objectKey, expiresSec)
+  presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string {
+    return this.signedUrl('GET', objectKey, expiresSec, opts?.contentDisposition)
   }
 
   /**
@@ -128,7 +161,10 @@ export class LocalHmacObjectStore implements ObjectStore {
       .map(decodeURIComponent)
       .join('/')
 
-    const expected = sign(method, objectKey, expiry, this.secret)
+    // Disposition (when present) is part of the signed material; '' otherwise so
+    // legacy URLs without it verify against the original signature form.
+    const disposition = url.searchParams.get('response-content-disposition') ?? ''
+    const expected = sign(method, objectKey, expiry, this.secret, disposition)
     if (!safeEqualHex(expected, signature)) return { valid: false, reason: 'bad_signature' }
     if (this.nowSec() >= expiry) return { valid: false, reason: 'expired' }
     return { valid: true }
@@ -200,7 +236,12 @@ export class S3ObjectStore implements ObjectStore {
     return `/${awsUriEncode(this.bucket)}/${encodedKey}`
   }
 
-  private presign(method: 'PUT' | 'GET', objectKey: string, expiresSec: number): string {
+  private presign(
+    method: 'PUT' | 'GET',
+    objectKey: string,
+    expiresSec: number,
+    contentDisposition?: string,
+  ): string {
     const url = new URL(this.endpoint)
     // Host header carries the port when non-default; it must match the URL host
     // exactly or the signature will not verify.
@@ -220,6 +261,12 @@ export class S3ObjectStore implements ObjectStore {
       'X-Amz-Date': amzDate,
       'X-Amz-Expires': String(expiresSec),
       'X-Amz-SignedHeaders': 'host',
+    }
+    // S3/MinIO natively replays `response-content-disposition` as the response
+    // Content-Disposition header; signing it (it joins the canonical query
+    // below) is sufficient to force a download for non-inline types (§3.5).
+    if (contentDisposition) {
+      params['response-content-disposition'] = contentDisposition
     }
 
     const canonicalQuery = Object.entries(params)
@@ -264,8 +311,8 @@ export class S3ObjectStore implements ObjectStore {
     }
   }
 
-  presignGet(objectKey: string, expiresSec: number): string {
-    return this.presign('GET', objectKey, expiresSec)
+  presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string {
+    return this.presign('GET', objectKey, expiresSec, opts?.contentDisposition)
   }
 }
 

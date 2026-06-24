@@ -83,7 +83,16 @@ Copy `.env.example` to `.env` and adjust. Summary:
 npm install
 
 # 2. create the schema (the 8 tables from §3.4)
+#    FRESH INSTALL ONLY — schema.sql holds the full CREATE TABLE DDLs and is
+#    applied once. Re-running it on an existing DB does nothing for tables that
+#    already exist, so it does NOT add columns introduced after the initial
+#    install — use the upgrade migrations below for that.
 mysql -u <user> -p <database> < migrations/schema.sql
+
+# 2b. EXISTING DEPLOYMENTS — apply the incremental upgrade migrations in
+#     migrations/upgrades/ IN FILENAME (date) ORDER. Each is idempotent and
+#     safe to re-run. Skip on a fresh install (schema.sql already covers them).
+mysql -u <user> -p <database> < migrations/upgrades/2026-06-23-add-doc-attachment-file-name.sql
 
 # 3. dev server (tsx watch) — starts both WS (:1234) and REST (:3000)
 npm run dev
@@ -110,7 +119,9 @@ against real MySQL/Redis are a future round (gate them behind env if added).
 
 ```
 backend/
-├─ migrations/schema.sql        # §3.4 — the 8 DDLs, copied verbatim
+├─ migrations/
+│  ├─ schema.sql                # §3.4 — the 8 DDLs, copied verbatim (fresh install)
+│  └─ upgrades/                 # idempotent incremental migrations for existing DBs
 ├─ src/
 │  ├─ config/env.ts             # typed env config
 │  ├─ db/
