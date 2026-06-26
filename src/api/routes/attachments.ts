@@ -14,7 +14,7 @@ import { requireDocRole } from '../guard.js'
 import { newAttachId } from '../../util/ids.js'
 import { config } from '../../config/env.js'
 import { getObjectStore } from '../../storage/objectStore.js'
-import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
+import { docAttachmentRepo, type DocAttachment } from '../../db/repos/docAttachmentRepo.js'
 
 export const attachmentsRouter = Router()
 
@@ -103,6 +103,23 @@ function sanitizeFileName(fileName: string): string {
 function dispositionFileName(fileName: string): string {
   const cleaned = fileName.replace(/[\p{Cc}"\\]/gu, '').trim()
   return cleaned === '' ? 'file' : cleaned
+}
+
+/**
+ * Mint a freshly signed, time-limited GET URL for a stored attachment. Non-inline
+ * types (anything but image/ and application/pdf) carry a forced-download
+ * Content-Disposition so a forged HTML/script payload declared as an allowed type
+ * cannot render in the browser; the disposition is baked into the signed URL so
+ * object storage replays it as the response header (§3.5). dispositionFileName
+ * strips quote/backslash/control chars first, so the file name cannot break out
+ * of the quoted-string or inject a CR-LF header. The single read and batch
+ * resolve endpoints share this one path so they never drift.
+ */
+function presignReadUrl(attachment: DocAttachment, ttl: number): string {
+  const contentDisposition = isInlineType(attachment.mime)
+    ? undefined
+    : `attachment; filename="${dispositionFileName(attachment.fileName)}"`
+  return getObjectStore().presignGet(attachment.objectKey, ttl, { contentDisposition })
 }
 
 attachmentsRouter.post('/:docId/attachments/presign', presignHandler)
@@ -204,14 +221,7 @@ export async function readHandler(req: Request, res: Response): Promise<void> {
   }
 
   const ttl = config.attachments.readUrlTtlSeconds
-  // Non-inline types (anything but image/ and application/pdf) must download,
-  // not render, in the browser — defends against forged HTML/script content
-  // declared as an allowed type. The disposition is baked into the signed URL so
-  // object storage replays it as the Content-Disposition response header (§3.5).
-  const contentDisposition = isInlineType(attachment.mime)
-    ? undefined
-    : `attachment; filename="${dispositionFileName(attachment.fileName)}"`
-  const url = getObjectStore().presignGet(attachment.objectKey, ttl, { contentDisposition })
+  const url = presignReadUrl(attachment, ttl)
 
   res.status(200).json({
     attachId: attachment.attachId,
@@ -222,4 +232,78 @@ export async function readHandler(req: Request, res: Response): Promise<void> {
     url,
     expiresInSec: ttl,
   })
+}
+
+/**
+ * Read-only batch signed-URL resolve (§3.3, RES-1..3): given a list of attachIds,
+ * return a freshly signed GET URL plus metadata for each one owned by this doc.
+ * Export-to-markdown needs this because the file-attachment node carries no URL
+ * at all and the image node's cached src may already be expired — at export time
+ * the front-end exchanges the attachIds for fresh links. Nothing is embedded and
+ * no binary is packaged; the links may expire and are re-fetched on demand.
+ */
+attachmentsRouter.post('/:docId/attachments/resolve', resolveHandler)
+
+export async function resolveHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'reader')
+  if (!guard) return
+
+  const { attachIds } = req.body ?? {}
+
+  // RES-1 hard constraints: the body must be a non-empty array of strings.
+  if (
+    !Array.isArray(attachIds) ||
+    attachIds.length === 0 ||
+    attachIds.some((id) => typeof id !== 'string')
+  ) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+  // RES-1 hard cap: reject over-cap requests outright — never silently truncate,
+  // which would drop attachments and break the lossless-export guarantee.
+  if (attachIds.length > config.attachments.maxResolveBatch) {
+    res.status(400).json({ error: 'attachIds_too_many' })
+    return
+  }
+
+  // Dedup while keeping first-seen order so the response is stable.
+  const requested = [...new Set(attachIds as string[])]
+
+  // RES-2 anti-enumeration: one query for this doc's whole set, then O(1)
+  // membership checks. An id not in the set (cross-doc or non-existent) lands in
+  // notFound with no existence leak, matching readHandler's cross-doc 404 stance.
+  const owned = new Map<string, DocAttachment>()
+  for (const attachment of await docAttachmentRepo.listByDoc(guard.meta.doc_id)) {
+    owned.set(attachment.attachId, attachment)
+  }
+
+  const ttl = config.attachments.readUrlTtlSeconds
+  const items: Array<{
+    attachId: string
+    url: string
+    expiresInSec: number
+    mime: string
+    sizeBytes: number
+    fileName: string
+  }> = []
+  const notFound: string[] = []
+
+  for (const attachId of requested) {
+    const attachment = owned.get(attachId)
+    if (!attachment) {
+      notFound.push(attachId)
+      continue
+    }
+    // RES-3: same presign + Content-Disposition path as the single read endpoint.
+    items.push({
+      attachId: attachment.attachId,
+      url: presignReadUrl(attachment, ttl),
+      expiresInSec: ttl,
+      mime: attachment.mime,
+      sizeBytes: attachment.sizeBytes,
+      fileName: attachment.fileName,
+    })
+  }
+
+  res.status(200).json({ items, notFound })
 }

@@ -87,10 +87,45 @@ export interface CreateVersionInput {
   createdBy: string
 }
 
+/** Filter dimension for listByDoc (maps to a kind SQL predicate). */
+export type VersionKindFilter = 'manual' | 'auto' | 'all'
+
 export interface ListVersionsOptions {
   cursor?: number
   limit?: number
+  /**
+   * Kind filter: `manual` = kind <> AUTO (named + restore), `auto` = kind = AUTO,
+   * `all` = no kind predicate. Takes precedence over `includeAuto` when set.
+   */
+  kind?: VersionKindFilter
+  /**
+   * Backward-compat alias, honoured ONLY when `kind` is absent:
+   * true -> 'all', false/absent -> 'manual' (preserves the legacy default of
+   * excluding auto snapshots).
+   */
   includeAuto?: boolean
+}
+
+/** Per-kind full counts for a doc (independent of limit/cursor). */
+export interface VersionCounts {
+  auto: number
+  manual: number
+  restore: number
+  total: number
+}
+
+/** Input for an auto snapshot written with same-transaction retention pruning. */
+export interface CreateAutoInput {
+  docId: string
+  documentName: string
+  /** Raw (uncompressed) Yjs state = Y.encodeStateAsUpdate(doc) at snapshot time. */
+  state: Uint8Array
+  schemaVersion: number
+  createdBy: string
+  /** Keep at most the most-recent N auto rows for this doc (AUTO_RETAIN_COUNT). */
+  retainCount: number
+  /** Drop auto rows older than this many days (AUTO_RETAIN_DAYS). */
+  retainDays: number
 }
 
 export const docVersionRepo = {
@@ -126,6 +161,62 @@ export const docVersionRepo = {
     return transaction((tx) => this.createTx(tx, input))
   },
 
+  /**
+   * Insert a KIND_AUTO snapshot and prune stale auto rows in ONE transaction
+   * (§5.4 / §0-A A4-2). Doing both under a single transaction avoids the race
+   * where two concurrent afterStoreDocument writers prune each other's rows.
+   *
+   * Two prune passes, both pinned to `kind = KIND_AUTO` as a HARD constraint:
+   * KIND_NAMED / KIND_RESTORE_MARKER rows are NEVER eligible for deletion.
+   *   1. by count — keep the most-recent `retainCount` auto rows (ORDER BY id
+   *      DESC for a stable "latest N"). MySQL forbids referencing the target
+   *      table directly in a DELETE subquery, so the keep-set is wrapped in an
+   *      aliased derived table.
+   *   2. by age  — drop auto rows older than `retainDays` days.
+   * Both run on the existing idx_doc_kind (doc_id, kind, id) index.
+   *
+   * `retainCount` / `retainDays` are clamped to non-negative integers and
+   * inlined into the SQL: mysql2 `.execute()` (prepared statements) rejects a
+   * `?` bind for LIMIT / INTERVAL with ER_WRONG_ARGUMENTS, and the clamped
+   * integers carry no injection surface (same rationale as listByDoc's LIMIT).
+   */
+  async createAutoWithPrune(input: CreateAutoInput): Promise<number> {
+    const keep = Math.max(1, Math.floor(input.retainCount))
+    const days = Math.max(0, Math.floor(input.retainDays))
+    return transaction(async (tx) => {
+      const id = await this.createTx(tx, {
+        docId: input.docId,
+        documentName: input.documentName,
+        kind: KIND_AUTO,
+        state: input.state,
+        schemaVersion: input.schemaVersion,
+        createdBy: input.createdBy,
+      })
+      // 1. count-based prune (keep most-recent N auto rows for this doc).
+      await tx.query(
+        `DELETE FROM doc_version
+         WHERE doc_id = ? AND kind = ?
+           AND id NOT IN (
+             SELECT id FROM (
+               SELECT id FROM doc_version
+               WHERE doc_id = ? AND kind = ?
+               ORDER BY id DESC
+               LIMIT ${keep}
+             ) AS keep
+           )`,
+        [input.docId, KIND_AUTO, input.docId, KIND_AUTO],
+      )
+      // 2. age-based prune (drop auto rows older than retainDays).
+      await tx.query(
+        `DELETE FROM doc_version
+         WHERE doc_id = ? AND kind = ?
+           AND created_at < NOW() - INTERVAL ${days} DAY`,
+        [input.docId, KIND_AUTO],
+      )
+      return id
+    })
+  },
+
   /** Metadata for one version (no blob). Returns null if absent. */
   async getById(id: number): Promise<DocVersion | null> {
     const rows = await query<DocVersionMetaRow>(
@@ -148,19 +239,26 @@ export const docVersionRepo = {
   },
 
   /**
-   * List a doc's versions newest-first with id-cursor pagination. `includeAuto`
-   * controls whether kind=auto snapshots are surfaced (default: excluded). The
-   * cursor is the smallest id already returned; the next page is id < cursor.
+   * List a doc's versions newest-first with id-cursor pagination. The kind
+   * filter selects which streams are returned: `manual` (named + restore),
+   * `auto`, or `all`. `kind` takes precedence; when absent the legacy
+   * `includeAuto` alias maps true -> 'all', false/absent -> 'manual' (the
+   * historical default of excluding auto snapshots). Each kind stream paginates
+   * independently — the cursor is just id < cursor on the filtered set.
    */
   async listByDoc(
     docId: string,
     opts: ListVersionsOptions = {},
   ): Promise<{ items: DocVersion[]; nextCursor: number | null }> {
     const limit = Math.min(100, Math.max(1, Number.isInteger(opts.limit) ? opts.limit! : 20))
+    const filter: VersionKindFilter = opts.kind ?? (opts.includeAuto ? 'all' : 'manual')
     const conds = ['doc_id = ?']
     const args: unknown[] = [docId]
-    if (!opts.includeAuto) {
+    if (filter === 'manual') {
       conds.push('kind <> ?')
+      args.push(KIND_AUTO)
+    } else if (filter === 'auto') {
+      conds.push('kind = ?')
       args.push(KIND_AUTO)
     }
     if (opts.cursor != null) {
@@ -184,6 +282,28 @@ export const docVersionRepo = {
     const items = (hasMore ? rows.slice(0, limit) : rows).map(mapRow)
     const nextCursor = hasMore ? items[items.length - 1]!.id : null
     return { items, nextCursor }
+  },
+
+  /**
+   * Per-kind full counts for a doc, independent of limit/cursor. A single
+   * COUNT(*) ... GROUP BY kind over idx_doc_kind (doc_id, kind, id) maps to the
+   * four reported fields: auto (kind=1), manual (kind=2, NAMED only), restore
+   * (kind=3), and their total. Missing kinds report 0.
+   */
+  async countsByKind(docId: string): Promise<VersionCounts> {
+    const rows = await query<{ kind: number; c: number }>(
+      `SELECT kind, COUNT(*) AS c FROM doc_version WHERE doc_id = ? GROUP BY kind`,
+      [docId],
+    )
+    const counts: VersionCounts = { auto: 0, manual: 0, restore: 0, total: 0 }
+    for (const row of rows) {
+      const n = Number(row.c)
+      if (Number(row.kind) === KIND_AUTO) counts.auto = n
+      else if (Number(row.kind) === KIND_NAMED) counts.manual = n
+      else if (Number(row.kind) === KIND_RESTORE_MARKER) counts.restore = n
+    }
+    counts.total = counts.auto + counts.manual + counts.restore
+    return counts
   },
 
   /** Rename a named snapshot's label. */

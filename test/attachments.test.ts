@@ -11,7 +11,7 @@ vi.mock('../src/db/pool.js', () => ({
   transaction: vi.fn(),
 }))
 
-import { presignHandler, readHandler } from '../src/api/routes/attachments.js'
+import { presignHandler, readHandler, resolveHandler } from '../src/api/routes/attachments.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { query } from '../src/db/pool.js'
@@ -256,6 +256,126 @@ describe('read-time Content-Disposition (§3.5 ⑯ A2)', () => {
       const url = new URL((res.body as { url: string }).url)
       expect(url.searchParams.get('response-content-disposition'), mime).toBeNull()
     }
+  })
+})
+
+describe('POST resolve batch (§3.3 RES-1..3)', () => {
+  const readerGuard = { meta: { doc_id: 'd_1' }, role: 'reader' } as never
+
+  const row = (attachId: string, mime: string, fileName: string, docId = 'd_1') => ({
+    attach_id: attachId,
+    doc_id: docId,
+    object_key: `${docId}/${attachId}/${fileName}`,
+    mime,
+    size_bytes: 2048,
+    file_name: fileName,
+    created_by: 'u',
+    created_at: new Date(0),
+  })
+
+  it('resolves a list of owned attachIds with fresh signed urls + metadata', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValue([
+      row('att_1', 'image/png', 'a.png'),
+      row('att_2', 'application/zip', 'b.zip'),
+    ] as never)
+    const res = mockRes()
+    await resolveHandler(req({ docId: 'd_1' }, { attachIds: ['att_1', 'att_2'] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      items: Array<{ attachId: string; url: string; expiresInSec: number; mime: string; fileName: string }>
+      notFound: string[]
+    }
+    expect(body.notFound).toEqual([])
+    expect(body.items.map((i) => i.attachId)).toEqual(['att_1', 'att_2'])
+    for (const item of body.items) {
+      expect(item.expiresInSec).toBeGreaterThan(0)
+      expect(verifySignedUrl(item.url).valid).toBe(true)
+    }
+    // The non-inline zip carries a forced-download disposition; the image does not.
+    const zip = body.items.find((i) => i.attachId === 'att_2')!
+    expect(new URL(zip.url).searchParams.get('response-content-disposition')).toBe(
+      'attachment; filename="b.zip"',
+    )
+    const img = body.items.find((i) => i.attachId === 'att_1')!
+    expect(new URL(img.url).searchParams.get('response-content-disposition')).toBeNull()
+  })
+
+  it('puts cross-doc and non-existent attachIds in notFound (no existence leak)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    // listByDoc only ever returns this doc's rows; a cross-doc / unknown id is
+    // simply absent from the set.
+    vi.mocked(query).mockResolvedValue([row('att_1', 'image/png', 'a.png')] as never)
+    const res = mockRes()
+    await resolveHandler(
+      req({ docId: 'd_1' }, { attachIds: ['att_1', 'att_other_doc', 'att_missing'] }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { items: Array<{ attachId: string }>; notFound: string[] }
+    expect(body.items.map((i) => i.attachId)).toEqual(['att_1'])
+    expect(body.notFound).toEqual(['att_other_doc', 'att_missing'])
+  })
+
+  it('rejects an over-cap list with 400 attachIds_too_many (no truncation)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    const attachIds = Array.from({ length: 201 }, (_, i) => `att_${i}`)
+    const res = mockRes()
+    await resolveHandler(req({ docId: 'd_1' }, { attachIds }), res as never)
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('attachIds_too_many')
+    // No DB lookup should have happened on rejection.
+    expect(vi.mocked(query)).not.toHaveBeenCalled()
+  })
+
+  it('rejects empty array / non-array / non-string element with 400 invalid_body', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    for (const attachIds of [[], 'att_1', { 0: 'att_1' }, ['att_1', 42], [null]]) {
+      const res = mockRes()
+      await resolveHandler(req({ docId: 'd_1' }, { attachIds }), res as never)
+      expect(res.statusCode, JSON.stringify(attachIds)).toBe(400)
+      expect((res.body as { error: string }).error).toBe('invalid_body')
+    }
+  })
+
+  it('is blocked when requireDocRole denies (insufficient role)', async () => {
+    // Guard writes its own 403 and returns falsy; the handler must bail out.
+    vi.mocked(requireDocRole).mockResolvedValue(null as never)
+    const res = mockRes()
+    await resolveHandler(req({ docId: 'd_1' }, { attachIds: ['att_1'] }), res as never)
+    expect(vi.mocked(query)).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(0)
+  })
+
+  it('sanitizes a CR/LF + quote file name in the disposition (no header injection)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValue([
+      row('att_1', 'application/zip', 'evil"\r\nSet-Cookie: x.zip'),
+    ] as never)
+    const res = mockRes()
+    await resolveHandler(req({ docId: 'd_1' }, { attachIds: ['att_1'] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const item = (res.body as { items: Array<{ url: string }> }).items[0]!
+    const disp = new URL(item.url).searchParams.get('response-content-disposition')!
+    // The inner quote, backslash and CR/LF are stripped, leaving a single safe
+    // quoted-string — no breakout, no injected header line.
+    expect(disp).toBe('attachment; filename="evilSet-Cookie: x.zip"')
+    expect(disp).not.toContain('\r')
+    expect(disp).not.toContain('\n')
+    expect(verifySignedUrl(item.url).valid).toBe(true)
+  })
+
+  it('dedups repeated attachIds while keeping a stable order', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValue([
+      row('att_1', 'image/png', 'a.png'),
+      row('att_2', 'image/png', 'b.png'),
+    ] as never)
+    const res = mockRes()
+    await resolveHandler(req({ docId: 'd_1' }, { attachIds: ['att_2', 'att_1', 'att_2'] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { items: Array<{ attachId: string }> }
+    expect(body.items.map((i) => i.attachId)).toEqual(['att_2', 'att_1'])
   })
 })
 

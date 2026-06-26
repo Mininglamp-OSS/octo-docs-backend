@@ -28,7 +28,12 @@ import {
   restoreVersionHandler,
 } from '../src/api/routes/versions.js'
 import { requireDocRole } from '../src/api/guard.js'
-import { docVersionRepo, KIND_RESTORE_MARKER } from '../src/db/repos/docVersionRepo.js'
+import {
+  docVersionRepo,
+  KIND_AUTO,
+  KIND_NAMED,
+  KIND_RESTORE_MARKER,
+} from '../src/db/repos/docVersionRepo.js'
 import { restoreVersion } from '../src/api/services/restoreVersion.js'
 import { persistence } from '../src/collab/persistence.js'
 import { applyRestoreToLiveDoc } from '../src/collab/liveRestore.js'
@@ -333,6 +338,138 @@ describe('restore endpoint schema gate', () => {
     await restoreVersionHandler(req({ docId: 'd_1', versionId: '1' }), res as never)
     expect(res.statusCode).toBe(409)
     expect((res.body as { error: string }).error).toBe('version_schema_newer')
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+})
+
+// ── preview endpoint: backend-decoded PM JSON, schema gate + empty-doc fallback ─
+// Mirrors the restore path's protections (gateSchema + decodeTargetSnapshot) that
+// the preview endpoint previously lacked. Preview reuses the SAME pure helpers and
+// must never touch any restore write path.
+describe('getVersionStateHandler — decoded preview (A3)', () => {
+  function versionRow(overrides: Partial<{ docId: string; schemaVersion: number }> = {}) {
+    return {
+      id: 5,
+      docId: overrides.docId ?? 'd_1',
+      documentName: 'octo:s1:f_default:d_1',
+      kind: 2,
+      name: '',
+      restoredFrom: null,
+      compressed: 1,
+      sizeBytes: 2,
+      schemaVersion: overrides.schemaVersion ?? SCHEMA_VERSION,
+      createdAt: new Date(0),
+      createdBy: 'u_1',
+    }
+  }
+
+  // T1: a brand-new doc snapshotted before any edit stores an empty Y.Doc, which
+  // decodes to a contentless `doc` — preview must return the canonical empty doc
+  // (one empty paragraph), NOT an error.
+  it('returns 200 + canonical empty doc for an empty snapshot (new doc, immediate save)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const emptyState = Y.encodeStateAsUpdate(new Y.Doc())
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow() as never,
+      state: emptyState,
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.headers['Content-Type']).toBeUndefined() // JSON, not octet-stream
+    const body = res.body as { doc: { content?: unknown[] }; schemaVersion: number; docVersionSeq: number }
+    expect(body.doc.content).toHaveLength(1)
+    expect(paragraphTexts(body.doc)).toEqual([''])
+    expect(body.schemaVersion).toBe(SCHEMA_VERSION)
+    expect(body.docVersionSeq).toBe(5)
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  // T2: a snapshot from a NEWER schema cannot be safely loaded → 409, consistent
+  // with the restore path's error code.
+  it('returns 409 version_schema_newer when the target schema is newer', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow({ schemaVersion: SCHEMA_VERSION + 1 }) as never,
+      state: stateFromPM({ type: 'doc', content: [para('A')] }),
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('version_schema_newer')
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  // T3: a normal non-empty snapshot decodes to its exact PM JSON content.
+  it('returns 200 with the decoded PM JSON for a normal non-empty version', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow() as never,
+      state: stateFromPM({ type: 'doc', content: [para('hello'), para('world')] }),
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { doc: unknown; schemaVersion: number; docVersionSeq: number }
+    expect((body.doc as { type: string }).type).toBe('doc')
+    expect(paragraphTexts(body.doc)).toEqual(['hello', 'world'])
+    expect(body.docVersionSeq).toBe(5)
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  // T4: a versionId belonging to another doc is hidden behind 404 (no existence leak).
+  it('returns 404 not_found for a cross-doc versionId', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow({ docId: 'd_other' }) as never,
+      state: stateFromPM({ type: 'doc', content: [para('A')] }),
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(404)
+    expect((res.body as { error: string }).error).toBe('not_found')
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  it('returns 400 invalid_version_id for a non-positive-integer versionId', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: 'abc' }), res as never)
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_version_id')
+  })
+
+  // T5: preview reuses only the PURE decode helpers — it must NOT touch any restore
+  // write path (no transaction, no createTx, no live-document apply).
+  it('never touches the restore write path (pure decode only)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow() as never,
+      state: stateFromPM({ type: 'doc', content: [para('A')] }),
+    })
+    const createTxSpy = vi.spyOn(docVersionRepo, 'createTx')
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(transaction).not.toHaveBeenCalled()
+    expect(createTxSpy).not.toHaveBeenCalled()
+    expect(applyRestoreToLiveDoc).not.toHaveBeenCalled()
+
+    createTxSpy.mockRestore()
     vi.mocked(docVersionRepo.getStateById).mockRestore()
   })
 })
@@ -665,5 +802,218 @@ describe('restoreVersion service — safety snapshot (BUG2 rollback)', () => {
 
     createSpy.mockRestore()
     vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+})
+
+// ── A4: kind-filtered streams + per-kind counts ───────────────────────────────
+// The list path is mocked at the SQL boundary (`query`), so these assert the
+// exact kind predicate the repo emits — that IS the filter mechanism. A `manual`
+// query can never surface auto rows because the DB is told `kind <> AUTO`.
+describe('docVersionRepo.listByDoc — kind filter (A4 streams)', () => {
+  /** Capture every (sql, args) the repo issues; return empty rows. */
+  function captureQuery() {
+    const calls: { sql: string; args: unknown[] }[] = []
+    vi.mocked(query).mockImplementation((async (sql: string, args?: unknown[]) => {
+      calls.push({ sql, args: args ?? [] })
+      return [] as never
+    }) as never)
+    return calls
+  }
+
+  it('kind=manual filters kind <> AUTO (named + restore, excludes auto)', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', { kind: 'manual' })
+    expect(calls[0]!.sql).toContain('kind <> ?')
+    expect(calls[0]!.sql).not.toContain('kind = ?')
+    expect(calls[0]!.args).toContain(KIND_AUTO)
+  })
+
+  it('kind=auto filters kind = AUTO (auto only)', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', { kind: 'auto' })
+    expect(calls[0]!.sql).toContain('kind = ?')
+    expect(calls[0]!.sql).not.toContain('kind <> ?')
+    expect(calls[0]!.args).toContain(KIND_AUTO)
+  })
+
+  it('kind=all applies no kind predicate (all kinds)', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', { kind: 'all' })
+    expect(calls[0]!.sql).not.toContain('kind <> ?')
+    expect(calls[0]!.sql).not.toContain('kind = ?')
+  })
+
+  it('default (no kind, no includeAuto) behaves like manual — backward compat', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', {})
+    expect(calls[0]!.sql).toContain('kind <> ?')
+    expect(calls[0]!.args).toContain(KIND_AUTO)
+  })
+
+  it('includeAuto=true (no kind) behaves like all', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', { includeAuto: true })
+    expect(calls[0]!.sql).not.toContain('kind <> ?')
+    expect(calls[0]!.sql).not.toContain('kind = ?')
+  })
+
+  it('includeAuto=false (no kind) behaves like manual', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', { includeAuto: false })
+    expect(calls[0]!.sql).toContain('kind <> ?')
+  })
+
+  it('explicit kind overrides includeAuto (kind=auto wins over includeAuto=false)', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', { kind: 'auto', includeAuto: false })
+    expect(calls[0]!.sql).toContain('kind = ?')
+    expect(calls[0]!.sql).not.toContain('kind <> ?')
+  })
+
+  it('cursor narrows each stream independently (id < cursor coexists with the kind predicate)', async () => {
+    const calls = captureQuery()
+    await docVersionRepo.listByDoc('d_1', { kind: 'manual', cursor: 50 })
+    // Both the manual kind predicate and the cursor bound are present, so paging
+    // the manual stream never spills into auto rows.
+    expect(calls[0]!.sql).toContain('kind <> ?')
+    expect(calls[0]!.sql).toContain('id < ?')
+    expect(calls[0]!.args).toEqual(['d_1', KIND_AUTO, 50])
+  })
+
+  it('manual stream is not crowded out by auto rows — a full page of manual rows still pages', async () => {
+    // The DB only ever returns manual/restore rows for a manual query (kind<>AUTO),
+    // so even with thousands of auto rows in the table, limit applies to manual.
+    const metaRow = (id: number, kind: number) => ({
+      id,
+      doc_id: 'd_1',
+      document_name: 'octo:s1:f_default:d_1',
+      kind,
+      name: kind === KIND_NAMED ? `n${id}` : '',
+      restored_from: null,
+      compressed: 1,
+      size_bytes: 1,
+      schema_version: SCHEMA_VERSION,
+      created_at: new Date(0),
+      created_by: 'u_1',
+    })
+    // limit=2 → repo fetches 3; all named ⇒ hasMore=true, nextCursor = last id.
+    vi.mocked(query).mockResolvedValue([
+      metaRow(30, KIND_NAMED),
+      metaRow(20, KIND_NAMED),
+      metaRow(10, KIND_NAMED),
+    ] as never)
+    const { items, nextCursor } = await docVersionRepo.listByDoc('d_1', { kind: 'manual', limit: 2 })
+    expect(items.map((i) => i.id)).toEqual([30, 20])
+    expect(items.every((i) => i.kind !== KIND_AUTO)).toBe(true)
+    expect(nextCursor).toBe(20)
+  })
+})
+
+describe('docVersionRepo.countsByKind — per-kind full counts', () => {
+  it('maps GROUP BY kind rows to {auto, manual, restore, total}', async () => {
+    vi.mocked(query).mockResolvedValue([
+      { kind: KIND_AUTO, c: 50 },
+      { kind: KIND_NAMED, c: 3 },
+      { kind: KIND_RESTORE_MARKER, c: 2 },
+    ] as never)
+    const counts = await docVersionRepo.countsByKind('d_1')
+    expect(counts).toEqual({ auto: 50, manual: 3, restore: 2, total: 55 })
+  })
+
+  it('reports 0 for absent kinds', async () => {
+    vi.mocked(query).mockResolvedValue([{ kind: KIND_NAMED, c: 1 }] as never)
+    const counts = await docVersionRepo.countsByKind('d_1')
+    expect(counts).toEqual({ auto: 0, manual: 1, restore: 0, total: 1 })
+  })
+
+  it('counts are independent of limit/cursor (full-doc tally regardless of paging)', async () => {
+    // N auto + M named + K restore for the doc; counts reflect the whole doc.
+    const N = 7, M = 3, K = 2
+    vi.mocked(query).mockResolvedValue([
+      { kind: KIND_AUTO, c: N },
+      { kind: KIND_NAMED, c: M },
+      { kind: KIND_RESTORE_MARKER, c: K },
+    ] as never)
+    const counts = await docVersionRepo.countsByKind('d_1')
+    expect(counts).toEqual({ auto: N, manual: M, restore: K, total: N + M + K })
+  })
+
+  it('issues a single GROUP BY kind query scoped to the doc', async () => {
+    const calls: { sql: string; args: unknown[] }[] = []
+    vi.mocked(query).mockImplementation((async (sql: string, args?: unknown[]) => {
+      calls.push({ sql, args: args ?? [] })
+      return [] as never
+    }) as never)
+    await docVersionRepo.countsByKind('d_1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sql).toContain('GROUP BY kind')
+    expect(calls[0]!.sql).toContain('doc_id = ?')
+    expect(calls[0]!.args).toEqual(['d_1'])
+  })
+})
+
+describe('listVersionsHandler — kind param + counts response', () => {
+  it('returns 400 invalid_kind for an unrecognized kind value', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const res = mockRes()
+    await listVersionsHandler(req({ docId: 'd_1' }, { query: { kind: 'bogus' } }), res as never)
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_kind')
+  })
+
+  it('passes a valid kind through to listByDoc and embeds counts in the response', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const listSpy = vi
+      .spyOn(docVersionRepo, 'listByDoc')
+      .mockResolvedValue({ items: [], nextCursor: null } as never)
+    const countsSpy = vi
+      .spyOn(docVersionRepo, 'countsByKind')
+      .mockResolvedValue({ auto: 50, manual: 1, restore: 0, total: 51 })
+
+    const res = mockRes()
+    await listVersionsHandler(req({ docId: 'd_1' }, { query: { kind: 'auto' } }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(listSpy.mock.calls[0]![1]).toMatchObject({ kind: 'auto' })
+    const body = res.body as { items: unknown[]; nextCursor: number | null; counts: unknown }
+    expect(body.counts).toEqual({ auto: 50, manual: 1, restore: 0, total: 51 })
+    expect(countsSpy).toHaveBeenCalledWith('d_1')
+
+    listSpy.mockRestore()
+    countsSpy.mockRestore()
+  })
+
+  it('forwards includeAuto as a compat alias only when kind is absent', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const listSpy = vi
+      .spyOn(docVersionRepo, 'listByDoc')
+      .mockResolvedValue({ items: [], nextCursor: null } as never)
+    vi.spyOn(docVersionRepo, 'countsByKind').mockResolvedValue({ auto: 0, manual: 0, restore: 0, total: 0 })
+
+    const res = mockRes()
+    await listVersionsHandler(req({ docId: 'd_1' }, { query: { includeAuto: 'true' } }), res as never)
+    expect(listSpy.mock.calls[0]![1]).toMatchObject({ includeAuto: true, kind: undefined })
+
+    listSpy.mockRestore()
+    vi.mocked(docVersionRepo.countsByKind).mockRestore()
+  })
+
+  it('ignores includeAuto when an explicit kind is provided', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const listSpy = vi
+      .spyOn(docVersionRepo, 'listByDoc')
+      .mockResolvedValue({ items: [], nextCursor: null } as never)
+    vi.spyOn(docVersionRepo, 'countsByKind').mockResolvedValue({ auto: 0, manual: 0, restore: 0, total: 0 })
+
+    const res = mockRes()
+    await listVersionsHandler(
+      req({ docId: 'd_1' }, { query: { kind: 'manual', includeAuto: 'true' } }),
+      res as never,
+    )
+    // kind set, includeAuto NOT forwarded (parsed only when kind absent).
+    expect(listSpy.mock.calls[0]![1]).toMatchObject({ kind: 'manual', includeAuto: undefined })
+
+    listSpy.mockRestore()
+    vi.mocked(docVersionRepo.countsByKind).mockRestore()
   })
 })

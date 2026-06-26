@@ -22,6 +22,12 @@ function num(name: string, fallback: number): number {
   return n
 }
 
+function bool(name: string, fallback: boolean): boolean {
+  const v = process.env[name]
+  if (v === undefined || v === '') return fallback
+  return v === '1' || v.toLowerCase() === 'true'
+}
+
 export type OctoIdentityMode = 'http' | 'middleware'
 
 /** Dev-only fallback secret; must never reach production (see requireSafeSigningSecret). */
@@ -102,6 +108,10 @@ export const config = {
     uploadUrlTtlSeconds: num('ATTACHMENT_UPLOAD_URL_TTL_SECONDS', 300),
     // TTL for re-issued signed GET (read) URLs (§3.5 step 5).
     readUrlTtlSeconds: num('ATTACHMENT_READ_URL_TTL_SECONDS', 600),
+    // Hard cap on the batch resolve endpoint (§3.3 RES-1). A reader can request
+    // a fresh signed URL for every attachId in one call; the cap bounds the
+    // presign abuse surface. Over-cap requests are rejected, never truncated.
+    maxResolveBatch: num('ATTACHMENT_MAX_RESOLVE_BATCH', 200),
     // Size caps are tiered by MIME (§3.5). The tier is chosen by the backend
     // from the 'image/' prefix — never trusted from the client — and both tiers
     // hard-cap. The split exists because images render inline (kept small for
@@ -169,4 +179,23 @@ export const config = {
 
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
+
+  // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
+  // triggered off the Hocuspocus store path (idle timer + min-interval fallback
+  // + unload flush). Shipped behind a default-OFF gate (gray release); when
+  // disabled the hooks are inert. Thresholds are env-injectable for load tuning.
+  autoSnapshot: {
+    // Master switch (§5.7). false => no auto snapshots, hooks do nothing.
+    enabled: bool('AUTO_SNAPSHOT_ENABLED', false),
+    // "stopped typing" idle window before a clean restore point is taken, and
+    // the idle dedup-lock TTL.
+    idleMs: num('AUTO_IDLE_MS', 15_000),
+    // minimum spacing between two auto snapshots = min-interval dedup-lock TTL,
+    // the fallback so continuous editing still snapshots periodically.
+    minIntervalMs: num('AUTO_MIN_INTERVAL_MS', 60_000),
+    // retention: keep at most the most-recent N auto rows per doc.
+    retainCount: num('AUTO_RETAIN_COUNT', 50),
+    // retention: drop auto rows older than this many days.
+    retainDays: num('AUTO_RETAIN_DAYS', 7),
+  },
 } as const

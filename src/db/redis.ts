@@ -28,6 +28,22 @@ export function rkey(...parts: string[]): string {
   return [config.redis.prefix, ...parts].join(':')
 }
 
+/**
+ * Best-effort short-lived lock via `SET key val NX PX ttlMs` (§5.5 L1).
+ *
+ * Returns true if THIS caller set the key (won the window), false if it was
+ * already held. Used by the auto-snapshot dedup guard so that under multi-node
+ * deployment only one node writes a given KIND_AUTO frame per window. The key
+ * auto-expires after ttlMs — the window IS the throttle, so we never explicitly
+ * release. A non-integer / non-positive ttl is coerced to a 1ms floor so the
+ * SET never throws on a bad config value.
+ */
+export async function acquireLock(key: string, ttlMs: number): Promise<boolean> {
+  const px = Math.max(1, Math.floor(ttlMs))
+  const res = await getRedis().set(key, '1', 'PX', px, 'NX')
+  return res === 'OK'
+}
+
 export async function closeRedis(): Promise<void> {
   if (client) {
     client.disconnect()

@@ -18,6 +18,7 @@ import { authenticate, type AuthContext } from './authenticate.js'
 import { connectionRegistry } from '../permission/connectionRegistry.js'
 import { recheckCurrentRoleCached } from '../permission/recheck.js'
 import { roleAtLeast } from '../permission/role.js'
+import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
 
 /**
  * Per-node epoch watermark (§4.5 step 4): beforeHandleMessage reads this local
@@ -156,6 +157,20 @@ export function createServer() {
     // with no way to crash the process. See validateAwarenessStates above.
     async beforeHandleAwareness(data) {
       validateAwarenessStates(data.states, data.context as AuthContext | undefined)
+    },
+
+    // A4 (§5.2): backend-autonomous KIND_AUTO snapshots. afterStoreDocument
+    // fires after the authoritative state is persisted; the auto-snapshot
+    // module owns the idle timer / min-interval fallback / Redis dedup. Gated
+    // behind AUTO_SNAPSHOT_ENABLED (default off) inside the module.
+    async afterStoreDocument(data) {
+      await handleAfterStore(data.documentName, data.lastContext as AuthContext | undefined)
+    },
+
+    // A4 (§5.2): flush the last editing burst + clear the per-doc idle timer
+    // when the document unloads.
+    async beforeUnloadDocument(data) {
+      await handleBeforeUnload(data.documentName)
     },
   })
 
