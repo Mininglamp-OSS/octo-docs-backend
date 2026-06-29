@@ -90,16 +90,36 @@ export const config = {
     // 's3'/'minio' signs real AWS SigV4 presigned URLs against an S3-compatible
     // endpoint, behind the same ObjectStore interface.
     driver: str('ATTACHMENT_DRIVER', 'local-hmac'),
-    // S3-compatible (MinIO/S3) driver settings. Used only when driver is
-    // 's3'/'minio'. Path-style addressing is always used. The endpoint is the
-    // PUBLIC, browser-reachable origin baked into the signed URL host (never a
-    // docker-internal alias). Credentials come from env — never hardcoded/logged.
+    // Optional object-key prefix prepended to every put/get key before signing,
+    // so multiple apps can share one bucket without colliding (e.g. Tencent COS
+    // shared with octo-server). Empty (default) keeps keys unprefixed — no
+    // change for existing MinIO/local-hmac deployments. Leading/trailing slashes
+    // are normalised; the prefix is part of the signed key (see objectStore.ts).
+    keyPrefix: str('ATTACHMENT_KEY_PREFIX', ''),
+    // S3-compatible (MinIO/S3/COS) driver settings. Used only when driver is
+    // 's3'/'minio'. The endpoint is the PUBLIC, browser-reachable origin baked
+    // into the signed URL host (never a docker-internal alias). Credentials come
+    // from env — never hardcoded/logged.
     s3: {
       endpoint: str('ATTACHMENT_S3_ENDPOINT', 'http://localhost:9000'),
       region: str('ATTACHMENT_S3_REGION', 'us-east-1'),
       accessKeyId: str('ATTACHMENT_S3_ACCESS_KEY', ''),
       secretAccessKey: str('ATTACHMENT_S3_SECRET_KEY', ''),
-      forcePathStyle: true,
+      // Path-style (`<endpoint>/<bucket>/<key>`, canonicalUri carries the bucket)
+      // is the default and what MinIO needs. Set false for virtual-hosted /
+      // custom-domain addressing where the host is already bound to the bucket
+      // (e.g. a Tencent COS CDN domain): the URL becomes `<endpoint>/<key>` and
+      // the canonicalUri drops the bucket segment so SigV4 verifies COS-side.
+      forcePathStyle: bool('ATTACHMENT_S3_FORCE_PATH_STYLE', true),
+      // Host used in the signed SigV4 `host` header, when it must differ from
+      // the public endpoint host. A Tencent COS CDN/custom domain (the endpoint
+      // the browser hits) origin-pulls to COS with the Host rewritten to the
+      // bucket origin (`<bucket>.cos.<region>.myqcloud.com`), and COS validates
+      // the signature against THAT host — so we sign the origin host while the
+      // URL still points at the custom domain. Empty (default) signs the
+      // endpoint host itself, which is correct for MinIO/S3 and COS accessed
+      // directly on its origin endpoint.
+      signingHost: str('ATTACHMENT_S3_SIGNING_HOST', ''),
     },
     // Secret keying the HMAC signature over (objectKey + expiry). Dev fallback;
     // MUST be overridden in production (enforced via requireSafeSigningSecret).

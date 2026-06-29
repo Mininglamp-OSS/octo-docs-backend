@@ -67,6 +67,19 @@ function sign(
     .digest('hex')
 }
 
+/**
+ * Prepend an optional, slash-normalised key prefix to a logical object key.
+ * The prefix lets several apps share one bucket without colliding (e.g. a
+ * Tencent COS bucket shared with octo-server). It is applied at the storage
+ * boundary so the DB keeps the logical key while the signed URL — and thus the
+ * signature — covers the full physical key. An empty prefix is a no-op, so
+ * existing deployments sign exactly the keys they did before.
+ */
+function applyKeyPrefix(prefix: string, objectKey: string): string {
+  const p = prefix.replace(/^\/+|\/+$/g, '')
+  return p ? `${p}/${objectKey}` : objectKey
+}
+
 /** Constant-time hex-string comparison (avoids signature timing leaks). */
 function safeEqualHex(a: string, b: string): boolean {
   const ba = Buffer.from(a, 'utf8')
@@ -84,18 +97,25 @@ function safeEqualHex(a: string, b: string): boolean {
 export class LocalHmacObjectStore implements ObjectStore {
   private readonly bucket: string
   private readonly secret: string
+  private readonly keyPrefix: string
   private readonly nowSec: () => number
 
-  constructor(opts?: { bucket?: string; secret?: string; nowSec?: () => number }) {
+  constructor(opts?: {
+    bucket?: string
+    secret?: string
+    keyPrefix?: string
+    nowSec?: () => number
+  }) {
     this.bucket = opts?.bucket ?? config.attachments.bucket
     this.secret = opts?.secret ?? config.attachments.signingSecret
+    this.keyPrefix = opts?.keyPrefix ?? config.attachments.keyPrefix
     this.nowSec = opts?.nowSec ?? (() => Math.floor(Date.now() / 1000))
   }
 
-  private baseUrl(objectKey: string): string {
+  private baseUrl(physicalKey: string): string {
     // Path-style URL against the bucket host. Each key segment is encoded but
     // the '/' separators are preserved so the key round-trips cleanly.
-    const encodedKey = objectKey.split('/').map(encodeURIComponent).join('/')
+    const encodedKey = physicalKey.split('/').map(encodeURIComponent).join('/')
     return `https://${this.bucket}.object-store.local/${encodedKey}`
   }
 
@@ -105,9 +125,12 @@ export class LocalHmacObjectStore implements ObjectStore {
     expiresSec: number,
     contentDisposition?: string,
   ): string {
+    // The prefix is bound into both the URL path and the signature so a key
+    // signed with one prefix can't be replayed under another.
+    const physicalKey = applyKeyPrefix(this.keyPrefix, objectKey)
     const expiry = this.nowSec() + expiresSec
-    const signature = sign(method, objectKey, expiry, this.secret, contentDisposition ?? '')
-    const url = new URL(this.baseUrl(objectKey))
+    const signature = sign(method, physicalKey, expiry, this.secret, contentDisposition ?? '')
+    const url = new URL(this.baseUrl(physicalKey))
     url.searchParams.set('X-Method', method)
     url.searchParams.set('X-Expiry', String(expiry))
     // Bound into the HMAC above; the self-hosted gateway in front of this driver
@@ -154,8 +177,10 @@ export class LocalHmacObjectStore implements ObjectStore {
     const expiry = Number(expiryStr)
     if (!Number.isFinite(expiry)) return { valid: false, reason: 'missing' }
 
-    // Reconstruct the object key from the path (decode each segment).
-    const objectKey = url.pathname
+    // Reconstruct the physical object key from the path (decode each segment).
+    // This is the prefixed key that was signed at mint time, so verification is
+    // self-consistent without needing to know the prefix here.
+    const physicalKey = url.pathname
       .replace(/^\//, '')
       .split('/')
       .map(decodeURIComponent)
@@ -164,7 +189,7 @@ export class LocalHmacObjectStore implements ObjectStore {
     // Disposition (when present) is part of the signed material; '' otherwise so
     // legacy URLs without it verify against the original signature form.
     const disposition = url.searchParams.get('response-content-disposition') ?? ''
-    const expected = sign(method, objectKey, expiry, this.secret, disposition)
+    const expected = sign(method, physicalKey, expiry, this.secret, disposition)
     if (!safeEqualHex(expected, signature)) return { valid: false, reason: 'bad_signature' }
     if (this.nowSec() >= expiry) return { valid: false, reason: 'expired' }
     return { valid: true }
@@ -193,16 +218,25 @@ function sha256Hex(data: string): string {
 }
 
 /**
- * Real S3-compatible driver (MinIO, AWS S3, …) that mints AWS Signature V4
- * presigned query-string URLs using only Node's built-in crypto — no aws-sdk /
- * minio package. MinIO is fully SigV4 compatible, so a correctly built
- * presigned URL works against it unchanged.
+ * Real S3-compatible driver (MinIO, AWS S3, Tencent COS, …) that mints AWS
+ * Signature V4 presigned query-string URLs using only Node's built-in crypto —
+ * no aws-sdk / minio / cos package. MinIO and COS are both SigV4 compatible
+ * (service=s3), so a correctly built presigned URL works against them unchanged.
  *
- * Addressing is path-style (`<endpoint>/<bucket>/<key>`); the host baked into
- * the signed URL is the configured *public*, browser-reachable endpoint (never
- * a docker-internal alias), since the front-end issues the PUT/GET directly.
- * Presigning is pure signing with no network call. `nowSec` is injectable so
- * tests can assert the embedded `X-Amz-Date` deterministically.
+ * Two addressing modes, selected by `forcePathStyle`:
+ *   · path-style (default, MinIO): URL = `<endpoint>/<bucket>/<key>` and the
+ *     canonicalUri carries the bucket segment.
+ *   · virtual-hosted / custom-domain (`forcePathStyle: false`, COS CDN domain):
+ *     the host is already bound to the bucket, so URL = `<endpoint>/<key>` and
+ *     the canonicalUri drops the bucket — otherwise COS computes a different
+ *     canonical request and rejects the signature (403 SignatureDoesNotMatch).
+ *
+ * The host baked into the signed URL is the configured *public*,
+ * browser-reachable endpoint (never a docker-internal alias), since the
+ * front-end issues the PUT/GET directly. An optional `keyPrefix` is prepended
+ * to every key before signing. Presigning is pure signing with no network call.
+ * `nowSec` is injectable so tests can assert the embedded `X-Amz-Date`
+ * deterministically.
  */
 export class S3ObjectStore implements ObjectStore {
   private readonly endpoint: string
@@ -210,6 +244,9 @@ export class S3ObjectStore implements ObjectStore {
   private readonly bucket: string
   private readonly accessKeyId: string
   private readonly secretAccessKey: string
+  private readonly forcePathStyle: boolean
+  private readonly keyPrefix: string
+  private readonly signingHost: string
   private readonly nowSec: () => number
   private static readonly SERVICE = 's3'
 
@@ -219,6 +256,9 @@ export class S3ObjectStore implements ObjectStore {
     bucket: string
     accessKeyId: string
     secretAccessKey: string
+    forcePathStyle?: boolean
+    keyPrefix?: string
+    signingHost?: string
     nowSec?: () => number
   }) {
     // Strip any trailing slash so path joining stays canonical.
@@ -227,13 +267,25 @@ export class S3ObjectStore implements ObjectStore {
     this.bucket = opts.bucket
     this.accessKeyId = opts.accessKeyId
     this.secretAccessKey = opts.secretAccessKey
+    // Default true preserves the historical path-style behaviour for MinIO.
+    this.forcePathStyle = opts.forcePathStyle ?? true
+    this.keyPrefix = opts.keyPrefix ?? ''
+    this.signingHost = opts.signingHost ?? ''
     this.nowSec = opts.nowSec ?? (() => Math.floor(Date.now() / 1000))
   }
 
-  /** Path-style canonical URI: /<bucket>/<encoded key segments>. */
-  private canonicalUri(objectKey: string): string {
-    const encodedKey = objectKey.split('/').map(awsUriEncode).join('/')
-    return `/${awsUriEncode(this.bucket)}/${encodedKey}`
+  /**
+   * Canonical URI for SigV4. Path-style includes the bucket segment
+   * (`/<bucket>/<key>`); virtual-hosted / custom-domain addressing omits it
+   * (`/<key>`) because the host already resolves to the bucket. `physicalKey`
+   * is the prefix-applied key, encoded segment-by-segment so '/' survives.
+   */
+  private canonicalUri(physicalKey: string): string {
+    const encodedKey = physicalKey.split('/').map(awsUriEncode).join('/')
+    if (this.forcePathStyle) {
+      return `/${awsUriEncode(this.bucket)}/${encodedKey}`
+    }
+    return `/${encodedKey}`
   }
 
   private presign(
@@ -244,8 +296,14 @@ export class S3ObjectStore implements ObjectStore {
   ): string {
     const url = new URL(this.endpoint)
     // Host header carries the port when non-default; it must match the URL host
-    // exactly or the signature will not verify.
+    // exactly or the signature will not verify. With a CDN/custom domain that
+    // origin-pulls to the bucket, the host the storage backend actually sees
+    // (and signs against) differs from the public URL host — `signingHost`
+    // overrides it for that case; otherwise we sign the endpoint host itself.
     const host = url.host
+    const signedHost = this.signingHost || host
+
+    const physicalKey = applyKeyPrefix(this.keyPrefix, objectKey)
 
     const now = new Date(this.nowSec() * 1000)
     const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '') // YYYYMMDDTHHMMSSZ
@@ -274,8 +332,8 @@ export class S3ObjectStore implements ObjectStore {
       .map(([k, v]) => `${awsUriEncode(k)}=${awsUriEncode(v)}`)
       .join('&')
 
-    const canonicalUri = this.canonicalUri(objectKey)
-    const canonicalHeaders = `host:${host}\n`
+    const canonicalUri = this.canonicalUri(physicalKey)
+    const canonicalHeaders = `host:${signedHost}\n`
     const signedHeaders = 'host'
     const canonicalRequest = [
       method,
@@ -337,6 +395,9 @@ export function getObjectStore(): ObjectStore {
           bucket: config.attachments.bucket,
           accessKeyId: config.attachments.s3.accessKeyId,
           secretAccessKey: config.attachments.s3.secretAccessKey,
+          forcePathStyle: config.attachments.s3.forcePathStyle,
+          keyPrefix: config.attachments.keyPrefix,
+          signingHost: config.attachments.s3.signingHost,
         })
       }
       return s3Store

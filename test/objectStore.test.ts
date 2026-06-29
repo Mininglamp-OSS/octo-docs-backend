@@ -15,6 +15,22 @@ describe('LocalHmacObjectStore presign driver (§3.5)', () => {
     expect(store.verify(uploadUrl).valid).toBe(true)
   })
 
+  it('applies a key prefix to the path and still verifies round-trip', () => {
+    const store = new LocalHmacObjectStore({
+      bucket: 'test-bucket',
+      secret: 'test-secret',
+      keyPrefix: 'octo-docs-local-dev',
+      nowSec: () => 1000,
+    })
+    const url = store.presignGet('d_1/att_1/photo.png', 600)
+    expect(new URL(url).pathname).toBe('/octo-docs-local-dev/d_1/att_1/photo.png')
+    // The signature covers the prefixed key, so verification is self-consistent.
+    expect(store.verify(url).valid).toBe(true)
+    // Tampering with the prefixed path invalidates the signature.
+    const tampered = url.replace('/octo-docs-local-dev/', '/octo-docs-local-dev-evil/')
+    expect(store.verify(tampered).valid).toBe(false)
+  })
+
   it('mints a GET url that verifies', () => {
     const store = storeAt(1000)
     const url = store.presignGet('d_1/att_1/photo.png', 600)
