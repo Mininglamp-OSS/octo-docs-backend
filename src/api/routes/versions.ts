@@ -24,7 +24,7 @@ import { requireDocRole } from '../guard.js'
 import { docVersionRepo, KIND_NAMED } from '../../db/repos/docVersionRepo.js'
 import { persistence } from '../../collab/persistence.js'
 import { restoreVersion } from '../services/restoreVersion.js'
-import { gateSchema, decodeTargetSnapshot, SchemaIncompatibleError } from '../../collab/versionRestore.js'
+import { gateSchema, decodeTargetSnapshot, decodeSheetSnapshot, decodeSheetDimsSnapshot, SchemaIncompatibleError, SheetSnapshotInvalidError } from '../../collab/versionRestore.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
 
 export const versionsRouter = Router()
@@ -178,12 +178,25 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
     const decoded = decodeTargetSnapshot(found.state)
     res.status(200).json({
       doc: decoded.toJSON(),
+      // Spreadsheet cells (empty {} for a text document). The sheet version panel
+      // renders these for preview/compare; the doc panel ignores the field.
+      sheetCells: decodeSheetSnapshot(found.state),
+      // Column-width / row-height overrides (empty {} for a text document). Both
+      // synced grid maps are surfaced so the version panel can faithfully render
+      // a historical sheet's layout, not just its cell contents.
+      sheetDims: decodeSheetDimsSnapshot(found.state),
       schemaVersion: found.version.schemaVersion,
       docVersionSeq: versionId,
     })
   } catch (err) {
     if (err instanceof SchemaIncompatibleError) {
       res.status(409).json({ error: 'version_schema_incompatible' })
+      return
+    }
+    if (err instanceof SheetSnapshotInvalidError) {
+      // Sheet snapshot violated the {v,f,s} contract — fail-closed like the
+      // ProseMirror schema path rather than serializing arbitrary values.
+      res.status(409).json({ error: 'sheet_snapshot_invalid' })
       return
     }
     throw err

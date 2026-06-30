@@ -27,7 +27,7 @@
  */
 import type { Document } from '@hocuspocus/server'
 import { getCollabServer } from './server.js'
-import { decodeTargetSnapshot, reconcileFragment } from './versionRestore.js'
+import { decodeTargetSnapshot, reconcileFragment, reconcileSheetMap } from './versionRestore.js'
 import { COLLAB_FIELD } from '../schema/index.js'
 
 /**
@@ -57,6 +57,10 @@ export async function applyRestoreToLiveDoc(
     await connection.transact((doc: Document) => {
       const fragment = doc.getXmlFragment(COLLAB_FIELD)
       reconcileFragment(targetPMDoc, fragment)
+      // Spreadsheet cells live in the 'sheet' map, not the fragment — restore them
+      // onto the same live doc so connected clients converge on the restored grid.
+      // No-op for a text document (it has no 'sheet' map).
+      reconcileSheetMap(doc, targetState)
     })
   } finally {
     // Flushes the final store (awaited) and releases the direct connection.

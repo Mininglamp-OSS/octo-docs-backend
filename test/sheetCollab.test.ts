@@ -1,0 +1,447 @@
+/**
+ * Sheet collaboration coverage (§7.x) — the no-DOM Y.Doc <-> cell helpers a bot
+ * uses, plus version-restore reconcile for sheets. Complements conversion.test.ts
+ * (docs side) and versions.test.ts (restore mechanics for text docs).
+ *
+ * Focus areas (all previously untested):
+ *   - {v,f,s} contract round-trips verbatim (styles must NOT be dropped by a bot).
+ *   - applySheetCellsToYMap set + null-delete semantics inside a transaction.
+ *   - decodeSheetSnapshot preview extraction.
+ *   - reconcileSheetMap: delete-live-only-cell, target-only-cell-added, overwrite,
+ *     and the pure-text early-return (no 'sheet' map on either side => false, doc
+ *     left byte-identical).
+ */
+import { describe, it, expect } from 'vitest'
+import * as Y from 'yjs'
+import {
+  SHEET_YMAP_FIELD,
+  SHEET_DIMS_FIELD,
+  sheetCellKey,
+  yDocStateToSheetCells,
+  applySheetCellsToYMap,
+  validateSheetCell,
+  validateSheetCells,
+  validateSheetDim,
+  validateSheetDims,
+  SheetSnapshotInvalidError,
+  type SheetCell,
+} from '../src/agent/sheetConversion.js'
+import {
+  decodeSheetSnapshot,
+  decodeSheetDimsSnapshot,
+  reconcileSheetMap,
+  SHEET_YMAP_FIELD as RESTORE_SHEET_FIELD,
+  SHEET_DIMS_FIELD as RESTORE_DIMS_FIELD,
+} from '../src/collab/versionRestore.js'
+import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
+
+/** Build a Y.Doc binary state whose 'sheet' map holds the given cells. */
+function sheetState(cells: Record<string, SheetCell>): Uint8Array {
+  const doc = new Y.Doc()
+  const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+  doc.transact(() => {
+    for (const [k, v] of Object.entries(cells)) ymap.set(k, v)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+/** Hydrate a live Y.Doc from a sheet state (or empty). */
+function liveDocFrom(state?: Uint8Array): Y.Doc {
+  const doc = new Y.Doc()
+  if (state) Y.applyUpdate(doc, state)
+  return doc
+}
+
+describe('sheetConversion — cell key + shared field', () => {
+  it('SHEET_YMAP_FIELD is the single shared constant across modules', () => {
+    expect(SHEET_YMAP_FIELD).toBe('sheet')
+    expect(RESTORE_SHEET_FIELD).toBe(SHEET_YMAP_FIELD) // no duplicate re-declaration
+  })
+
+  it('sheetCellKey builds the canonical `${sheetId}!${row}:${col}` form', () => {
+    expect(sheetCellKey('default', 0, 0)).toBe('default!0:0')
+    expect(sheetCellKey('s2', 3, 4)).toBe('s2!3:4')
+  })
+})
+
+describe('sheetConversion — {v,f,s} contract round-trip (styles must survive)', () => {
+  it('preserves value, formula AND resolved style through Y.Doc binary and back', () => {
+    const key = sheetCellKey('default', 0, 0)
+    const styled: SheetCell = {
+      v: 42,
+      f: '=B1*2',
+      // resolved IStyleData shape the frontend binding syncs (opaque to backend)
+      s: { bl: 1, cl: { rgb: '#FF0000' }, bg: { rgb: '#FFFF00' }, ht: 2, vt: 2, fs: 16 },
+    }
+    const state = sheetState({ [key]: styled })
+
+    const cells = yDocStateToSheetCells(state)
+    expect(cells[key]).toEqual(styled)
+    // the style object must NOT be dropped or flattened — verbatim round-trip
+    expect(cells[key].s).toEqual(styled.s)
+  })
+
+  it('round-trips a value-only and a formula-only cell without inventing an `s`', () => {
+    const kv = sheetCellKey('default', 1, 0)
+    const kf = sheetCellKey('default', 1, 1)
+    const state = sheetState({ [kv]: { v: 'text' }, [kf]: { f: '=1+1' } })
+    const cells = yDocStateToSheetCells(state)
+    expect(cells[kv]).toEqual({ v: 'text' })
+    expect(cells[kf]).toEqual({ f: '=1+1' })
+    expect(cells[kv].s).toBeUndefined()
+  })
+})
+
+describe('sheetConversion — applySheetCellsToYMap (set + null-delete)', () => {
+  it('sets cells and deletes on null, within a caller transaction', () => {
+    const doc = new Y.Doc()
+    const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    const a = sheetCellKey('default', 0, 0)
+    const b = sheetCellKey('default', 0, 1)
+
+    doc.transact(() => applySheetCellsToYMap(ymap, { [a]: { v: 1 }, [b]: { v: 2 } }))
+    expect(ymap.get(a)).toEqual({ v: 1 })
+    expect(ymap.get(b)).toEqual({ v: 2 })
+
+    // null deletes only the targeted key
+    doc.transact(() => applySheetCellsToYMap(ymap, { [a]: null }))
+    expect(ymap.has(a)).toBe(false)
+    expect(ymap.get(b)).toEqual({ v: 2 })
+  })
+})
+
+describe('versionRestore — decodeSheetSnapshot (preview extraction)', () => {
+  it('returns the plain cell map from a snapshot, verbatim (incl. style)', () => {
+    const key = sheetCellKey('default', 0, 0)
+    const cell: SheetCell = { v: 'H', s: { bl: 1 } }
+    const out = decodeSheetSnapshot(sheetState({ [key]: cell }))
+    expect(out[key]).toEqual(cell)
+  })
+
+  it('returns an empty object for a pure text document (no sheet map)', () => {
+    const textState = prosemirrorJSONToYDocState({
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'hi' }] }],
+    })
+    expect(decodeSheetSnapshot(textState)).toEqual({})
+  })
+})
+
+/**
+ * Build a Y.Doc state whose 'sheet' map holds ARBITRARY (possibly contract-
+ * violating) values, bypassing any validation. Simulates a hostile/buggy writer
+ * that put non-`{v,f,s}` data under the sheet map, so we can prove the read /
+ * restore boundaries fail-closed.
+ */
+function rawSheetState(cells: Record<string, unknown>): Uint8Array {
+  const doc = new Y.Doc()
+  const ymap = doc.getMap(SHEET_YMAP_FIELD)
+  doc.transact(() => {
+    for (const [k, v] of Object.entries(cells)) ymap.set(k, v as never)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+describe('sheetConversion — validateSheetCell (fail-closed {v,f,s} boundary)', () => {
+  const key = sheetCellKey('default', 0, 0)
+
+  it('accepts a well-formed {v,f,s} cell and returns only contract fields', () => {
+    const cell = { v: 1, f: '=A1', s: { bl: 1 } }
+    expect(validateSheetCell(key, cell)).toEqual(cell)
+  })
+
+  it('accepts each singleton (value-only, formula-only, style-only)', () => {
+    expect(validateSheetCell(key, { v: 'x' })).toEqual({ v: 'x' })
+    expect(validateSheetCell(key, { f: '=1' })).toEqual({ f: '=1' })
+    expect(validateSheetCell(key, { s: { bl: 1 } })).toEqual({ s: { bl: 1 } })
+    expect(validateSheetCell(key, { v: null })).toEqual({ v: null })
+  })
+
+  it('rejects an unexpected field (not v/f/s)', () => {
+    expect(() => validateSheetCell(key, { v: 1, evil: true })).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a wrong-typed value (v object / f non-string / s non-object)', () => {
+    expect(() => validateSheetCell(key, { v: { nested: 1 } })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, { f: 123 })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, { s: 'red' })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, { s: [1, 2] })).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a non-object cell entry (string / array / null)', () => {
+    expect(() => validateSheetCell(key, 'plain')).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, [1])).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, null)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects an empty cell (none of v/f/s present)', () => {
+    expect(() => validateSheetCell(key, {})).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a hostile / malformed key', () => {
+    expect(() => validateSheetCell('', { v: 1 })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell('no-bang-0:0', { v: 1 })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell('default!x:y', { v: 1 })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell('a'.repeat(300) + '!0:0', { v: 1 })).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('validateSheetCells rejects the whole map if any cell is bad', () => {
+    const good = sheetCellKey('default', 0, 0)
+    const bad = sheetCellKey('default', 0, 1)
+    expect(() => validateSheetCells({ [good]: { v: 1 }, [bad]: { evil: 1 } })).toThrow(
+      SheetSnapshotInvalidError,
+    )
+  })
+})
+
+describe('applySheetCellsToYMap — fail-closed on write', () => {
+  it('rejects a contract-violating cell before mutating the map', () => {
+    const doc = new Y.Doc()
+    const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    const k = sheetCellKey('default', 0, 0)
+    expect(() =>
+      doc.transact(() => applySheetCellsToYMap(ymap, { [k]: { junk: 1 } as never })),
+    ).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a delete with a malformed key', () => {
+    const doc = new Y.Doc()
+    const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    expect(() => doc.transact(() => applySheetCellsToYMap(ymap, { 'bad-key': null }))).toThrow(
+      SheetSnapshotInvalidError,
+    )
+  })
+})
+
+describe('versionRestore — fail-closed on malformed snapshots (security boundary)', () => {
+  const key = sheetCellKey('default', 0, 0)
+
+  it('decodeSheetSnapshot throws instead of serializing arbitrary values into the HTTP response', () => {
+    const state = rawSheetState({ [key]: { v: 1, evil: 'payload' } })
+    expect(() => decodeSheetSnapshot(state)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('decodeSheetSnapshot throws on a non-cell entry (string smuggled under the sheet map)', () => {
+    const state = rawSheetState({ [key]: 'not-a-cell' })
+    expect(() => decodeSheetSnapshot(state)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('reconcileSheetMap throws and leaves the live doc untouched when the target is malformed', () => {
+    const liveKey = sheetCellKey('default', 5, 5)
+    const live = liveDocFrom(sheetState({ [liveKey]: { v: 'safe' } }))
+    const before = Y.encodeStateAsUpdate(live)
+    const badTarget = rawSheetState({ [key]: { v: 1, hostile: true } })
+
+    expect(() => live.transact(() => reconcileSheetMap(live, badTarget))).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    // The live-only cell must NOT have been deleted — validation runs before any mutation.
+    const after = Y.encodeStateAsUpdate(live)
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(liveKey)).toEqual({ v: 'safe' })
+    expect(Array.from(after)).toEqual(Array.from(before)) // byte-identical, no partial restore
+  })
+})
+
+describe('versionRestore — reconcileSheetMap', () => {
+  it('deletes a live-only cell not present in the target', () => {
+    const keep = sheetCellKey('default', 0, 0)
+    const liveOnly = sheetCellKey('default', 0, 1)
+    const live = liveDocFrom(sheetState({ [keep]: { v: 'keep' }, [liveOnly]: { v: 'gone' } }))
+    const target = sheetState({ [keep]: { v: 'keep' } })
+
+    let touched = false
+    live.transact(() => {
+      touched = reconcileSheetMap(live, target)
+    })
+    const sheet = live.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    expect(touched).toBe(true)
+    expect(sheet.has(liveOnly)).toBe(false) // live-only deleted
+    expect(sheet.get(keep)).toEqual({ v: 'keep' })
+  })
+
+  it('adds a target-only cell absent from the live doc', () => {
+    const existing = sheetCellKey('default', 0, 0)
+    const added = sheetCellKey('default', 2, 2)
+    const live = liveDocFrom(sheetState({ [existing]: { v: 'a' } }))
+    const target = sheetState({ [existing]: { v: 'a' }, [added]: { v: 'new', s: { bl: 1 } } })
+
+    live.transact(() => reconcileSheetMap(live, target))
+    const sheet = live.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    expect(sheet.get(added)).toEqual({ v: 'new', s: { bl: 1 } }) // added incl. style
+  })
+
+  it('overwrites a cell whose value/style changed in the target', () => {
+    const k = sheetCellKey('default', 0, 0)
+    const live = liveDocFrom(sheetState({ [k]: { v: 'old', s: { bl: 0 } } }))
+    const target = sheetState({ [k]: { v: 'new', s: { bl: 1 } } })
+    live.transact(() => reconcileSheetMap(live, target))
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'new', s: { bl: 1 } })
+  })
+
+  it('is a no-op for a pure text document (early-return false, bytes unchanged)', () => {
+    const textState = prosemirrorJSONToYDocState({
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'hi' }] }],
+    })
+    const live = liveDocFrom(textState)
+    const before = Y.encodeStateAsUpdate(live)
+
+    let touched = true
+    live.transact(() => {
+      touched = reconcileSheetMap(live, textState)
+    })
+    const after = Y.encodeStateAsUpdate(live)
+
+    expect(touched).toBe(false) // neither side has a 'sheet' map
+    expect(Array.from(after)).toEqual(Array.from(before)) // byte-identical
+  })
+})
+
+/** Build a Y.Doc binary state whose 'sheetDims' map holds the given dims. */
+function dimsState(dims: Record<string, number>, cells: Record<string, SheetCell> = {}): Uint8Array {
+  const doc = new Y.Doc()
+  doc.transact(() => {
+    const cellMap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    for (const [k, v] of Object.entries(cells)) cellMap.set(k, v)
+    const dimMap = doc.getMap<number>(SHEET_DIMS_FIELD)
+    for (const [k, v] of Object.entries(dims)) dimMap.set(k, v)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+/** Build a Y.Doc binary state with an arbitrary (possibly hostile) sheetDims map. */
+function rawDimsState(dims: Record<string, unknown>): Uint8Array {
+  const doc = new Y.Doc()
+  const dimMap = doc.getMap(SHEET_DIMS_FIELD)
+  doc.transact(() => {
+    for (const [k, v] of Object.entries(dims)) dimMap.set(k, v as never)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+describe('sheetConversion — validateSheetDim (fail-closed c<idx>/r<idx> contract)', () => {
+  it('accepts a positive finite width/height with a valid key', () => {
+    expect(validateSheetDim('c0', 120)).toBe(120)
+    expect(validateSheetDim('r3', 42)).toBe(42)
+  })
+
+  it('rejects a bad key shape', () => {
+    expect(() => validateSheetDim('x0', 100)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDim('c', 100)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDim('col1', 100)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects non-positive, non-finite, or absurd values', () => {
+    expect(() => validateSheetDim('c0', 0)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDim('c0', -5)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDim('c0', Infinity)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDim('c0', 1e9)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDim('c0', '120' as never)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('validateSheetDims rejects the whole batch if any entry is bad', () => {
+    expect(() => validateSheetDims({ c0: 100, r1: -1 })).toThrow(SheetSnapshotInvalidError)
+    expect(validateSheetDims({ c0: 100, r1: 30 })).toEqual({ c0: 100, r1: 30 })
+  })
+})
+
+describe('versionRestore — sheetDims decode + restore (P1: full-grid restore)', () => {
+  it('SHEET_DIMS_FIELD is the single shared constant across modules', () => {
+    expect(SHEET_DIMS_FIELD).toBe('sheetDims')
+    expect(RESTORE_DIMS_FIELD).toBe(SHEET_DIMS_FIELD)
+  })
+
+  it('decodeSheetDimsSnapshot extracts col-width/row-height overrides for preview', () => {
+    const state = dimsState({ c0: 200, r2: 48 })
+    expect(decodeSheetDimsSnapshot(state)).toEqual({ c0: 200, r2: 48 })
+  })
+
+  it('decodeSheetDimsSnapshot returns {} for a text document (no sheetDims map)', () => {
+    const textState = prosemirrorJSONToYDocState({
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'x' }] }],
+    })
+    expect(decodeSheetDimsSnapshot(textState)).toEqual({})
+  })
+
+  it('decodeSheetDimsSnapshot throws (fail-closed) on a hostile dims value', () => {
+    const state = rawDimsState({ c0: -999 })
+    expect(() => decodeSheetDimsSnapshot(state)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('reconcileSheetMap restores dims alongside cells (widen-then-restore rolls back layout)', () => {
+    // Target snapshot: narrow col c0=80, plus a cell.
+    const k = sheetCellKey('default', 0, 0)
+    const target = dimsState({ c0: 80 }, { [k]: { v: 'old' } })
+    // Live doc: user widened c0 to 300 and added a stray dim r5.
+    const live = liveDocFrom(dimsState({ c0: 300, r5: 60 }, { [k]: { v: 'new' } }))
+
+    live.transact(() => reconcileSheetMap(live, target))
+
+    const dims = live.getMap<number>(SHEET_DIMS_FIELD)
+    expect(dims.get('c0')).toBe(80) // rolled back to target width
+    expect(dims.has('r5')).toBe(false) // live-only dim removed
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'old' })
+  })
+
+  it('reconcileSheetMap fires (returns true) when only dims differ, cells empty', () => {
+    const target = dimsState({ c1: 150 })
+    const live = liveDocFrom(dimsState({ c1: 90 }))
+    let touched = false
+    live.transact(() => {
+      touched = reconcileSheetMap(live, target)
+    })
+    expect(touched).toBe(true)
+    expect(live.getMap<number>(SHEET_DIMS_FIELD).get('c1')).toBe(150)
+  })
+
+  it('reconcileSheetMap throws + leaves BOTH maps untouched on a malformed target dim', () => {
+    const k = sheetCellKey('default', 0, 0)
+    const live = liveDocFrom(dimsState({ c0: 120 }, { [k]: { v: 'safe' } }))
+    const badTarget = rawDimsState({ c0: -1 }) // hostile dim
+    expect(() => live.transact(() => reconcileSheetMap(live, badTarget))).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    // fail-closed: live dims + cells unchanged (no half-restore)
+    expect(live.getMap<number>(SHEET_DIMS_FIELD).get('c0')).toBe(120)
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'safe' })
+  })
+})
+
+describe('applySheetCellsToYMap — P2: validate-all-then-apply atomicity', () => {
+  it('a mixed batch with one invalid cell writes NOTHING (no partial flush)', () => {
+    const doc = new Y.Doc()
+    const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    const good = sheetCellKey('default', 0, 0)
+    const bad = sheetCellKey('default', 1, 0)
+    expect(() =>
+      doc.transact(() =>
+        applySheetCellsToYMap(ymap, { [good]: { v: 'ok' }, [bad]: { junk: 1 } as never }),
+      ),
+    ).toThrow(SheetSnapshotInvalidError)
+    // The valid cell must NOT have been set before the invalid one threw.
+    expect(ymap.has(good)).toBe(false)
+    expect(ymap.size).toBe(0)
+  })
+
+  it('a bad delete key also aborts before any valid set lands', () => {
+    const doc = new Y.Doc()
+    const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    const good = sheetCellKey('default', 0, 0)
+    expect(() =>
+      doc.transact(() => applySheetCellsToYMap(ymap, { [good]: { v: 'ok' }, 'bad-key': null })),
+    ).toThrow(SheetSnapshotInvalidError)
+    expect(ymap.has(good)).toBe(false)
+  })
+
+  it('an all-valid mixed set+delete batch applies fully', () => {
+    const doc = new Y.Doc()
+    const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    const a = sheetCellKey('default', 0, 0)
+    const b = sheetCellKey('default', 1, 0)
+    doc.transact(() => applySheetCellsToYMap(ymap, { [a]: { v: 1 }, [b]: { v: 2 } }))
+    doc.transact(() => applySheetCellsToYMap(ymap, { [a]: null, [b]: { v: 3 } }))
+    expect(ymap.has(a)).toBe(false)
+    expect(ymap.get(b)).toEqual({ v: 3 })
+  })
+})
