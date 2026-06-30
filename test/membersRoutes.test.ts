@@ -45,6 +45,7 @@ function mockRes(): MockRes {
 
 // Resolve the PUT add-member handler from the Express router stack.
 function putMemberHandler() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   for (const layer of (membersRouter as unknown as { stack: any[] }).stack) {
     const route = layer.route
     if (route && route.path === '/:docId/members' && route.methods?.put) {

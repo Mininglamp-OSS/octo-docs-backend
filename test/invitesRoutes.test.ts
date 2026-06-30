@@ -40,6 +40,7 @@ function mockRes(): MockRes {
 
 // Resolve the POST create-invite handler from the Express router stack.
 function createInviteHandler() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   for (const layer of (invitesRouter as unknown as { stack: any[] }).stack) {
     const route = layer.route
     if (route && route.path === '/:docId/invites' && route.methods?.post) {
