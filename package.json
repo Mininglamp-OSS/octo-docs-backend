@@ -13,6 +13,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "test": "vitest run",
     "test:watch": "vitest",
     "license:check": "license-checker --onlyAllow 'MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0' --production"
@@ -37,12 +39,16 @@
     "yjs": "^13.6.31"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@types/express": "^4.17.21",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.7.4",
     "@types/ws": "^8.5.12",
+    "eslint": "^9.39.4",
+    "globals": "^17.7.0",
     "tsx": "^4.19.1",
     "typescript": "^5.6.2",
+    "typescript-eslint": "^8.62.1",
     "vitest": "^2.1.2"
   }
 }

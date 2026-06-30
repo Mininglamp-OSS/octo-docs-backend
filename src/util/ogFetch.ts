@@ -97,6 +97,10 @@ export const httpTransport: Transport = (target, validatedIps, timeoutMs) =>
     // hostname, default cert validation (rejectUnauthorized stays true) (§3.5 S2).
     if (isHttps) options.servername = target.hostname
 
+    // Declared with let: the `fail` closure above captures `req`, while the
+    // request callback below captures `fail` — a cycle that requires a forward
+    // declaration here.
+    // eslint-disable-next-line prefer-const
     let req: http.ClientRequest
     let settled = false
     const fail = (e: Error): void => {
