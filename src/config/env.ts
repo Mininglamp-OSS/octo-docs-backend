@@ -49,6 +49,39 @@ export function requireSafeSigningSecret(secret: string): string {
   return secret
 }
 
+/**
+ * Resolve the public, browser-reachable collab WS URL that collab-token responses
+ * hand back as `collabWsUrl` (§4.4). The Hocuspocus WS server lives on its own
+ * origin (default :1234) with nginx NOT reverse-proxying it, so this MUST be an
+ * absolute `ws://`/`wss://` URL — a relative path would resolve against the REST
+ * API origin and never reach the WS port.
+ *
+ * PHASE 1 (this change): soft-warn only, never fail-fast. During the compat
+ * window the frontend still falls back to its build-time env when the field is
+ * absent, so an unset/invalid value must not crash the backend. A follow-up
+ * cleanup issue flips this to fail-fast once the frontend drops that fallback
+ * (mirrors requireSafeSigningSecret's fail-fast contract). Returns '' to mean
+ * "omit the field"; callers must not emit an empty or malformed URL.
+ */
+export function resolveCollabPublicWsUrl(raw: string): string {
+  const value = raw.trim()
+  if (value === '') {
+    console.warn(
+      '[config] COLLAB_TOKEN_PUBLIC_WS_URL is not set; collab-token responses will omit collabWsUrl ' +
+        'and clients fall back to their build-time WS env (compatibility phase).',
+    )
+    return ''
+  }
+  if (!/^wss?:\/\//i.test(value)) {
+    console.warn(
+      `[config] COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value}. ` +
+        'Ignoring it; collabWsUrl will be omitted this phase.',
+    )
+    return ''
+  }
+  return value
+}
+
 export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
@@ -72,6 +105,12 @@ export const config = {
   collabToken: {
     secret: str('COLLAB_TOKEN_SECRET', 'dev-only-change-me'),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
+    // Public, browser-reachable collab WS origin surfaced to clients as
+    // `collabWsUrl` in the collab-token response (§4.4). Absolute ws://|wss://
+    // only (WS runs on its own :1234 origin, not reverse-proxied). Empty (unset
+    // or malformed) => field omitted; validated soft (warn, never fail) during
+    // the compat phase — see resolveCollabPublicWsUrl.
+    publicWsUrl: resolveCollabPublicWsUrl(str('COLLAB_TOKEN_PUBLIC_WS_URL', '')),
   },
 
   octoIdentity: {
