@@ -66,6 +66,7 @@ export function requireSafeSigningSecret(secret: string): string {
 export function resolveCollabPublicWsUrl(raw: string): string {
   const value = raw.trim()
   if (value === '') {
+    // eslint-disable-next-line no-console
     console.warn(
       '[config] COLLAB_TOKEN_PUBLIC_WS_URL is not set; collab-token responses will omit collabWsUrl ' +
         'and clients fall back to their build-time WS env (compatibility phase).',
@@ -73,6 +74,7 @@ export function resolveCollabPublicWsUrl(raw: string): string {
     return ''
   }
   if (!/^wss?:\/\//i.test(value)) {
+    // eslint-disable-next-line no-console
     console.warn(
       `[config] COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value}. ` +
         'Ignoring it; collabWsUrl will be omitted this phase.',

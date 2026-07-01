@@ -37,6 +37,7 @@ describe('resolveCollabPublicWsUrl (collab WS url validation, §4.4)', () => {
 
   it('returns "" (omit) and warns when unset/empty', () => {
     expect(resolveCollabPublicWsUrl('')).toBe('')
+    // eslint-disable-next-line no-console
     expect(console.warn).toHaveBeenCalledOnce()
   })
 
@@ -46,6 +47,7 @@ describe('resolveCollabPublicWsUrl (collab WS url validation, §4.4)', () => {
 
   it('rejects a non-ws scheme (http/https) — returns "" and warns', () => {
     expect(resolveCollabPublicWsUrl('https://collab.example.com')).toBe('')
+    // eslint-disable-next-line no-console
     expect(console.warn).toHaveBeenCalledOnce()
   })
 
