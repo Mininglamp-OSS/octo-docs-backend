@@ -26,6 +26,14 @@ export interface CollabTokenResult {
   token: string
   expiresAt: string // ISO8601
   role: Role
+  // Current permission epoch for the doc (§4.5). Mirrors the signed claim so the
+  // client can seed its epoch without decoding the JWT (previously absent, which
+  // forced the frontend to default to 0 — XIN-210/211).
+  permission_epoch: number
+  // Absolute public WS origin for the collab handshake (§4.4). Present only when
+  // the backend has COLLAB_TOKEN_PUBLIC_WS_URL configured; omitted otherwise so
+  // the client falls back to its build-time env during the compat phase.
+  collabWsUrl?: string
 }
 
 /** Sign a short-lived collab token (§4.4). */
@@ -42,7 +50,18 @@ export function signCollabToken(claims: CollabClaims): CollabTokenResult {
     { algorithm: 'HS256', expiresIn: ttl },
   )
   const expiresAt = new Date((Math.floor(Date.now() / 1000) + ttl) * 1000).toISOString()
-  return { token, expiresAt, role: claims.role }
+  const result: CollabTokenResult = {
+    token,
+    expiresAt,
+    role: claims.role,
+    permission_epoch: claims.permission_epoch,
+  }
+  // Only surface an absolute, configured WS origin; never emit an empty/relative
+  // one (resolveCollabPublicWsUrl already normalised unset/malformed to '').
+  if (config.collabToken.publicWsUrl !== '') {
+    result.collabWsUrl = config.collabToken.publicWsUrl
+  }
+  return result
 }
 
 /**
