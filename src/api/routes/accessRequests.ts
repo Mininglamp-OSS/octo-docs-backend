@@ -99,9 +99,16 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
 })
 
 /**
- * POST approve (needs admin). Grants the chosen role via the shared max-merge
- * path (only-up + epoch bump + owner/admin skip), then marks the request
- * approved. Idempotency: only a still-pending request is transitioned.
+ * POST approve (needs admin). Consumes the pending request FIRST, then grants
+ * the chosen role via the shared max-merge path (only-up + epoch bump +
+ * owner/admin skip).
+ *
+ * The decide() -> grant order is load-bearing: decide() carries the only
+ * `WHERE status = pending` guard and reports whether it actually transitioned a
+ * row. Granting only when decide() returns true means a replayed, double-
+ * submitted, or already-decided request (denied OR approved) can never授权 —
+ * a denial is never silently overwritten and an approval is never double-
+ * granted. A non-pending request is a 409 (already decided) with no grant.
  */
 accessRequestsRouter.post(
   '/:docId/access-requests/:requestId/approve',
@@ -116,18 +123,26 @@ accessRequestsRouter.post(
     // Approver picks the level; default to what was requested.
     const grantRole = parseReqRole((req.body ?? {}).role, roleName(Number(request.requested_role)) as 'reader' | 'writer')
 
+    // Transition pending -> approved first; grant only on a genuine transition.
+    const decided = await docAccessRequestRepo.decide({
+      docId: req.params.docId!,
+      requestId: req.params.requestId!,
+      status: REQUEST_STATUS_APPROVED,
+      decidedBy: req.uid!,
+    })
+    if (!decided) {
+      // Already denied / approved / cancelled (or lost a concurrent race):
+      // the request is no longer pending, so we grant nothing.
+      res.status(409).json({ error: 'not_pending' })
+      return
+    }
+
     const result = await grantForwardAccess({
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
       uid: request.uid,
       roleNum: roleToNumber(grantRole),
       grantedBy: req.uid!,
-    })
-    await docAccessRequestRepo.decide({
-      docId: req.params.docId!,
-      requestId: req.params.requestId!,
-      status: REQUEST_STATUS_APPROVED,
-      decidedBy: req.uid!,
     })
     res.status(200).json({ ok: true, role: result.finalRole })
   },

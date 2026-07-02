@@ -218,6 +218,61 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
     expect(res.statusCode).toBe(404)
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
+
+  // Regression (§ review打回 blocker): grant MUST be gated on a genuine
+  // pending -> approved transition. decide() owns the only WHERE status=pending
+  // guard, so when it reports no row transitioned we授权 nothing — otherwise a
+  // replayed / already-decided approve silently overwrites a denial or double-
+  // grants. These three cases pin decide()->grant ordering.
+  const requestRow = (status: number) => ({
+    doc_id: 'd_1',
+    uid: 'u_applicant',
+    requested_role: 1,
+    reason: '',
+    status,
+    request_id: 'req_x',
+    decided_by: 'u_admin',
+    created_at: new Date(0),
+    updated_at: new Date(0),
+  })
+
+  it('① approving an already-denied request -> 409, no grant', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(requestRow(REQUEST_STATUS_DENIED))
+    // Real repo returns false: the WHERE status=pending UPDATE matched no row.
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(false)
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({ error: 'not_pending' })
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
+
+  it('② approving an already-approved request -> 409, idempotent (no double grant)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(requestRow(REQUEST_STATUS_APPROVED))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(false)
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
+
+  it('③ decide() returns false (lost race) -> no grant, decide runs before grant', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(requestRow(1))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(false)
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(vi.mocked(docAccessRequestRepo.decide)).toHaveBeenCalledWith({
+      docId: 'd_1',
+      requestId: 'req_x',
+      status: REQUEST_STATUS_APPROVED,
+      decidedBy: 'u_admin',
+    })
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
 })
 
 // ── deny ────────────────────────────────────────────────────────────────────
