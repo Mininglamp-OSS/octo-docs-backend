@@ -23,3 +23,8 @@ export function newInviteToken(): string {
 export function newAttachId(): string {
   return `att_${rand(12)}`
 }
+
+/** Generate an access-request id (screen 4c). High-entropy, routes approve/deny. */
+export function newRequestId(): string {
+  return `req_${rand(12)}`
+}

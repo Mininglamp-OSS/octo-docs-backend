@@ -13,6 +13,8 @@ import { authMiddleware } from './middleware/auth.js'
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
+import { forwardGrantRouter } from './routes/forwardGrant.js'
+import { accessRequestsRouter } from './routes/accessRequests.js'
 import { invitesRouter, acceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
@@ -40,6 +42,8 @@ export function createApp(): Express {
   // 3. metadata operations
   api.use(docsRouter) // / , /:docId
   api.use(membersRouter) // /:docId/members ...
+  api.use(forwardGrantRouter) // /:docId/forward-grant (forward-to-chat authorization, max-merge)
+  api.use(accessRequestsRouter) // /:docId/access-requests ... (screen 4c request/approve/deny)
   api.use(invitesRouter) // /:docId/invites ... (admin)
   api.use(attachmentsRouter) // /:docId/attachments/presign , /:docId/attachments/:attachId
   api.use(linkCardRouter) // /:docId/link-card (OG fetch, §3.5 ⑰)
