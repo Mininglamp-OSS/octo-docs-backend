@@ -16,7 +16,12 @@ const DEFAULT_FOLDER = 'f_default'
 /** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
 docsRouter.post('/', async (req: Request, res: Response) => {
   const uid = req.uid!
-  const { spaceId, folderId, title, docType } = req.body ?? {}
+  const { spaceId: bodySpaceId, folderId, title, docType } = req.body ?? {}
+  // Space isolation (P1): the space is sourced from the enforced X-Space-Id
+  // header (req.spaceId, set by spaceContextMiddleware). body.spaceId is retained
+  // only as a transitional fallback and is scheduled for removal in P3; whenever
+  // the header is present (always, post-middleware) it takes precedence.
+  const spaceId = req.spaceId ?? (typeof bodySpaceId === 'string' ? bodySpaceId : '')
   if (typeof spaceId !== 'string' || spaceId === '') {
     res.status(400).json({ error: 'spaceId required' })
     return
@@ -82,7 +87,10 @@ export async function getDocHandler(req: Request, res: Response) {
 /** GET /api/v1/docs — list docs the caller owns or is a member of. */
 docsRouter.get('/', async (req: Request, res: Response) => {
   const uid = req.uid!
-  const spaceId = typeof req.query.spaceId === 'string' ? req.query.spaceId : undefined
+  // Space isolation (P1): the space is the enforced X-Space-Id header
+  // (req.spaceId, set by spaceContextMiddleware), never a client-supplied query
+  // param. Listing is hard-scoped to that space.
+  const spaceId = req.spaceId!
   const folderId = typeof req.query.folderId === 'string' ? req.query.folderId : undefined
   const page = Math.max(1, Number(req.query.page ?? 1) || 1)
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
