@@ -31,4 +31,4 @@ CREATE TABLE IF NOT EXISTS doc_access_request (
   PRIMARY KEY (doc_id, uid),
   UNIQUE KEY uk_request_id (request_id),
   KEY idx_doc_status (doc_id, status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
