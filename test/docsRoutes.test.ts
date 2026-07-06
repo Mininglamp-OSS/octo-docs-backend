@@ -37,7 +37,7 @@ function mockRes(): MockRes {
 }
 
 function req(params: Record<string, string>) {
-  return { uid: 'u_1', params, body: undefined, query: {} } as never
+  return { uid: 'u_1', spaceId: 's1', params, body: undefined, query: {} } as never
 }
 
 /** A doc_meta row as the repo returns it (snake_case columns). */
@@ -65,8 +65,9 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
   it('requires at least reader on the doc', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(null)
     await getDocHandler(req({ docId: 'd_1' }), mockRes() as never)
-    // The minRole passed to the guard (4th arg) is 'reader'.
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    // The space (4th arg) is sourced from req.spaceId; the minRole (5th arg) is 'reader'.
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
   })
 
   it('returns 200 with the camelCase doc shape for an authorized reader', async () => {

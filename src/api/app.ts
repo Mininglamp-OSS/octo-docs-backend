@@ -6,10 +6,13 @@
  *      themselves and return their own 401, so they are mounted BEFORE
  *      authMiddleware.
  *   2. authMiddleware (octo identity -> req.uid) for the metadata operations.
- *   3. metadata routers (docs / members / invites-admin / attachments).
+ *   3. spaceContextMiddleware (X-Space-Id header -> req.spaceId) for the
+ *      metadata operations; a missing header is a hard 400.
+ *   4. metadata routers (docs / members / invites-admin / attachments).
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { authMiddleware } from './middleware/auth.js'
+import { spaceContextMiddleware } from './middleware/spaceContext.js'
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
@@ -37,7 +40,10 @@ export function createApp(): Express {
   // 2. require octo identity for everything below
   api.use(authMiddleware)
 
-  // 3. metadata operations
+  // 3. require a space context (X-Space-Id header) for the metadata operations
+  api.use(spaceContextMiddleware)
+
+  // 4. metadata operations
   api.use(docsRouter) // / , /:docId
   api.use(membersRouter) // /:docId/members ...
   api.use(invitesRouter) // /:docId/invites ... (admin)

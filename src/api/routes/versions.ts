@@ -73,7 +73,7 @@ function parseVersionId(raw: string | undefined): number | null {
 versionsRouter.get('/:docId/versions', listVersionsHandler)
 
 export async function listVersionsHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
 
   const cursorRaw = req.query.cursor
@@ -112,7 +112,7 @@ export async function listVersionsHandler(req: Request, res: Response): Promise<
 versionsRouter.post('/:docId/versions', createVersionHandler)
 
 export async function createVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
   if (!guard) return
 
   // Wire contract: the frontend sends the label as `label`. Accept the legacy
@@ -146,7 +146,7 @@ export async function createVersionHandler(req: Request, res: Response): Promise
 versionsRouter.get('/:docId/versions/:versionId/state', getVersionStateHandler)
 
 export async function getVersionStateHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
 
   const versionId = parseVersionId(req.params.versionId)
@@ -194,7 +194,7 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
 versionsRouter.patch('/:docId/versions/:versionId', renameVersionHandler)
 
 export async function renameVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
   if (!guard) return
 
   const versionId = parseVersionId(req.params.versionId)
@@ -224,7 +224,7 @@ export async function renameVersionHandler(req: Request, res: Response): Promise
 versionsRouter.delete('/:docId/versions/:versionId', deleteVersionHandler)
 
 export async function deleteVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
 
   const versionId = parseVersionId(req.params.versionId)
@@ -248,7 +248,7 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
   const docId = req.params.docId!
   // Initial authorization (admin-only). The authoritative recheck happens again
   // under the row lock inside the service — this is the cheap pre-check / 404 pass.
-  const guard = await requireDocRole(res, req.uid!, docId, 'admin')
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin')
   if (!guard) return
 
   const versionId = parseVersionId(req.params.versionId)

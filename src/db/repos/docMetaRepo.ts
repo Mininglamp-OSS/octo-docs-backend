@@ -111,7 +111,7 @@ export const docMetaRepo = {
    */
   async listForUser(params: {
     uid: string
-    spaceId?: string
+    spaceId: string
     folderId?: string
     page: number
     pageSize: number
@@ -123,10 +123,11 @@ export const docMetaRepo = {
     // clause order so the full args array lines up positionally with the SQL.
     const filterArgs: unknown[] = []
     // role: owner => admin(3), else doc_member.role
-    if (params.spaceId) {
-      where.push('m.space_id = ?')
-      filterArgs.push(params.spaceId)
-    }
+    // Space isolation (P1): listing is always scoped to the caller's space; the
+    // space filter is unconditional now that spaceId is required (sourced from
+    // the enforced X-Space-Id header). Docs in other spaces are never returned.
+    where.push('m.space_id = ?')
+    filterArgs.push(params.spaceId)
     if (params.folderId) {
       where.push('m.folder_id = ?')
       filterArgs.push(params.folderId)

@@ -125,7 +125,7 @@ function presignReadUrl(attachment: DocAttachment, ttl: number): string {
 attachmentsRouter.post('/:docId/attachments/presign', presignHandler)
 
 export async function presignHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
   if (!guard) return
 
   const { fileName, mime, sizeBytes } = req.body ?? {}
@@ -210,7 +210,7 @@ export async function presignHandler(req: Request, res: Response): Promise<void>
 attachmentsRouter.get('/:docId/attachments/:attachId', readHandler)
 
 export async function readHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
 
   const attachment = await docAttachmentRepo.getById(req.params.attachId!)
@@ -245,7 +245,7 @@ export async function readHandler(req: Request, res: Response): Promise<void> {
 attachmentsRouter.post('/:docId/attachments/resolve', resolveHandler)
 
 export async function resolveHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
 
   const { attachIds } = req.body ?? {}

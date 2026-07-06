@@ -52,6 +52,7 @@ function req(opts: {
 }) {
   return {
     uid: opts.uid ?? 'u_reader',
+    spaceId: 's1',
     params: opts.params ?? {},
     body: opts.body,
     query: opts.query ?? {},
@@ -131,7 +132,9 @@ describe('POST create (reader can comment)', () => {
     expect(res.statusCode).toBe(201)
     expect((res.body as { id: number }).id).toBe(123)
     // reader role is sufficient (product decision read => can comment).
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    // The space (4th arg) is threaded from req.spaceId; minRole is the 5th arg.
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
   })
 
   it('rejects a root comment with no anchors (root/reply anchor invariant)', async () => {
@@ -269,7 +272,7 @@ describe('PATCH resolve / body edit', () => {
     // Single guard call: the floor gate with the reader minimum; writer is
     // enforced from guard.role, not a second requireDocRole call.
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
   })
 
   it('resolves a thread for a writer and stamps resolved_by', async () => {
@@ -357,7 +360,7 @@ describe('DELETE soft / hard', () => {
     )
     expect(res.statusCode).toBe(403)
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
   })
 
   it('hard-deletes for an admin', async () => {
@@ -394,7 +397,7 @@ describe('reader floor gate on body-edit / soft-delete (revoked author + doc sta
     expect(res.statusCode).toBe(403)
     // The floor gate fired (reader minimum) and short-circuited before getById.
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
     // No DB read of the comment happened — the gate blocked first.
     expect(vi.mocked(query)).not.toHaveBeenCalled()
   })
@@ -408,7 +411,7 @@ describe('reader floor gate on body-edit / soft-delete (revoked author + doc sta
     )
     expect(res.statusCode).toBe(403)
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
     expect(vi.mocked(query)).not.toHaveBeenCalled()
   })
 

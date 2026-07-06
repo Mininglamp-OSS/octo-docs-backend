@@ -21,7 +21,7 @@ function parseRole(v: unknown): Role | null {
 
 /** GET members (needs admin). */
 membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
   const members = await docMemberRepo.list(req.params.docId!)
   res.status(200).json({
@@ -40,7 +40,7 @@ membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
  * non-existent uid => 404 user_not_found (no ghost member written).
  */
 membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
   const { uid, role } = req.body ?? {}
   if (typeof uid !== 'string' || uid === '') {
@@ -71,7 +71,7 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
 
 /** DELETE member (needs admin); owner cannot be removed (§4.5). */
 membersRouter.delete('/:docId/members/:uid', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
   const targetUid = req.params.uid!
   if (targetUid === guard.meta.owner_id) {

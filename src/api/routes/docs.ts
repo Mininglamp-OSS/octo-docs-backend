@@ -16,8 +16,14 @@ const DEFAULT_FOLDER = 'f_default'
 /** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
 docsRouter.post('/', async (req: Request, res: Response) => {
   const uid = req.uid!
-  const { spaceId, folderId, title, docType } = req.body ?? {}
-  if (typeof spaceId !== 'string' || spaceId === '') {
+  const { folderId, title, docType } = req.body ?? {}
+  // Space isolation (P3): the space is sourced solely from the enforced
+  // X-Space-Id header (req.spaceId, set by spaceContextMiddleware, guaranteed
+  // non-empty). The transitional body.spaceId fallback (P1) is removed — any
+  // spaceId in the request body is ignored; the header is the single source of
+  // truth. The empty guard below stays as defense-in-depth for the header.
+  const spaceId = req.spaceId ?? ''
+  if (spaceId === '') {
     res.status(400).json({ error: 'spaceId required' })
     return
   }
@@ -61,7 +67,7 @@ docsRouter.post('/', async (req: Request, res: Response) => {
 export async function getDocHandler(req: Request, res: Response) {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, 'reader')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader')
   if (!guard) return
   const { meta, role } = guard
   res.status(200).json({
@@ -82,7 +88,10 @@ export async function getDocHandler(req: Request, res: Response) {
 /** GET /api/v1/docs — list docs the caller owns or is a member of. */
 docsRouter.get('/', async (req: Request, res: Response) => {
   const uid = req.uid!
-  const spaceId = typeof req.query.spaceId === 'string' ? req.query.spaceId : undefined
+  // Space isolation (P1): the space is the enforced X-Space-Id header
+  // (req.spaceId, set by spaceContextMiddleware), never a client-supplied query
+  // param. Listing is hard-scoped to that space.
+  const spaceId = req.spaceId!
   const folderId = typeof req.query.folderId === 'string' ? req.query.folderId : undefined
   const page = Math.max(1, Number(req.query.page ?? 1) || 1)
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
@@ -110,7 +119,7 @@ docsRouter.get('/:docId', getDocHandler)
 docsRouter.patch('/:docId', async (req: Request, res: Response) => {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, 'admin')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin')
   if (!guard) return
   const { title } = req.body ?? {}
   if (typeof title !== 'string' || title === '') {
@@ -125,7 +134,7 @@ docsRouter.patch('/:docId', async (req: Request, res: Response) => {
 docsRouter.delete('/:docId', async (req: Request, res: Response) => {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, 'admin')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin')
   if (!guard) return
   const deleted = await docMetaRepo.softDelete(docId)
   // Broadcast the epoch invalidation so connected writers recheck and get cut
