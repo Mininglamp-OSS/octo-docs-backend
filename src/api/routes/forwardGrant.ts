@@ -34,7 +34,7 @@ function parseGrantRole(v: unknown): 'reader' | 'writer' | null {
 forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Response) => {
   // Authorization to GRANT: only admin/owner may forward-grant (owner => admin).
   // requireDocRole writes 404/409/403 and returns null when blocked.
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
 
   const { uid, role } = req.body ?? {}

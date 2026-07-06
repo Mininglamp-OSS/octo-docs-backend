@@ -77,7 +77,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
 
 /** GET list requests by status (needs admin; default pending). */
 accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
   const statusParam = req.query.status
   const statusNum =
@@ -113,7 +113,7 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
 accessRequestsRouter.post(
   '/:docId/access-requests/:requestId/approve',
   async (req: Request, res: Response) => {
-    const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+    const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
     if (!guard) return
     const request = await docAccessRequestRepo.getByRequestId(req.params.docId!, req.params.requestId!)
     if (!request) {
@@ -152,7 +152,7 @@ accessRequestsRouter.post(
 accessRequestsRouter.post(
   '/:docId/access-requests/:requestId/deny',
   async (req: Request, res: Response) => {
-    const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+    const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
     if (!guard) return
     const request = await docAccessRequestRepo.getByRequestId(req.params.docId!, req.params.requestId!)
     if (!request) {
