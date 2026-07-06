@@ -82,6 +82,25 @@ CREATE TABLE doc_invite_redemption (
   PRIMARY KEY (invite_token, uid)                 -- 同一 uid 对同一 token 仅计一次（再次点击不重复 +used_count）
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 访问申请（屏4c「申请访问」MVP，拉取式）：无权限接收方点开文档链接被 403 后，
+-- 提交一条访问申请；owner + admin 拉取 pending 列表并 approve/deny。approve 走与
+-- 转发授权同一条 max-merge（只升不降）路径。PK (doc_id, uid) 单行复用 = 天然幂等
+-- （同人重复申请只刷新为 pending，不刷屏多行），与 doc_member / doc_invite_redemption 同一去重范式。
+CREATE TABLE doc_access_request (
+  doc_id         VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
+  uid            VARCHAR(64)  NOT NULL,            -- 申请人可信 uid（authMiddleware 注入，绝非请求体）
+  requested_role TINYINT      NOT NULL DEFAULT 1,  -- 1=reader 2=writer（无 commenter/admin 申请）
+  reason         VARCHAR(512) NOT NULL DEFAULT '',
+  status         TINYINT      NOT NULL DEFAULT 1,  -- 1=pending 2=approved 3=denied 4=cancelled
+  request_id     VARCHAR(64)  NOT NULL,            -- 高熵 id，供 approve/deny 路由寻址
+  decided_by     VARCHAR(64)  NOT NULL DEFAULT '', -- 处理人 uid
+  created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id, uid),                       -- 一个 uid 对一个 doc 至多一条申请（重复申请 UPDATE 复用）
+  UNIQUE KEY uk_request_id (request_id),
+  KEY idx_doc_status (doc_id, status)              -- admin 拉「某文档 pending 申请」
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 【迁移说明：doc_acl → doc_member】
 -- v1.x 的 doc_acl(principal_type ∈ {1=user, 2=group}) 在 v2.0 被 doc_member 取代：
 --   · principal_type=user 行 = 直授个人 → 直接迁入 doc_member（doc_id, principal_id→uid, role, granted_by, source=direct）；
