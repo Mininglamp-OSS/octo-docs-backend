@@ -83,8 +83,8 @@ describe('POST /api/v1/docs — create persists into the header space', () => {
     const req = {
       uid: 'u_owner',
       spaceId: 's_header',
-      // body.spaceId is a P1 transitional fallback and must be overridden by the
-      // header when present (removal deferred to P3).
+      // body.spaceId is ignored (the P1 transitional fallback was removed in
+      // P3); the header space is the single source of truth.
       body: { spaceId: 's_body_attacker', folderId: 'f_x', title: 'Hello', docType: 'doc' },
     } as never
     await collectionHandler('post')(req, res as never)

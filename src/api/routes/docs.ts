@@ -16,13 +16,14 @@ const DEFAULT_FOLDER = 'f_default'
 /** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
 docsRouter.post('/', async (req: Request, res: Response) => {
   const uid = req.uid!
-  const { spaceId: bodySpaceId, folderId, title, docType } = req.body ?? {}
-  // Space isolation (P1): the space is sourced from the enforced X-Space-Id
-  // header (req.spaceId, set by spaceContextMiddleware). body.spaceId is retained
-  // only as a transitional fallback and is scheduled for removal in P3; whenever
-  // the header is present (always, post-middleware) it takes precedence.
-  const spaceId = req.spaceId ?? (typeof bodySpaceId === 'string' ? bodySpaceId : '')
-  if (typeof spaceId !== 'string' || spaceId === '') {
+  const { folderId, title, docType } = req.body ?? {}
+  // Space isolation (P3): the space is sourced solely from the enforced
+  // X-Space-Id header (req.spaceId, set by spaceContextMiddleware, guaranteed
+  // non-empty). The transitional body.spaceId fallback (P1) is removed — any
+  // spaceId in the request body is ignored; the header is the single source of
+  // truth. The empty guard below stays as defense-in-depth for the header.
+  const spaceId = req.spaceId ?? ''
+  if (spaceId === '') {
     res.status(400).json({ error: 'spaceId required' })
     return
   }
