@@ -66,7 +66,7 @@ docsRouter.post('/', async (req: Request, res: Response) => {
 export async function getDocHandler(req: Request, res: Response) {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, 'reader')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader')
   if (!guard) return
   const { meta, role } = guard
   res.status(200).json({
@@ -118,7 +118,7 @@ docsRouter.get('/:docId', getDocHandler)
 docsRouter.patch('/:docId', async (req: Request, res: Response) => {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, 'admin')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin')
   if (!guard) return
   const { title } = req.body ?? {}
   if (typeof title !== 'string' || title === '') {
@@ -133,7 +133,7 @@ docsRouter.patch('/:docId', async (req: Request, res: Response) => {
 docsRouter.delete('/:docId', async (req: Request, res: Response) => {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, 'admin')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin')
   if (!guard) return
   const deleted = await docMetaRepo.softDelete(docId)
   // Broadcast the epoch invalidation so connected writers recheck and get cut

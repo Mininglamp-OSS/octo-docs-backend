@@ -43,7 +43,7 @@ function mockRes(): MockRes {
 }
 
 function req(params: Record<string, string>, body?: unknown) {
-  return { uid: 'u_writer', params, body } as never
+  return { uid: 'u_writer', spaceId: 's1', params, body } as never
 }
 
 const writerGuard = { meta: { doc_id: 'd_1' }, role: 'writer' } as never
@@ -62,6 +62,8 @@ describe('POST presign validation (§3.5 step 1)', () => {
     await presignHandler(req({ docId: 'd_1' }, { fileName: 'x.bin', mime: 'application/octet-stream', sizeBytes: 10 }), res as never)
     expect(res.statusCode).toBe(400)
     expect((res.body as { error: string }).error).toBe('mime_not_allowed')
+    // The doc guard is scoped to req.spaceId (4th arg).
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
   })
 
   it('rejects image/svg+xml even though it matches the image/ prefix (XSS)', async () => {

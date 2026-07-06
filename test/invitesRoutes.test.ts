@@ -55,6 +55,7 @@ function createInviteHandler() {
 function req() {
   return {
     uid: 'u_admin',
+    spaceId: 's1',
     params: { docId: 'd_1' },
     body: { role: 'writer' },
     protocol: 'http',
@@ -82,6 +83,8 @@ describe('POST /api/v1/docs/:docId/invites — create response (#6)', () => {
     const body = res.body as Record<string, unknown>
     expect(typeof body.inviteToken).toBe('string')
     expect(body.role).toBe('writer')
+    // The doc guard is scoped to req.spaceId (4th arg).
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
 
     // No host-derived link of any kind in the response.
     expect(body).not.toHaveProperty('url')
@@ -94,6 +97,7 @@ describe('POST /api/v1/docs/:docId/invites — create response (#6)', () => {
 function reqWith(body: Record<string, unknown>) {
   return {
     uid: 'u_admin',
+    spaceId: 's1',
     params: { docId: 'd_1' },
     body,
   } as never

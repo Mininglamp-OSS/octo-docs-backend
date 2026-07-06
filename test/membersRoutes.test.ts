@@ -60,6 +60,7 @@ function putMemberHandler() {
 function req(body: Record<string, unknown>, octoToken = 'caller-session-token') {
   return {
     uid: 'u_admin',
+    spaceId: 's1',
     octoToken,
     params: { docId: 'd_1' },
     body,
@@ -99,6 +100,8 @@ describe('PUT /api/v1/docs/:docId/members — anti ghost-member check', () => {
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual({ ok: true })
     expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledTimes(1)
+    // The doc guard is scoped to req.spaceId (4th arg).
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
   })
 
   it('add member with an unresolvable uid -> 404 user_not_found', async () => {

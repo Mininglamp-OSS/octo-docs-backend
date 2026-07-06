@@ -35,7 +35,7 @@ function mockRes(): MockRes {
   }
 }
 function req(body?: unknown) {
-  return { uid: 'u_reader', params: { docId: 'd_1' }, body } as never
+  return { uid: 'u_reader', spaceId: 's1', params: { docId: 'd_1' }, body } as never
 }
 
 const readerGuard = { meta: { doc_id: 'd_1' }, role: 'reader' } as never
@@ -71,6 +71,8 @@ describe('POST /link-card (§3.5 ⑰)', () => {
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual(sampleCard)
     expect(vi.mocked(fetchOgCard)).toHaveBeenCalledOnce()
+    // The doc guard is scoped to req.spaceId (4th arg).
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
     // Cached under the og:v1:<sha256> namespace with the success TTL.
     const [key, value, mode, ttl] = redisStore.set.mock.calls[0]!
     expect(String(key)).toMatch(/^octo-docs:og:v1:[0-9a-f]{64}$/)
