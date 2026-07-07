@@ -9,10 +9,16 @@
  *   3. spaceContextMiddleware (X-Space-Id header -> req.spaceId) for the
  *      metadata operations; a missing header is a hard 400.
  *   4. metadata routers (docs / members / invites-admin / attachments).
+ *
+ * A second, bot-facing mount (§ v4.3) re-mounts the same metadata routers under
+ * /v1/bot/docs behind verifyBot (bot token -> req.uid + server-resolved
+ * req.spaceId) instead of authMiddleware + spaceContextMiddleware. The human
+ * mount below is unchanged.
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { authMiddleware } from './middleware/auth.js'
 import { spaceContextMiddleware } from './middleware/spaceContext.js'
+import { verifyBotMiddleware } from './middleware/verifyBot.js'
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
@@ -57,6 +63,27 @@ export function createApp(): Express {
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
 
   app.use('/api/v1/docs', api)
+
+  // Bot-facing entry (§ v4.3): the SAME nine metadata routers, re-mounted behind
+  // a bot identity middleware at a physically distinct prefix so nginx can route
+  // /v1/bot/docs -> docs-backend while other /v1/bot/* -> octo-server. No handler
+  // code is copied or forked — each router only reads req.uid / req.spaceId, both
+  // of which verifyBot injects (uid from the bot token, spaceId from octo-server's
+  // server-side reverse lookup). Deliberately excludes the public collab-token /
+  // invite-accept routes (those are a separate user-token path) and does NOT mount
+  // spaceContextMiddleware — the bot space is server-resolved, never header-driven.
+  const botApi = Router()
+  botApi.use(verifyBotMiddleware)
+  botApi.use(docsRouter)
+  botApi.use(membersRouter)
+  botApi.use(forwardGrantRouter)
+  botApi.use(accessRequestsRouter)
+  botApi.use(invitesRouter)
+  botApi.use(attachmentsRouter)
+  botApi.use(linkCardRouter)
+  botApi.use(commentsRouter)
+  botApi.use(versionsRouter)
+  app.use('/v1/bot/docs', botApi)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

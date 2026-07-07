@@ -27,6 +27,16 @@ export interface OctoIdentity {
   verifyToken(token: string): Promise<{ uid: string; name?: string } | null>
 
   /**
+   * (a-bot) Resolve a bot bearer token to its trusted bot uid and the bot's
+   * space. Calls octo-server's already-existing POST /v1/auth/verify-bot, which
+   * validates the token against the `robot` table and server-side reverse-looks-up
+   * the bot's space from its most recent active `space_member` row. The space is
+   * therefore never client-supplied (anti-spoof). Returns null when the token is
+   * missing/invalid (caller => 401 / unauthorized).
+   */
+  verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null>
+
+  /**
    * (b) Look up a single user by uid. Returns null if the user does not exist
    * (used by §8.4 PUT members to reject ghost members => 404 user_not_found).
    *
@@ -69,6 +79,29 @@ export class HttpOctoIdentity implements OctoIdentity {
     const body = (await res.json().catch(() => null)) as { uid?: string; name?: string } | null
     if (!body || typeof body.uid !== 'string' || body.uid === '') return null
     return { uid: body.uid, name: body.name }
+  }
+
+  async verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null> {
+    if (!token) return null
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/auth/verify-bot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bot_token: token }),
+      })
+    } catch {
+      // Authoritative identity source unreachable => treat as unverified.
+      return null
+    }
+    if (!res.ok) return null
+    const body = (await res.json().catch(() => null)) as
+      | { bot_uid?: string; space_id?: string }
+      | null
+    if (!body || typeof body.bot_uid !== 'string' || body.bot_uid === '') return null
+    // The space is whatever octo-server reverse-resolved from the bot's active
+    // space_member row; it is never a client-supplied value (anti-spoof).
+    return { uid: body.bot_uid, spaceId: typeof body.space_id === 'string' ? body.space_id : '' }
   }
 
   async getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
@@ -121,6 +154,10 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
     return this.delegate.getUser(uid, callerToken)
+  }
+
+  verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null> {
+    return this.delegate.verifyBot(token)
   }
 
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
