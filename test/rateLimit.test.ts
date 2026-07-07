@@ -74,4 +74,21 @@ describe('rate limiter (§8.4)', () => {
       }
     })
   })
+
+  it('keys per real client IP behind a proxy (X-Forwarded-For), not the proxy address', async () => {
+    // trustProxy=1 => req.ip is taken from X-Forwarded-For (one nginx hop), so
+    // two different upstream clients get independent budgets instead of sharing
+    // one bucket keyed on the proxy socket address.
+    const app = createApp({ rateLimit: { windowMs: 60_000, max: 2 }, trustProxy: 1 })
+    await withServer(app, async (base) => {
+      const clientA = { 'X-Forwarded-For': '203.0.113.10' }
+      const clientB = { 'X-Forwarded-For': '203.0.113.20' }
+      // Client A exhausts its own budget.
+      expect((await fetch(`${base}/api/v1/docs`, { headers: clientA })).status).not.toBe(429)
+      expect((await fetch(`${base}/api/v1/docs`, { headers: clientA })).status).not.toBe(429)
+      expect((await fetch(`${base}/api/v1/docs`, { headers: clientA })).status).toBe(429)
+      // Client B is unaffected — a separate bucket, proving keying is per client IP.
+      expect((await fetch(`${base}/api/v1/docs`, { headers: clientB })).status).not.toBe(429)
+    })
+  })
 })

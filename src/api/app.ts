@@ -16,6 +16,7 @@
  * mount below is unchanged.
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
+import { config } from '../config/env.js'
 import { authMiddleware } from './middleware/auth.js'
 import { spaceContextMiddleware } from './middleware/spaceContext.js'
 import { verifyBotMiddleware } from './middleware/verifyBot.js'
@@ -31,8 +32,14 @@ import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
 
-export function createApp(opts: { rateLimit?: RateLimiterOptions } = {}): Express {
+export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
   const app = express()
+
+  // Trust the reverse proxy (nginx) in front of us so req.ip — and therefore the
+  // per-IP rate limiter below — reflects the real client from X-Forwarded-For
+  // rather than the proxy address. Configurable per deployment (config.trustProxy).
+  app.set('trust proxy', opts.trustProxy ?? config.trustProxy)
+
   app.use(express.json({ limit: '1mb' }))
 
   // health check (no auth, and deliberately mounted BEFORE any rate limiter so

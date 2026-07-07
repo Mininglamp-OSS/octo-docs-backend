@@ -108,6 +108,8 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `HOSTNAME` | no (`octo-docs-local`) | node identity in logs/registry |
 | `HOCUSPOCUS_PORT` | no (`1234`) | WS listener |
 | `HTTP_PORT` | no (`3000`) | REST listener |
+| `TRUST_PROXY` | **recommended behind a proxy** (`1`) | Express `trust proxy` value. The REST API sits behind nginx, so this must be set for `req.ip` — and the per-IP rate limiter — to resolve the real client from `X-Forwarded-For` instead of the proxy address. `1` = one nginx hop; use the hop count for deeper chains, a preset/CIDR like `loopback`, or `false` when exposed directly. Do **not** use `true` in prod (permissive: clients can spoof `X-Forwarded-For`). |
+| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
 | `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | recommended | authoritative store connection |
 | `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size |
 | `REDIS_HOST` / `REDIS_PORT` | recommended | broadcast bus / cache / registry |
