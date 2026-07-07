@@ -26,7 +26,7 @@ import { transaction, type Tx } from '../../db/pool.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../../db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
-import { restoreReconcile, gateSchema, SchemaIncompatibleError } from '../../collab/versionRestore.js'
+import { restoreReconcile, gateSchema, SchemaIncompatibleError, SheetSnapshotInvalidError } from '../../collab/versionRestore.js'
 import { applyRestoreToLiveDoc } from '../../collab/liveRestore.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
@@ -108,6 +108,12 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     } catch (err) {
       if (err instanceof SchemaIncompatibleError) {
         return { ok: false as const, status: 409, error: 'version_schema_incompatible' }
+      }
+      if (err instanceof SheetSnapshotInvalidError) {
+        // Target sheet snapshot violated the {v,f,s} contract — fail-closed
+        // (no safety snapshot, no live write) so a malformed version can never
+        // be replayed onto the live doc or rebroadcast to clients.
+        return { ok: false as const, status: 409, error: 'sheet_snapshot_invalid' }
       }
       throw err
     }

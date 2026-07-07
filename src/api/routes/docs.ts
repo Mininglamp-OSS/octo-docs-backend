@@ -105,6 +105,7 @@ docsRouter.get('/', async (req: Request, res: Response) => {
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
+      docType: d.doc_type,
       role: roleName(Number(d.role)),
       updatedAt: d.updated_at,
     })),
