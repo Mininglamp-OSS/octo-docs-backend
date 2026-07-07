@@ -148,7 +148,13 @@ accessRequestsRouter.post(
   },
 )
 
-/** POST deny (needs admin). Marks the request denied; requester stays forbidden. */
+/**
+ * POST deny (needs admin). Marks the request denied; requester stays forbidden.
+ * Gated on a genuine pending -> denied transition (same范式 as approve): if the
+ * request is unknown -> 404, and if it is no longer pending (already approved /
+ * denied / cancelled, or lost a concurrent race) decide() reports no row and we
+ * return 409 not_pending instead of a false ok:true.
+ */
 accessRequestsRouter.post(
   '/:docId/access-requests/:requestId/deny',
   async (req: Request, res: Response) => {
@@ -159,12 +165,20 @@ accessRequestsRouter.post(
       res.status(404).json({ error: 'not_found' })
       return
     }
-    await docAccessRequestRepo.decide({
+    // Mirror approve: decide() carries the only WHERE status=pending guard and
+    // reports whether it actually transitioned a row. Only report ok when a
+    // genuine pending -> denied transition happened; a replayed / already-decided
+    // (approved OR denied) request is a 409, never a false success.
+    const decided = await docAccessRequestRepo.decide({
       docId: req.params.docId!,
       requestId: req.params.requestId!,
       status: REQUEST_STATUS_DENIED,
       decidedBy: req.uid!,
     })
+    if (!decided) {
+      res.status(409).json({ error: 'not_pending' })
+      return
+    }
     res.status(200).json({ ok: true })
   },
 )
