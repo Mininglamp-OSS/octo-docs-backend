@@ -7,7 +7,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 //   - list:   admin-gated pending list shape
 //   - approve: grants via the shared max-merge core + marks approved
 //   - deny:    marks denied; unknown request -> 404
-vi.mock('../src/api/guard.js', () => ({ requireDocRole: vi.fn() }))
+// requireDocRole is mocked (its role resolution is exercised elsewhere), but
+// requireSameSpace keeps its real implementation so the submit space-scope gate
+// is tested against the actual meta.space_id vs req.spaceId comparison.
+vi.mock('../src/api/guard.js', async (orig) => {
+  const actual = (await orig()) as Record<string, unknown>
+  return { ...actual, requireDocRole: vi.fn() }
+})
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({ docMetaRepo: { getByDocId: vi.fn() } }))
 vi.mock('../src/db/repos/docAccessRequestRepo.js', async (orig) => {
   const actual = (await orig()) as Record<string, unknown>
@@ -89,7 +95,7 @@ beforeEach(() => {
 describe('POST /:docId/access-requests — submit', () => {
   const submitHandler = () => handlerFor('/:docId/access-requests', 'post')
   const req = (body: Record<string, unknown>) =>
-    ({ uid: 'u_applicant', params: { docId: 'd_1' }, body }) as never
+    ({ uid: 'u_applicant', spaceId: 's_1', params: { docId: 'd_1' }, body }) as never
 
   it('doc missing/deleted -> 404, no row written', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(null)
@@ -99,15 +105,31 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
+  it('cross-space doc -> 404 (indistinguishable from missing), no row, no oracle', async () => {
+    // Doc exists but lives in space s_other; the caller is scoped to s_1. The
+    // submit path is role-less, so this space gate is the only thing standing
+    // between a caller in one space and a doc in another. It must 404 (same
+    // shape as a missing doc) BEFORE the status branches so neither the doc's
+    // existence nor its archived/active state leaks, and no request row is
+    // written into the other space.
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_other' } as never)
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'writer' }), res as never)
+    expect(res.statusCode).toBe(404)
+    expect(res.body).toEqual({ error: 'not_found' })
+    expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
   it('archived doc (status=2) -> 409', async () => {
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 2 } as never)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 2, space_id: 's_1' } as never)
     const res = mockRes()
     await submitHandler()(req({}), res as never)
     expect(res.statusCode).toBe(409)
   })
 
   it('caller already >= requested role -> 200 already_granted, no row', async () => {
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1 } as never)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1' } as never)
     vi.mocked(resolveRole).mockResolvedValue('writer')
     const res = mockRes()
     await submitHandler()(req({ requestedRole: 'reader' }), res as never)
@@ -117,7 +139,7 @@ describe('POST /:docId/access-requests — submit', () => {
   })
 
   it('no existing access -> 201 pending, row written with requested role', async () => {
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1 } as never)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1' } as never)
     vi.mocked(resolveRole).mockResolvedValue('none')
     vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_x', status: 1 })
     const res = mockRes()

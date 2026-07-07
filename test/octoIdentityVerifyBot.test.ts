@@ -36,10 +36,19 @@ describe('HttpOctoIdentity.verifyBot — /v1/auth/verify-bot', () => {
     expect(JSON.parse(init.body as string)).toEqual({ bot_token: 'bot-bearer-token' })
   })
 
-  it('returns an empty spaceId when octo-server reverse-resolves no space', async () => {
+  it('returns null when octo-server reverse-resolves no space (spaceless bot must not be authorized)', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => botResponse({ bot_uid: 'bot_9', space_id: '' })))
     const identity = new HttpOctoIdentity('http://octo.test')
-    expect(await identity.verifyBot('t')).toEqual({ uid: 'bot_9', spaceId: '' })
+    // A bot with no resolvable space is rejected at the identity layer (returns
+    // null) so verifyBotMiddleware 401s it, rather than proceeding with an empty
+    // req.spaceId that would defeat per-space doc scoping.
+    expect(await identity.verifyBot('t')).toBeNull()
+  })
+
+  it('returns null when the response omits space_id entirely', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => botResponse({ bot_uid: 'bot_9' })))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.verifyBot('t')).toBeNull()
   })
 
   it('returns null without calling fetch when the token is empty', async () => {

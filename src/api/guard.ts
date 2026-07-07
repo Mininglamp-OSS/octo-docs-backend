@@ -12,6 +12,25 @@ export interface DocGuard {
 }
 
 /**
+ * Cross-space 404 gate (P2). A doc that lives in another space must be
+ * indistinguishable from one that does not exist, so an out-of-space hit
+ * returns 404 not_found (never 403) — matching the not_found semantics for
+ * cross-doc references and never leaking a doc's existence outside the caller's
+ * space. Writes the 404 and returns false when the doc is out of space.
+ *
+ * Shared by requireDocRole and the role-less access-request submit handler so
+ * both mounts (human /api/v1/docs and bot /v1/bot/docs) enforce identical space
+ * scoping from a single definition rather than a forked bespoke check.
+ */
+export function requireSameSpace(res: Response, meta: DocMeta, spaceId: string): boolean {
+  if (meta.space_id !== spaceId) {
+    res.status(404).json({ error: 'not_found' })
+    return false
+  }
+  return true
+}
+
+/**
  * Load the doc and resolve the caller's role, enforcing a minimum role.
  * Writes the appropriate HTTP error and returns null when blocked:
  *   404 doc missing/deleted, 404 cross-space, 409 archived, 403 insufficient role.
@@ -34,8 +53,7 @@ export async function requireDocRole(
     res.status(404).json({ error: 'not_found' })
     return null
   }
-  if (meta.space_id !== spaceId) {
-    res.status(404).json({ error: 'not_found' })
+  if (!requireSameSpace(res, meta, spaceId)) {
     return null
   }
   if (meta.status === 2) {

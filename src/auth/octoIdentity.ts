@@ -101,7 +101,17 @@ export class HttpOctoIdentity implements OctoIdentity {
     if (!body || typeof body.bot_uid !== 'string' || body.bot_uid === '') return null
     // The space is whatever octo-server reverse-resolved from the bot's active
     // space_member row; it is never a client-supplied value (anti-spoof).
-    return { uid: body.bot_uid, spaceId: typeof body.space_id === 'string' ? body.space_id : '' }
+    //
+    // A bot with no resolvable space MUST NOT be authorized: reject it here
+    // (return null, the unverified-identity signal) rather than passing an empty
+    // spaceId downstream. Every doc guard scopes on req.spaceId, so an empty
+    // space would silently defeat that scoping (empty === empty matches nothing
+    // real, but bypasses the intended isolation). Enforcing it at the identity
+    // layer means verifyBotMiddleware 401s a spaceless bot via its existing
+    // null check, with no per-middleware special case, and keeps the invariant
+    // "a verified bot identity always carries a real space" in one place.
+    if (typeof body.space_id !== 'string' || body.space_id === '') return null
+    return { uid: body.bot_uid, spaceId: body.space_id }
   }
 
   async getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
