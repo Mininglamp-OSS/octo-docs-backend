@@ -19,6 +19,7 @@ import express, { type Express, Router, type Request, type Response, type NextFu
 import { authMiddleware } from './middleware/auth.js'
 import { spaceContextMiddleware } from './middleware/spaceContext.js'
 import { verifyBotMiddleware } from './middleware/verifyBot.js'
+import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLimit.js'
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
@@ -30,16 +31,22 @@ import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
 
-export function createApp(): Express {
+export function createApp(opts: { rateLimit?: RateLimiterOptions } = {}): Express {
   const app = express()
   app.use(express.json({ limit: '1mb' }))
 
-  // health check (no auth)
+  // health check (no auth, and deliberately mounted BEFORE any rate limiter so
+  // liveness/readiness probes are never throttled)
   app.get('/healthz', (_req: Request, res: Response) => {
     res.status(200).json({ ok: true })
   })
 
   const api = Router()
+
+  // 0. per-IP rate limit for the whole human chain (§8.4). Mounted first so it
+  //    also covers the public collab-token / invite-accept routes below and the
+  //    authorizing metadata routers.
+  api.use(createRateLimiter(opts.rateLimit))
 
   // 1. public (identity verified inside the handler/service)
   api.use(collabTokenRouter) // POST /collab-token
@@ -73,6 +80,9 @@ export function createApp(): Express {
   // invite-accept routes (those are a separate user-token path) and does NOT mount
   // spaceContextMiddleware — the bot space is server-resolved, never header-driven.
   const botApi = Router()
+  // Same per-IP rate limit for the bot chain (independent budget from the human
+  // mount), mounted ahead of verifyBot so the authorizing bot routes are covered.
+  botApi.use(createRateLimiter(opts.rateLimit))
   botApi.use(verifyBotMiddleware)
   botApi.use(docsRouter)
   botApi.use(membersRouter)

@@ -116,6 +116,18 @@ export const config = {
     prefix: str('REDIS_PREFIX', 'octo-docs'),
   },
 
+  // Per-IP request throttle applied to the REST route chains (§8.4). Guards the
+  // authenticated/authorizing metadata endpoints on both the human (/api/v1/docs)
+  // and bot (/v1/bot/docs) mounts against abuse. Defaults are generous enough not
+  // to affect normal interactive/bot usage; tune down only if abuse is observed.
+  // The /healthz probe is mounted ahead of the limiter and stays unthrottled.
+  rateLimit: {
+    // Rolling window length.
+    windowMs: num('RATE_LIMIT_WINDOW_MS', 60_000),
+    // Max requests per IP per window before a 429 is returned.
+    max: num('RATE_LIMIT_MAX', 300),
+  },
+
   collabToken: {
     secret: str('COLLAB_TOKEN_SECRET', 'dev-only-change-me'),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
