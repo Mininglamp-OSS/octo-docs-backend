@@ -57,30 +57,77 @@ interface RepairPlan {
 }
 
 /**
+ * Fileset GC policy for a repair pass (P1-1). Image elements and their `files`
+ * entries can legitimately be inserted across TWO separate transactions (element
+ * in txn A, file in txn B, or vice versa — the FE binding does not guarantee an
+ * atomic file+element commit). At the scoped repair tick BETWEEN those two
+ * transactions one side is not yet visible, so a naive GC that fires on mere
+ * absence destroys a just-inserted image/file whose counterpart is still in
+ * flight. GC must therefore act only on POSITIVE DELETE EVIDENCE, never on
+ * absence alone:
+ *
+ *   'coldStart'  — the whole persisted state is materialized at once (cold-start
+ *                  / failover / whole-board pass): nothing is in flight, so an
+ *                  absent-file image really is dangling and an unreferenced file
+ *                  really is orphaned — drop / GC both. Deterministic (BE-M11).
+ *   'none'       — a live insert/update or element-deletion pass: never drop an
+ *                  image for an absent file and never GC a file. An absent
+ *                  counterpart may simply not have arrived yet.
+ *   Set<string>  — a live FILE-DELETION pass: the set holds the fileIds just
+ *                  removed in the triggering transaction. Drop only images whose
+ *                  fileId is in this set; GC no other file. A pending image whose
+ *                  (not-yet-arrived) file is NOT in the set is left untouched.
+ */
+type FilePolicy = 'coldStart' | 'none' | ReadonlySet<string>
+
+/**
  * Compute the repair plan from the current doc state. Pure read; performs no
  * writes. `scope` (when provided) limits which element ids are candidates for
  * normalize/drop — the live observer passes the changed ids (gate 3); the
- * cold-start path passes `null` to consider every element.
+ * cold-start path passes `null` to consider every element. `files` gates all
+ * file-related GC on positive delete evidence (see FilePolicy, P1-1).
  */
-function planRepair(doc: Y.Doc, scope: ReadonlySet<string> | null): RepairPlan {
+function planRepair(
+  doc: Y.Doc,
+  scope: ReadonlySet<string> | null,
+  files: FilePolicy,
+): RepairPlan {
   const elements = getElementsMap(doc)
   const allIds = new Set(elements.keys())
   const fileIds = new Set(getFilesMap(doc).keys())
   const current = readElements(doc)
 
-  // Pass 1: decide survivors (drop bad id/type or dangling-image) over all ids,
-  // so reference pruning in pass 2 sees the correct surviving-id set. A survivor
-  // whose tombstone flag is set (isDeleted === true) keeps its key (§1.1) but is
-  // NOT a valid reference target: `referenceable` is therefore the non-tombstoned
-  // subset, and it — not `survivors` — is what pass 2 passes as elementIds so a
-  // ref to a tombstoned element is pruned exactly like a ref to an absent one
-  // (M-5, types.ts §elementIds = the non-tombstoned id set).
+  // Should an image whose `fileId` is absent from the files container be DROPPED
+  // this pass? Only on positive delete evidence (see FilePolicy). On insert
+  // passes ('none') an absent file may just be a split-transaction insert that
+  // has not landed yet, so the image is kept.
+  const dropAbsentImage = (id: string): boolean => {
+    const el = current.get(id)
+    if (!el || !FILE_BEARING_TYPES.has(el.type as string)) return false
+    const fid = el.fileId
+    const absent = typeof fid !== 'string' || !fileIds.has(fid)
+    if (!absent) return false
+    if (files === 'coldStart') return true
+    if (files === 'none') return false
+    return typeof fid === 'string' && files.has(fid) // just-deleted file only
+  }
+
+  // Pass 1: decide survivors (drop bad id/type or a positively-dangling image)
+  // over all ids, so reference pruning in pass 2 sees the correct surviving-id
+  // set. The absent-file drop is decided by `dropAbsentImage` (NOT by passing
+  // fileIds into normalizeElement) so a split-transaction insert is never GC'd
+  // on mere absence (P1-1). A survivor whose tombstone flag is set
+  // (isDeleted === true) keeps its key (§1.1) but is NOT a valid reference
+  // target: `referenceable` is therefore the non-tombstoned subset, and it — not
+  // `survivors` — is what pass 2 passes as elementIds so a ref to a tombstoned
+  // element is pruned exactly like a ref to an absent one (M-5, types.ts
+  // §elementIds = the non-tombstoned id set).
   const survivors = new Set<string>()
   const referenceable = new Set<string>()
   const dropAll: string[] = []
   for (const id of allIds) {
-    const n = normalizeElement(current.get(id), { fileIds })
-    if (n) {
+    const n = normalizeElement(current.get(id), {})
+    if (n && !dropAbsentImage(id)) {
       survivors.add(id)
       if (n.isDeleted !== true) referenceable.add(id)
     } else {
@@ -95,7 +142,7 @@ function planRepair(doc: Y.Doc, scope: ReadonlySet<string> | null): RepairPlan {
   let seq = 0
   for (const id of [...survivors].sort()) {
     const el = current.get(id)!
-    const n = normalizeElement(el, { fileIds })!
+    const n = normalizeElement(el, {})!
     if (n.index === undefined) indexFill.set(id, fillIndexKey(seq++))
   }
 
@@ -103,7 +150,7 @@ function planRepair(doc: Y.Doc, scope: ReadonlySet<string> | null): RepairPlan {
   const candidates = scope ? [...survivors].filter((id) => scope.has(id)) : [...survivors]
   for (const id of candidates.sort()) {
     const el = current.get(id)!
-    const n = normalizeElement(el, { elementIds: referenceable, fileIds }) as WhiteboardElement
+    const n = normalizeElement(el, { elementIds: referenceable }) as WhiteboardElement
     const final: Record<string, unknown> = { ...n }
     const fill = indexFill.get(id)
     if (fill !== undefined) final.index = fill
@@ -112,16 +159,22 @@ function planRepair(doc: Y.Doc, scope: ReadonlySet<string> | null): RepairPlan {
   }
 
   // File GC: a file with no surviving image element referencing it is dangling.
-  const referenced = new Set<string>()
-  for (const id of survivors) {
-    const el = current.get(id)!
-    if (FILE_BEARING_TYPES.has(el.type as string) && typeof el.fileId === 'string') {
-      referenced.add(el.fileId)
-    }
-  }
+  // Only performed on a whole-board cold-start pass — never on a live insert
+  // pass (a file whose image is a pending split-transaction insert must survive)
+  // and never on a file-deletion pass (the removed files are already gone from
+  // the map; their images are dropped via dropAbsentImage). See FilePolicy.
   const fileGc: string[] = []
-  for (const fid of [...fileIds].sort()) {
-    if (!referenced.has(fid)) fileGc.push(fid)
+  if (files === 'coldStart') {
+    const referenced = new Set<string>()
+    for (const id of survivors) {
+      const el = current.get(id)!
+      if (FILE_BEARING_TYPES.has(el.type as string) && typeof el.fileId === 'string') {
+        referenced.add(el.fileId)
+      }
+    }
+    for (const fid of [...fileIds].sort()) {
+      if (!referenced.has(fid)) fileGc.push(fid)
+    }
   }
 
   const drops = scope ? dropAll.filter((id) => scope.has(id)) : dropAll
@@ -178,28 +231,66 @@ function applyPlan(doc: Y.Doc, plan: RepairPlan): boolean {
 
 /**
  * Repair the live in-memory doc. `scope` limits normalization to the changed
- * element ids (gate 3); pass `null` to consider the whole board. Returns true if
- * a corrective transaction was written.
+ * element ids (gate 3); pass `null` to consider the whole board. `files` gates
+ * file GC on positive delete evidence (P1-1); it defaults to `'coldStart'` for a
+ * whole-board pass (scope === null: nothing in flight, GC is safe) and to
+ * `'none'` for a scoped live pass (an absent counterpart may be a
+ * split-transaction insert still in flight). The file-deletion path passes an
+ * explicit set of just-removed fileIds. Returns true if a corrective transaction
+ * was written.
  */
-export function repairLiveDoc(doc: Y.Doc, scope: ReadonlySet<string> | null = null): boolean {
-  return applyPlan(doc, planRepair(doc, scope))
+export function repairLiveDoc(
+  doc: Y.Doc,
+  scope: ReadonlySet<string> | null = null,
+  files: FilePolicy = scope === null ? 'coldStart' : 'none',
+): boolean {
+  return applyPlan(doc, planRepair(doc, scope, files))
+}
+
+/**
+ * Choose the clientID repair's corrective structs are attributed under, AFTER
+ * the input state has been loaded into `doc` (P1-2). The fixed REPAIR_CLIENT_ID
+ * is the determinism lever for BE-M11 (new structs carry the same client on
+ * every node), but it self-collides on RE-repair: a doc whose loaded state was
+ * already produced by a prior repair generation ALREADY contains structs under
+ * REPAIR_CLIENT_ID. If we pinned `doc.clientID = REPAIR_CLIENT_ID` before
+ * loading such a state, Yjs would detect the collision on applyUpdate and
+ * silently reassign a RANDOM clientID — so the gen-2 corrective writes land under
+ * a per-node random id and two nodes diverge, defeating BE-M11.
+ *
+ * Instead we load first (with the doc's own throwaway random id, which cannot
+ * collide with the reserved band in practice), then pick the highest reserved id
+ * not already present in the loaded state: REPAIR_CLIENT_ID for a first-generation
+ * repair (byte-identical to the previous behaviour), or the next id down for each
+ * successive generation. The choice is a pure function of the loaded state, so it
+ * is generation-stable AND identical across nodes — collision-free determinism.
+ */
+function chooseRepairClientId(doc: Y.Doc): number {
+  const present = Y.decodeStateVector(Y.encodeStateVector(doc))
+  let id = REPAIR_CLIENT_ID
+  while (present.has(id) || id === doc.clientID) id -= 1
+  return id
 }
 
 /**
  * Cold-start / failover repair (BE-M11). Materializes a canonical state from
- * `state` on a fresh Y.Doc pinned to the fixed REPAIR_CLIENT_ID, so independent
- * instances produce byte-identical `encodeStateAsUpdate`. Returns the canonical
- * bytes and whether repair changed anything.
+ * `state` on a fresh Y.Doc, attributing repair's corrective structs to a
+ * collision-free reserved clientID (chooseRepairClientId), so independent
+ * instances produce byte-identical `encodeStateAsUpdate` — including on a SECOND
+ * repair of an already-once-repaired doc (P1-2). Returns the canonical bytes and
+ * whether repair changed anything.
  */
 export function repairWhiteboardState(state: Uint8Array | null): {
   state: Uint8Array
   changed: boolean
 } {
   const doc = new Y.Doc()
-  // Fixed client id => repair's new structs are attributed identically on every
-  // node (the determinism lever for BE-M11). Safe: only repair writes locally.
-  doc.clientID = REPAIR_CLIENT_ID
+  // Load FIRST (the doc's throwaway random id will not collide with the loaded
+  // structs), THEN pin a collision-free reserved clientID for repair's writes.
+  // Pinning before load is what triggered Yjs's random-id reassignment on a
+  // re-repair (the REPAIR_CLIENT_ID self-collision) and broke determinism.
   if (state && state.length > 0) Y.applyUpdate(doc, state)
+  doc.clientID = chooseRepairClientId(doc)
   const changed = repairLiveDoc(doc, null)
   const out = Y.encodeStateAsUpdate(doc)
   doc.destroy()
@@ -308,9 +399,23 @@ export function attachWhiteboardRepair(doc: Y.Doc): () => void {
 
   const onFiles = (events: Y.YEvent<Y.Map<unknown>>[], txn: Y.Transaction) => {
     if (txn.origin === REPAIR_ORIGIN) return // gate 1
-    // A file removal can orphan image elements; rescan touched image refs by
-    // running a whole-board pass (files maps are tiny). Cheap and idempotent.
-    repairLiveDoc(doc, null)
+    // Only a file DELETION can orphan an image element (its fileId now dangles).
+    // A file INSERT must NOT trigger GC: the file may be the first half of a
+    // split-transaction insert whose image element has not arrived yet — GCing
+    // it here as "unreferenced" would destroy it before its element lands (P1-1).
+    const deletedFiles = new Set<string>()
+    for (const e of events) {
+      if (e.target === files) {
+        for (const [key, change] of e.keys) {
+          if (change.action === 'delete') deletedFiles.add(key)
+        }
+      }
+    }
+    if (deletedFiles.size === 0) return
+    // Drop exactly the images pointing at a just-deleted file (whole-board scope
+    // so every referrer is caught); pass the deleted-file set so a pending image
+    // whose not-yet-arrived file is NOT in the set is left untouched.
+    repairLiveDoc(doc, null, deletedFiles)
   }
 
   elements.observeDeep(onElements)

@@ -260,3 +260,74 @@ describe('attachWhiteboardRepair — live observer (§4.1 gates 1 & 3)', () => {
     dispose()
   })
 })
+
+describe('attachWhiteboardRepair — split-transaction image/file insert (P1-1)', () => {
+  // A user's client can commit an image element and its `files` entry in TWO
+  // separate transactions (the FE binding does not guarantee an atomic commit).
+  // At the scoped repair tick BETWEEN them, one side is not yet visible. Repair
+  // must NOT GC the just-inserted side as dangling — doing so silently destroyed
+  // the image on the next transaction (yujiawei P1-1). Both orderings must
+  // survive, and the fix must hold WITHOUT relying on FE atomicity.
+  const insertImage = (doc: Y.Doc, id: string, fileId: string) => {
+    doc.transact(() => {
+      const m = new Y.Map()
+      m.set('id', id); m.set('type', 'image'); m.set('version', 1)
+      m.set('versionNonce', 7); m.set('index', 'a0'); m.set('fileId', fileId)
+      doc.getMap(ELEMENTS_FIELD).set(id, m as Y.Map<unknown>)
+    }, 'user')
+  }
+  const insertFile = (doc: Y.Doc, fileId: string) => {
+    doc.transact(() => {
+      const f = new Y.Map()
+      f.set('attachId', fileId); f.set('mimeType', 'image/png')
+      doc.getMap(FILES_FIELD).set(fileId, f as Y.Map<unknown>)
+    }, 'user')
+  }
+
+  it('element-then-file: image survives when its file lands in a later transaction', () => {
+    const doc = buildDoc({})
+    const dispose = attachWhiteboardRepair(doc)
+    insertImage(doc, 'img', 'F') // txn A — file not present yet
+    insertFile(doc, 'F') // txn B — the file arrives
+    expect([...readElements(doc).keys()]).toContain('img')
+    expect(readElements(doc).get('img')!.fileId).toBe('F')
+    expect([...getFilesMap(doc).keys()]).toContain('F')
+    dispose()
+  })
+
+  it('file-then-element: file survives when its image lands in a later transaction', () => {
+    const doc = buildDoc({})
+    const dispose = attachWhiteboardRepair(doc)
+    insertFile(doc, 'F') // txn A — no referencing element yet
+    insertImage(doc, 'img', 'F') // txn B — the image arrives
+    expect([...getFilesMap(doc).keys()]).toContain('F') // not GC'd as "unreferenced"
+    expect([...readElements(doc).keys()]).toContain('img')
+    dispose()
+  })
+
+  it('a pending split-transaction file is NOT GC\'d by an unrelated element delete', () => {
+    // File F2 is inserted first; its image has not arrived. Meanwhile an
+    // unrelated element is deleted. A delete pass must not sweep F2 away.
+    const doc = buildDoc({ other: clean('other', 'a0') })
+    const dispose = attachWhiteboardRepair(doc)
+    insertFile(doc, 'F2') // pending: image still in flight
+    doc.transact(() => doc.getMap(ELEMENTS_FIELD).delete('other'), 'user')
+    expect([...getFilesMap(doc).keys()]).toContain('F2')
+    insertImage(doc, 'img2', 'F2') // the image finally lands
+    expect([...readElements(doc).keys()]).toContain('img2')
+    dispose()
+  })
+
+  it('still drops an image whose file is explicitly DELETED live (delete-gated GC works)', () => {
+    // The resilience must not disable legitimate GC: when a file is genuinely
+    // deleted, the image pointing at it is now unrenderable and IS dropped.
+    const doc = buildDoc(
+      { img: { id: 'img', type: 'image', version: 1, versionNonce: 7, index: 'a0', fileId: 'F' } },
+      { F: { attachId: 'F', mimeType: 'image/png' } },
+    )
+    const dispose = attachWhiteboardRepair(doc)
+    doc.transact(() => doc.getMap(FILES_FIELD).delete('F'), 'user')
+    expect([...readElements(doc).keys()]).not.toContain('img') // dropped — file gone
+    dispose()
+  })
+})

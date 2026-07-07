@@ -213,3 +213,68 @@ describe('BE-M11 load-path (afterLoadDocument) repair determinism', () => {
     doc.destroy()
   })
 })
+
+describe('BE-M11 gen-2 re-repair byte-determinism (REPAIR_CLIENT_ID self-collision, P1-2)', () => {
+  const input = buildIllegalState()
+
+  // The round-1 fix pinned doc.clientID = REPAIR_CLIENT_ID BEFORE loading state.
+  // On a SECOND repair, the loaded state already contains structs authored by
+  // REPAIR_CLIENT_ID (from gen-1), so Yjs detected the collision on applyUpdate
+  // and silently reassigned a RANDOM clientID — the gen-2 corrective writes then
+  // landed under a per-node random id and two nodes DIVERGED, defeating BE-M11.
+  // The fix loads first, then attributes repair writes to a collision-free
+  // reserved clientID chosen from the loaded state.
+
+  it('re-repair of an already-repaired state is byte-identical to the fresh repair', () => {
+    const gen1 = repairWhiteboardState(input).state
+    const gen2 = repairWhiteboardState(gen1) // cold-load + repair AGAIN
+    // idempotent at the byte level: gen-2 produces no change and the SAME bytes.
+    expect(gen2.changed).toBe(false)
+    expect(Buffer.from(gen2.state)).toEqual(Buffer.from(gen1))
+  })
+
+  it('two nodes cold-loading + re-repairing the same persisted state converge byte-identically', () => {
+    const gen1 = repairWhiteboardState(input).state // persisted after gen-1
+    const nodeA = repairWhiteboardState(gen1).state
+    const nodeB = repairWhiteboardState(gen1).state
+    expect(Buffer.from(nodeA)).toEqual(Buffer.from(nodeB)) // 2-node byte-identical
+    expect(Buffer.from(nodeA)).toEqual(Buffer.from(gen1)) // == single fresh repair
+  })
+
+  it('a gen-2 that MUST write (fresh illegal edit after gen-1) still converges across nodes', () => {
+    // A live edit lands illegal content on top of an already-repaired doc, then
+    // the doc is persisted and cold-repaired again on two failover nodes with
+    // DIFFERENT random clientIDs. The gen-2 repair genuinely writes; it must
+    // still emit byte-identical structs (no random-client divergence).
+    const gen1 = repairWhiteboardState(input).state
+    const withEdit = (nodeClientId: number) => {
+      const doc = new Y.Doc()
+      doc.clientID = nodeClientId
+      Y.applyUpdate(doc, gen1)
+      doc.transact(() => {
+        const m = new Y.Map()
+        m.set('id', 'e_late'); m.set('type', 'rectangle'); m.set('version', 0); m.set('x', NaN)
+        doc.getMap(ELEMENTS_FIELD).set('e_late', m as Y.Map<unknown>)
+      }, 'user')
+      const bytes = Y.encodeStateAsUpdate(doc)
+      doc.destroy()
+      return bytes
+    }
+    // Same logical edit authored on two nodes with the SAME client id => same
+    // persisted bytes (isolates the repair-side determinism, not the edit's).
+    const persistedA = withEdit(555)
+    const persistedB = withEdit(555)
+    expect(Buffer.from(persistedA)).toEqual(Buffer.from(persistedB))
+
+    const rA = repairWhiteboardState(persistedA)
+    const rB = repairWhiteboardState(persistedB)
+    expect(rA.changed).toBe(true) // gen-2 really had to repair the late edit
+    expect(Buffer.from(rA.state)).toEqual(Buffer.from(rB.state)) // no self-collision divergence
+    // the late element was actually normalized (version 0 -> 1, x NaN -> 0)
+    const doc = decode(rA.state)
+    const late = readElements(doc).get('e_late')!
+    doc.destroy()
+    expect(late.version).toBe(1)
+    expect(late.x).toBe(0)
+  })
+})

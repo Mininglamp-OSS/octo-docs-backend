@@ -104,3 +104,50 @@ describe('awareness identity validation (§8.3.1, source-scoped & non-fatal)', (
     expect(states.has(1)).toBe(true)
   })
 })
+
+describe('awareness avatar sanitization (P2 XSS guard, non-fatal)', () => {
+  const keepAvatar = (avatar: unknown) => {
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: 'user-1', name: 'Ada', avatar } }],
+    ])
+    validateAwarenessStates(states, ctxFor('user-1'))
+    const u = (states.get(1) as { user: Record<string, unknown> }).user
+    return { present: 'avatar' in u, value: u.avatar, name: u.name }
+  }
+
+  it('preserves safe avatar references (http/https, protocol- & root-relative, raster data URI)', () => {
+    for (const safe of [
+      'https://cdn.example.com/a.png',
+      'http://example.com/a.jpg',
+      '//cdn.example.com/a.webp', // protocol-relative
+      '/avatars/user-1.png', // root-relative
+      'avatars/user-1.gif', // relative path
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==',
+    ]) {
+      const r = keepAvatar(safe)
+      expect(r.present, safe).toBe(true)
+      expect(r.value, safe).toBe(safe)
+    }
+  })
+
+  it('strips a script-vector avatar (javascript:/data:text/html) but KEEPS presence', () => {
+    for (const bad of ['javascript:alert(1)', 'JavaScript:alert(1)', 'data:text/html,<script>alert(1)</script>']) {
+      const r = keepAvatar(bad)
+      expect(r.present, bad).toBe(false) // dangerous value stripped
+      expect(r.name, bad).toBe('Ada') // rest of presence survives
+    }
+  })
+
+  it('strips an svg data URI (SVG can embed script) and any value with markup/control chars', () => {
+    expect(keepAvatar('data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=').present).toBe(false)
+    expect(keepAvatar('https://x/a.png"><img src=x onerror=alert(1)>').present).toBe(false)
+    expect(keepAvatar('vbscript:msgbox(1)').present).toBe(false)
+    expect(keepAvatar('file:///etc/passwd').present).toBe(false)
+  })
+
+  it('strips a non-string or oversize avatar', () => {
+    expect(keepAvatar(12345).present).toBe(false)
+    expect(keepAvatar({ url: 'x' }).present).toBe(false)
+    expect(keepAvatar('https://x/' + 'a'.repeat(2100)).present).toBe(false) // > AVATAR_MAX_LEN
+  })
+})

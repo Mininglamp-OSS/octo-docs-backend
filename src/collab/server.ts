@@ -44,6 +44,42 @@ export function setEpochWatermark(documentName: string, epoch: number): void {
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/
 
 /**
+ * Reasonable cap for a relayed avatar reference — enough for a small raster
+ * data: thumbnail, short enough to keep awareness frames light. Longer values
+ * are treated as unsafe and stripped.
+ */
+const AVATAR_MAX_LEN = 2048
+/** Raster image data: URIs only — never svg/text, which can carry script. */
+const DATA_IMAGE_RE = /^data:image\/(png|jpe?g|gif|webp);/i
+
+/**
+ * True if `v` is a safe avatar reference to RELAY to peers (§8.3.1 / P2).
+ *
+ * `avatar` is an optional, cosmetic field the v1 whiteboard binding publishes
+ * alongside `{ id, name }`. It is echoed to every other peer and rendered there,
+ * so an attacker-controlled value must never carry a script vector. Accept only:
+ *   - http(s) URLs, protocol-relative (`//host/…`), or scheme-less relative /
+ *     root-relative paths (a path can't execute), and
+ *   - `data:image/{png,jpeg,gif,webp}` raster data URIs.
+ * Reject `javascript:` / `vbscript:` / other schemes, `data:text/*` and
+ * `data:image/svg+xml` (SVG can embed script), any value containing markup or
+ * control characters, oversize strings, and non-strings. Never throws.
+ */
+export function isSafeAvatar(v: unknown): v is string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > AVATAR_MAX_LEN) return false
+  // Positive allowlist of URL / data-URI-safe characters: this excludes control
+  // chars, whitespace, quotes and angle brackets outright, so no raw markup or
+  // smuggled control byte can slip through to a rendering peer.
+  if (!/^[A-Za-z0-9\-._~:/?#@!$&*+,;=%()]+$/.test(v)) return false
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(v)
+  if (!scheme) return true // relative or protocol-relative — no scheme, no script
+  const s = (scheme[1] ?? '').toLowerCase()
+  if (s === 'http' || s === 'https') return true
+  if (s === 'data') return DATA_IMAGE_RE.test(v) // raster data URIs only
+  return false // javascript:, vbscript:, file:, data:text/*, data:image/svg+xml, …
+}
+
+/**
  * §8.3.1 presence identity + field validation — source-scoped and NON-FATAL.
  *
  * `beforeHandleAwareness` hands us the awareness states decoded from THIS
@@ -84,7 +120,9 @@ export function validateAwarenessStates(
 ): void {
   if (!ctx) return // server-internal awareness (DirectConnection) carries no client ctx
   for (const [clientId, state] of states) {
-    const user = (state as { user?: { id?: unknown; name?: unknown; color?: unknown } }).user
+    const user = (state as {
+      user?: { id?: unknown; name?: unknown; color?: unknown; avatar?: unknown }
+    }).user
     if (!user) continue // non-presence awareness data — nothing to validate
 
     // (1) Identity binding: a connection may only publish presence under its OWN
@@ -104,6 +142,14 @@ export function validateAwarenessStates(
     // name is optional; strip it when present and not a string <= 64 chars.
     if ('name' in user && !(typeof user.name === 'string' && user.name.length <= 64)) {
       delete (user as { name?: unknown }).name
+    }
+    // avatar is optional (the v1 whiteboard binding publishes { id, name,
+    // avatar }); strip it when present and not a safe image reference so no
+    // script vector (javascript: URL, raw HTML, svg/text data URI) is relayed to
+    // peers that render it (P2). Sanitize-in-place, never fatal — same tier as
+    // color/name.
+    if ('avatar' in user && !isSafeAvatar(user.avatar)) {
+      delete (user as { avatar?: unknown }).avatar
     }
   }
 }
