@@ -53,10 +53,28 @@ const COLOR_RE = /^#[0-9a-fA-F]{6}$/
  * peers' pre-existing presence — which is why legitimate multi-user cursors
  * flow through untouched.
  *
- * On any failure (impersonated identity, bad color, oversized/non-string name)
- * we DROP the offending clientId from the map — rejecting that part of the
- * frame. We MUST NOT throw: a malformed or impostor awareness frame must never
- * crash the process or break other users' live collaboration (the prior
+ * Two tiers, by design:
+ *
+ *  1. IMPERSONATION is the only security-relevant rejection: a frame whose
+ *     `user.id` is not this connection's own uid is dropping the whole state
+ *     (a client must never publish presence claiming to be someone else).
+ *
+ *  2. `color` and `name` are OPTIONAL, cosmetic fields. They must never cause
+ *     the WHOLE presence state to be dropped — doing so silently kills the
+ *     user's entire presence broadcast for that frame, and because Hocuspocus
+ *     re-encodes the awareness update from only the surviving states, a dropped
+ *     state is never applied to the document awareness and therefore never
+ *     relayed (neither the local broadcast nor the Redis cross-node publish
+ *     fires). The v1 whiteboard binding publishes `{ id, name, avatar }` with
+ *     NO color at all, so the old whole-state drop on a missing/invalid color
+ *     meant the receiving peer got ZERO awareness frames (presence A->B = 0)
+ *     even though doc (type0) sync relayed fine. We instead SANITIZE the
+ *     offending field in place (strip an invalid/unsafe color so no CSS
+ *     injection value propagates; strip an oversized/non-string name) and let
+ *     the rest of the presence broadcast — standard Hocuspocus relay behavior.
+ *
+ * We MUST NOT throw: a malformed or impostor awareness frame must never crash
+ * the process or break other users' live collaboration (an earlier
  * implementation iterated the full broadcast set and threw, which crashed the
  * whole backend the moment a second user joined — a remotely triggerable DoS).
  */
@@ -68,14 +86,24 @@ export function validateAwarenessStates(
   for (const [clientId, state] of states) {
     const user = (state as { user?: { id?: unknown; name?: unknown; color?: unknown } }).user
     if (!user) continue // non-presence awareness data — nothing to validate
-    // identity must not be impersonated; color a valid hex (no CSS injection);
-    // name a string <= 64 chars.
-    const idOk = user.id === ctx.user.id
-    const colorOk = typeof user.color === 'string' && COLOR_RE.test(user.color)
-    const nameOk = typeof user.name === 'string' && user.name.length <= 64
-    if (!idOk || !colorOk || !nameOk) {
-      // Reject only this offending state; the rest of the frame is broadcast.
+
+    // (1) Identity binding: a connection may only publish presence under its OWN
+    // uid. A frame claiming a different id is impersonation -> drop the whole
+    // state. This is the single hard, security-relevant rejection.
+    if (user.id !== ctx.user.id) {
       states.delete(clientId)
+      continue
+    }
+
+    // (2) Cosmetic fields are sanitized, never fatal to the state. color is
+    // optional; only strip it when it is PRESENT and not a safe #RRGGBB hex (no
+    // CSS injection). A missing color is legitimate (whiteboard presence).
+    if ('color' in user && !(typeof user.color === 'string' && COLOR_RE.test(user.color))) {
+      delete (user as { color?: unknown }).color
+    }
+    // name is optional; strip it when present and not a string <= 64 chars.
+    if ('name' in user && !(typeof user.name === 'string' && user.name.length <= 64)) {
+      delete (user as { name?: unknown }).name
     }
   }
 }

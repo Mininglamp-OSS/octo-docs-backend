@@ -51,18 +51,36 @@ describe('awareness identity validation (§8.3.1, source-scoped & non-fatal)', (
     expect(states.size).toBe(1)
   })
 
-  it('drops states with an invalid color (CSS-injection guard) without throwing', () => {
+  it('relays whiteboard presence that carries no color field (id + name + avatar)', () => {
+    // The v1 whiteboard binding publishes { id, name, avatar } with NO color.
+    // A missing color must NOT drop the state — otherwise the receiving peer
+    // gets zero awareness frames (presence A->B = 0). The state survives intact.
+    const wb = { user: { id: 'user-1', name: 'Ada', avatar: 'https://x/a.png' }, pointer: { x: 1, y: 2 } }
+    const states = new Map<number, Record<string, unknown>>([[5, wb]])
+
+    expect(() => validateAwarenessStates(states, ctxFor('user-1'))).not.toThrow()
+    expect(states.has(5)).toBe(true)
+    expect(states.get(5)).toEqual(wb) // untouched: id, name, avatar, pointer all preserved
+  })
+
+  it('strips an invalid color (CSS-injection guard) but KEEPS the presence state', () => {
+    // An invalid/unsafe color is sanitized in place — the dangerous value never
+    // propagates, but the user's presence still broadcasts (the rest survives).
     const states = new Map<number, Record<string, unknown>>([
       [1, presence('user-1', 'Ada', '#aabbcc')],
-      [2, presence('user-1', 'Eve', 'red; background:url(x)')],
+      [2, { user: { id: 'user-1', name: 'Eve', color: 'red; background:url(x)' }, cursor: { anchor: 1, head: 1 } }],
     ])
 
     expect(() => validateAwarenessStates(states, ctxFor('user-1'))).not.toThrow()
     expect(states.has(1)).toBe(true)
-    expect(states.has(2)).toBe(false)
+    expect(states.get(1)).toEqual(presence('user-1')) // valid color preserved
+    expect(states.has(2)).toBe(true) // state kept (not dropped)
+    const u2 = (states.get(2) as { user: Record<string, unknown> }).user
+    expect('color' in u2).toBe(false) // unsafe color stripped
+    expect(u2.name).toBe('Eve') // rest of presence preserved
   })
 
-  it('drops states with a non-string or oversized name without throwing', () => {
+  it('strips a non-string or oversized name but KEEPS the presence state', () => {
     const states = new Map<number, Record<string, unknown>>([
       [1, presence('user-1', 'x'.repeat(64))],
       [2, presence('user-1', 'x'.repeat(65))],
@@ -70,9 +88,14 @@ describe('awareness identity validation (§8.3.1, source-scoped & non-fatal)', (
     ])
 
     expect(() => validateAwarenessStates(states, ctxFor('user-1'))).not.toThrow()
-    expect(states.has(1)).toBe(true) // 64 chars is allowed
-    expect(states.has(2)).toBe(false) // 65 chars rejected
-    expect(states.has(3)).toBe(false) // non-string name rejected
+    expect(states.has(1)).toBe(true) // 64 chars is allowed, preserved
+    expect((states.get(1) as { user: Record<string, unknown> }).user.name).toBe('x'.repeat(64))
+    expect(states.has(2)).toBe(true) // state kept
+    expect('name' in (states.get(2) as { user: Record<string, unknown> }).user).toBe(false) // 65-char name stripped
+    expect(states.has(3)).toBe(true) // state kept
+    const u3 = (states.get(3) as { user: Record<string, unknown> }).user
+    expect('name' in u3).toBe(false) // non-string name stripped
+    expect(u3.color).toBe('#aabbcc') // valid color preserved
   })
 
   it('leaves non-presence awareness data (no user field) untouched', () => {
