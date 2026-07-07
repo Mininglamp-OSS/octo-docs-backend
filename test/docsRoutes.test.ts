@@ -10,9 +10,19 @@ vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(async () => []),
   transaction: vi.fn(),
 }))
+vi.mock('../src/db/repos/docMetaRepo.js', () => ({
+  docMetaRepo: {
+    create: vi.fn(async () => undefined),
+    getByDocId: vi.fn(async () => null),
+  },
+}))
+vi.mock('../src/util/ids.js', () => ({
+  newDocId: vi.fn(() => 'd_fixed'),
+}))
 
-import { getDocHandler } from '../src/api/routes/docs.js'
+import { createDocHandler, getDocHandler } from '../src/api/routes/docs.js'
 import { requireDocRole } from '../src/api/guard.js'
+import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 
 interface MockRes {
   statusCode: number
@@ -133,5 +143,65 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
     await getDocHandler(req({ docId: 'd_1' }), res as never)
     expect(res.statusCode).toBe(403)
     expect((res.body as { error: string }).error).toBe('forbidden')
+  })
+})
+
+describe('POST /api/v1/docs — create key codec (XIN-83 hop-2 join 404)', () => {
+  function postReq(body: Record<string, unknown>) {
+    return { uid: 'u_1', params: {}, body, query: {} } as never
+  }
+
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.create).mockReset().mockResolvedValue(undefined as never)
+    vi.mocked(docMetaRepo.getByDocId)
+      .mockReset()
+      .mockResolvedValue({ ...metaRow, doc_id: 'd_fixed' } as never)
+  })
+
+  it('mints the 5-segment :wb: key for a whiteboard (docType "board")', async () => {
+    const res = mockRes()
+    await createDocHandler(postReq({ spaceId: 's1', folderId: 'f_888', docType: 'board' }), res as never)
+
+    expect(res.statusCode).toBe(201)
+    const persisted = vi.mocked(docMetaRepo.create).mock.calls[0]![0]
+    // Persistence/routing key MUST match what the browser joins with and what
+    // onAuthenticate parses: octo:{space}:{folder}:wb:{board}, board === docId.
+    expect(persisted.documentName).toBe('octo:s1:f_888:wb:d_fixed')
+    expect(persisted.docType).toBe('board')
+    expect((res.body as { documentName: string }).documentName).toBe('octo:s1:f_888:wb:d_fixed')
+    expect((res.body as { docType: string }).docType).toBe('board')
+  })
+
+  it('mints the 4-segment document key for a rich-text doc (default docType)', async () => {
+    const res = mockRes()
+    await createDocHandler(postReq({ spaceId: 's1', folderId: 'f_888' }), res as never)
+
+    expect(res.statusCode).toBe(201)
+    const persisted = vi.mocked(docMetaRepo.create).mock.calls[0]![0]
+    expect(persisted.documentName).toBe('octo:s1:f_888:d_fixed')
+    expect(persisted.docType).toBe('doc')
+  })
+
+  it('defaults the folder segment to f_default when omitted', async () => {
+    const res = mockRes()
+    await createDocHandler(postReq({ spaceId: 's1', docType: 'board' }), res as never)
+
+    const persisted = vi.mocked(docMetaRepo.create).mock.calls[0]![0]
+    expect(persisted.documentName).toBe('octo:s1:f_default:wb:d_fixed')
+  })
+
+  it('rejects an illegal space segment with 400 (no row written)', async () => {
+    const res = mockRes()
+    await createDocHandler(postReq({ spaceId: 'bad space', docType: 'board' }), res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect(vi.mocked(docMetaRepo.create)).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when spaceId is missing', async () => {
+    const res = mockRes()
+    await createDocHandler(postReq({}), res as never)
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('spaceId required')
   })
 })

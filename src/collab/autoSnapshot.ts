@@ -65,15 +65,16 @@ function getState(documentName: string): DocAutoState {
 }
 
 /**
- * doc_id is the 4th segment of the documentName (docs are created as
- * buildDocumentName(space, folder, docId)), so we derive it without a DB hit —
- * the same identity other code relies on. Whiteboard / malformed keys yield
- * null and are skipped (the document backend does not snapshot them).
+ * doc_id is the 4th segment of a document key, or the board id (5th segment) of
+ * a whiteboard key — both are created with their id as doc_meta.doc_id, so we
+ * derive it without a DB hit. M2 (XIN-26 item 5): whiteboards keep the same auto
+ * crash-recovery snapshots as documents, hence the whiteboard branch here.
+ * Malformed keys yield null and are skipped.
  */
 function deriveDocId(documentName: string): string | null {
   try {
     const parsed = parseDocumentName(documentName)
-    return parsed.kind === 'document' ? parsed.doc : null
+    return parsed.kind === 'document' ? parsed.doc : parsed.board
   } catch {
     return null
   }

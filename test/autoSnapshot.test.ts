@@ -170,9 +170,17 @@ describe('unload', () => {
 
 // ── docId derivation ──────────────────────────────────────────────────────────
 describe('docId derivation', () => {
-  it('skips documents whose name does not parse to a document key', async () => {
+  it('snapshots whiteboard keys, deriving docId from the board segment (XIN-26 item 5)', async () => {
     vi.setSystemTime(0)
     await handleAfterStore('octo:s1:f1:wb:b1', ctx('u_w')) // whiteboard key
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(createAuto).toHaveBeenCalled()
+    expect(createAuto.mock.calls[0]![0]).toMatchObject({ docId: 'b1', documentName: 'octo:s1:f1:wb:b1' })
+  })
+
+  it('skips a malformed key that parses to neither a document nor a whiteboard', async () => {
+    vi.setSystemTime(0)
+    await handleAfterStore('not-an-octo-key', ctx('u_w'))
     await vi.advanceTimersByTimeAsync(15_000)
     expect(createAuto).not.toHaveBeenCalled()
   })

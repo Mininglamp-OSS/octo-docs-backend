@@ -8,6 +8,7 @@ import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
+import { buildWhiteboardName, WhiteboardNameError } from '../../whiteboard/schema/index.js'
 import { newDocId } from '../../util/ids.js'
 import { requireDocRole } from '../guard.js'
 
@@ -15,8 +16,41 @@ export const docsRouter = Router()
 
 const DEFAULT_FOLDER = 'f_default'
 
+/**
+ * docType value the front-end stamps on whiteboards (DocsHome create menu /
+ * docsApi). Boards persist + address under the 5-segment `:wb:` key; everything
+ * else is a rich-text document under the 4-segment key.
+ */
+const WHITEBOARD_DOC_TYPE = 'board'
+
+/**
+ * Build the canonical persistence/routing document_name for a freshly created
+ * doc. This is the SINGLE place a new key is minted, and it must agree with the
+ * key the client addresses on join and the key onAuthenticate parses:
+ *
+ *   - whiteboard (docType 'board'): `octo:{space}:{folder}:wb:{docId}` (5-seg) —
+ *     the board id is the {board} segment (BoardSession passes `board: docId`),
+ *     so collab-token issuance + WS auth resolve the row by the same key the
+ *     browser joins with. Minting a 4-seg `d_` key here was the hop-2 join 404:
+ *     persistence wrote 4-seg while the client/auth path addressed 5-seg `:wb:`.
+ *   - document: `octo:{space}:{folder}:{docId}` (4-seg).
+ *
+ * Throws DocumentNameError / WhiteboardNameError on an illegal segment.
+ */
+export function buildCreatedDocumentName(
+  spaceId: string,
+  folder: string,
+  docId: string,
+  docType: string,
+): string {
+  // documentName 3rd segment MUST equal folder_id (§8.1 invariant).
+  return docType === WHITEBOARD_DOC_TYPE
+    ? buildWhiteboardName(spaceId, folder, docId)
+    : buildDocumentName(spaceId, folder, docId)
+}
+
 /** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
-docsRouter.post('/', async (req: Request, res: Response) => {
+export async function createDocHandler(req: Request, res: Response) {
   const uid = req.uid!
   const { folderId, title, docType } = req.body ?? {}
   // Space isolation (P3): the space is sourced solely from the enforced
@@ -30,13 +64,13 @@ docsRouter.post('/', async (req: Request, res: Response) => {
     return
   }
   const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
+  const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
   const docId = newDocId()
   let documentName: string
   try {
-    // documentName 3rd segment MUST equal folder_id (§8.1 invariant).
-    documentName = buildDocumentName(spaceId, folder, docId)
+    documentName = buildCreatedDocumentName(spaceId, folder, docId, resolvedDocType)
   } catch (err) {
-    if (err instanceof DocumentNameError) {
+    if (err instanceof DocumentNameError || err instanceof WhiteboardNameError) {
       res.status(400).json({ error: err.message })
       return
     }
@@ -49,7 +83,7 @@ docsRouter.post('/', async (req: Request, res: Response) => {
     ownerId: uid,
     spaceId,
     folderId: folder,
-    docType: typeof docType === 'string' && docType !== '' ? docType : 'doc',
+    docType: resolvedDocType,
     createdBy: uid,
   })
   // Bot path only: the doc owner is the bot itself (ownerId = bot uid), so the
@@ -81,10 +115,13 @@ docsRouter.post('/', async (req: Request, res: Response) => {
     spaceId,
     folderId: folder,
     ownerId: uid,
+    docType: resolvedDocType,
     role: 'admin',
     createdAt: meta?.created_at,
   })
-})
+}
+
+docsRouter.post('/', createDocHandler)
 
 /** GET /api/v1/docs/{docId} — fetch one doc's metadata (needs reader). */
 export async function getDocHandler(req: Request, res: Response) {

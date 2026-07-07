@@ -19,6 +19,8 @@ import { connectionRegistry } from '../permission/connectionRegistry.js'
 import { recheckCurrentRoleCached } from '../permission/recheck.js'
 import { roleAtLeast } from '../permission/role.js'
 import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
+import { parseDocumentName } from '../permission/documentName.js'
+import { attachWhiteboardRepair, repairLiveDoc } from '../whiteboard/repair.js'
 
 /**
  * Per-node epoch watermark (§4.5 step 4): beforeHandleMessage reads this local
@@ -26,6 +28,13 @@ import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
  * subscriber (wired in index.ts). Keyed by documentName.
  */
 const epochWatermark = new Map<string, number>()
+
+/**
+ * Per-document disposer for the whiteboard repair observer (§4.1), keyed by
+ * documentName. Set in afterLoadDocument for whiteboard keys, called in
+ * beforeUnloadDocument so the observer is torn down with the document.
+ */
+const repairDisposers = new Map<string, () => void>()
 
 export function setEpochWatermark(documentName: string, epoch: number): void {
   const cur = epochWatermark.get(documentName) ?? 0
@@ -159,6 +168,23 @@ export function createServer() {
       validateAwarenessStates(data.states, data.context as AuthContext | undefined)
     },
 
+    // M2 (§4.1): for whiteboard keys, attach the server-authoritative repair
+    // observer to the freshly loaded live Y.Doc, then run one cold-start pass to
+    // converge any persisted illegal state. The observer scopes work to changed
+    // ids and skips its own REPAIR_ORIGIN writes (anti-self-excitation gates).
+    async afterLoadDocument(data) {
+      let kind: string
+      try {
+        kind = parseDocumentName(data.documentName).kind
+      } catch {
+        return // malformed key: nothing to repair (auth already rejected it)
+      }
+      if (kind !== 'whiteboard') return
+      const dispose = attachWhiteboardRepair(data.document)
+      repairDisposers.set(data.documentName, dispose)
+      repairLiveDoc(data.document) // converge persisted state on load
+    },
+
     // A4 (§5.2): backend-autonomous KIND_AUTO snapshots. afterStoreDocument
     // fires after the authoritative state is persisted; the auto-snapshot
     // module owns the idle timer / min-interval fallback / Redis dedup. Gated
@@ -168,8 +194,13 @@ export function createServer() {
     },
 
     // A4 (§5.2): flush the last editing burst + clear the per-doc idle timer
-    // when the document unloads.
+    // when the document unloads. Also tear down the whiteboard repair observer.
     async beforeUnloadDocument(data) {
+      const dispose = repairDisposers.get(data.documentName)
+      if (dispose) {
+        dispose()
+        repairDisposers.delete(data.documentName)
+      }
       await handleBeforeUnload(data.documentName)
     },
   })

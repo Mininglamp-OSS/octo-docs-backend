@@ -21,7 +21,7 @@ export type IssueResult =
 /**
  * Issue a collab token for (octoToken, documentName).
  *   - octoToken invalid/missing  => 401
- *   - documentName invalid/whiteboard => 403
+ *   - documentName malformed => 403
  *   - doc missing/deleted => 404
  *   - role === none => 403 (no token)
  */
@@ -31,14 +31,16 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
   const uid = identity.uid
 
-  // Validate / parse documentName (reject whiteboard + malformed keys).
+  // Validate / parse documentName. M2: whiteboard keys are now served, so both
+  // document and whiteboard kinds are accepted; only malformed keys => 403. The
+  // permission subject is meta.doc_id either way (whiteboard rows carry
+  // doc_id = board, doc_type = 'whiteboard').
   let parsed
   try {
     parsed = parseDocumentName(documentName)
   } catch {
     return { ok: false, status: 403, error: 'forbidden' }
   }
-  if (parsed.kind !== 'document') return { ok: false, status: 403, error: 'forbidden' }
 
   // Doc existence/status + folder/key consistency (§4.1/§8.1 invariant).
   const meta = await docMetaRepo.getByDocumentName(documentName)

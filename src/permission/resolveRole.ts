@@ -34,8 +34,10 @@ export async function resolveRole(uid: string, docId: string): Promise<ResolvedR
  * herd protection); this function itself is the authoritative DB read.
  */
 export async function recheckCurrentRole(documentName: string, uid: string): Promise<ResolvedRole> {
+  // M2: both document (4-seg) and whiteboard (5-seg `:wb:`) keys are served. The
+  // permission subject is meta.doc_id either way; only malformed keys are
+  // rejected (parseDocumentName throws -> caller fails closed).
   const parsed = parseDocumentName(documentName)
-  if (parsed.kind !== 'document') return 'none' // whiteboard keys not served here
   const meta = await docMetaRepo.getByDocumentName(documentName)
   if (!meta || meta.status === 0) return 'none'
   // key/folder_id consistency invariant (§4.1): parsed folder must equal folder_id.
