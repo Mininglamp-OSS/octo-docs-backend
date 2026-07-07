@@ -253,6 +253,25 @@ export const config = {
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
 
+  // Server-side PDF export (Puppeteer / headless Chrome). The browser is a
+  // SINGLETON (~300MB resident); these bound the concurrency, queue depth and
+  // per-render time so a burst of exports can't exhaust memory or wedge the
+  // process. executablePath is empty for local dev (bundled Chromium); in the
+  // alpine image it points at the apk-installed chromium (see Dockerfile).
+  pdfExport: {
+    // Max concurrent renders sharing the one browser; the rest queue.
+    maxConcurrent: num('PDF_EXPORT_MAX_CONCURRENT', 2),
+    // Max renders allowed to WAIT in the queue; over this the route returns 503.
+    maxQueue: num('PDF_EXPORT_MAX_QUEUE', 10),
+    // Hard per-render timeout; on expiry the page is closed (leak guard).
+    renderTimeoutMs: num('PDF_EXPORT_RENDER_TIMEOUT_MS', 30_000),
+    // Recycle (relaunch) the browser after this many rendered pages to bound the
+    // slow memory creep of a long-lived Chrome; 0 disables recycling.
+    recycleAfterPages: num('PDF_EXPORT_RECYCLE_AFTER_PAGES', 200),
+    // System Chromium path (set in Docker); empty => use puppeteer's bundled one.
+    executablePath: str('PUPPETEER_EXECUTABLE_PATH', ''),
+  },
+
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
   // + unload flush). Shipped behind a default-OFF gate (gray release); when

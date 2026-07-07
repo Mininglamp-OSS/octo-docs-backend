@@ -20,6 +20,7 @@ import { createApp } from './api/app.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
 import { closePool } from './db/pool.js'
 import { closeRedis } from './db/redis.js'
+import { closeBrowser } from './export/pdfService.js'
 
 async function main(): Promise<void> {
   // B1 safety backstop: a stray throw/rejection inside an async hook (e.g. a
@@ -84,6 +85,7 @@ async function main(): Promise<void> {
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.
       httpServer.close()
+      await closeBrowser() // close the headless Chromium (PDF export)
       sub.disconnect()
       await closeRedis()
       await closePool()

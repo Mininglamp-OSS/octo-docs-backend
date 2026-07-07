@@ -22,6 +22,9 @@ export function getPool(): mysql.Pool {
       database: config.mysql.database,
       connectionLimit: config.mysql.connectionLimit,
       waitForConnections: true,
+      // MySQL container runs in UTC; tell mysql2 to interpret DATETIME as UTC
+      // so JS Date objects are correct without timezone offset errors.
+      timezone: '+00:00',
       // Keep binary columns (LONGBLOB state) as Buffer, not string.
       // mysql2 returns BLOB/LONGBLOB as Buffer by default.
       namedPlaceholders: false,
