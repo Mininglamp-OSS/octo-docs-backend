@@ -21,6 +21,7 @@
 import { Router, type Request, type Response } from 'express'
 import * as Y from 'yjs'
 import { requireDocRole } from '../guard.js'
+import type { DocMeta } from '../../db/repos/docMetaRepo.js'
 import { docVersionRepo, KIND_NAMED } from '../../db/repos/docVersionRepo.js'
 import { persistence } from '../../collab/persistence.js'
 import { restoreVersion } from '../services/restoreVersion.js'
@@ -30,6 +31,37 @@ import { SCHEMA_VERSION } from '../../schema/index.js'
 export const versionsRouter = Router()
 
 const MAX_NAME_LEN = 256
+
+/** doc_type value the front-end stamps on whiteboards (see routes/docs.ts). */
+const WHITEBOARD_DOC_TYPE = 'board'
+
+/**
+ * Guard the ProseMirror version create/preview/restore path against whiteboard
+ * rows (§11.5 schema-isolation; §11.6 defers named/restore version UI for
+ * whiteboards).
+ *
+ * Whiteboards persist under the shared doc_meta/doc_version tables but their
+ * snapshots are Y.Doc blobs with a whiteboard schema (`schema_version=2`,
+ * elements/files maps, no `default` XmlFragment). `gateSchema(2, 15)` returns
+ * ok:true (an OLDER target never trips the forward-compat gate), so without a
+ * doc_type guard a board blob would flow through the PM decoder and:
+ *   - preview: decode a contentless doc → 200 + silently-empty rich text;
+ *   - restore: stamp a mis-schema (SCHEMA_VERSION) safety snapshot on the board
+ *     row and fire a spurious no-op reconcile + broadcast on the live board;
+ *   - create: stamp SCHEMA_VERSION on a board version row with no doc_type guard.
+ * gateSchema is NOT the right tool here (it only rejects a NEWER schema), so
+ * boards are rejected up front with a fast 409 before any decode/DB write.
+ *
+ * Returns true (and writes the 409) when the doc is a whiteboard; the caller
+ * must return immediately.
+ */
+function rejectWhiteboardVersioning(res: Response, meta: DocMeta): boolean {
+  if (meta.doc_type === WHITEBOARD_DOC_TYPE) {
+    res.status(409).json({ error: 'version_unsupported_doc_type' })
+    return true
+  }
+  return false
+}
 
 /**
  * Shape a version row for the list / item JSON response.
@@ -114,6 +146,8 @@ versionsRouter.post('/:docId/versions', createVersionHandler)
 export async function createVersionHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
   if (!guard) return
+  // Whiteboards do not participate in the PM version path (§11.5/§11.6).
+  if (rejectWhiteboardVersioning(res, guard.meta)) return
 
   // Wire contract: the frontend sends the label as `label`. Accept the legacy
   // `name` as a fallback so older clients keep working.
@@ -148,6 +182,10 @@ versionsRouter.get('/:docId/versions/:versionId/state', getVersionStateHandler)
 export async function getVersionStateHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
+  // Whiteboards do not participate in the PM version path (§11.5/§11.6): a board
+  // blob decodes to a contentless doc, so reject before the decode instead of
+  // returning 200 + silently-empty rich text.
+  if (rejectWhiteboardVersioning(res, guard.meta)) return
 
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {
@@ -263,6 +301,10 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
   // under the row lock inside the service — this is the cheap pre-check / 404 pass.
   const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin')
   if (!guard) return
+  // Whiteboards do not participate in the PM version path (§11.5/§11.6): reject
+  // before restoreVersion so no mis-schema safety snapshot is stamped on the
+  // board row and no spurious no-op write/broadcast reaches the live board.
+  if (rejectWhiteboardVersioning(res, guard.meta)) return
 
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {

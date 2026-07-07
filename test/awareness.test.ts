@@ -103,6 +103,19 @@ describe('awareness identity validation (§8.3.1, source-scoped & non-fatal)', (
     expect(() => validateAwarenessStates(states, ctxFor('user-1'))).not.toThrow()
     expect(states.has(1)).toBe(true)
   })
+
+  it('does not throw on a null / non-object state (MUST-NOT-throw contract)', () => {
+    // A malformed frame may decode to a null or primitive state; reading `.user`
+    // off it would throw and crash the broadcast for every peer. The shape guard
+    // skips it as non-presence and leaves valid states intact.
+    const states = new Map<number, Record<string, unknown>>([
+      [1, null as never],
+      [2, 42 as never],
+      [3, presence('user-1')],
+    ])
+    expect(() => validateAwarenessStates(states, ctxFor('user-1'))).not.toThrow()
+    expect(states.has(3)).toBe(true)
+  })
 })
 
 describe('awareness avatar sanitization (P2 XSS guard, non-fatal)', () => {

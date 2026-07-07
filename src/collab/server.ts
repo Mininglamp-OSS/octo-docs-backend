@@ -72,6 +72,12 @@ export function isSafeAvatar(v: unknown): v is string {
   // smuggled control byte can slip through to a rendering peer.
   if (!/^[A-Za-z0-9\-._~:/?#@!$&*+,;=%()]+$/.test(v)) return false
   const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(v)
+  // A scheme-less value has no executable scheme, so it is accepted even when it
+  // contains `%` or `//` (e.g. `javascript%3Aalert(1)`, `//host/x`). This is
+  // safe ONLY under the invariant that avatar is rendered EXCLUSIVELY as an
+  // <img src> — a URL sink that treats such values as inert paths/hosts, never
+  // as executable script. Do not reuse this value in an href/CSS/HTML sink
+  // without re-validating against that context.
   if (!scheme) return true // relative or protocol-relative — no scheme, no script
   const s = (scheme[1] ?? '').toLowerCase()
   if (s === 'http' || s === 'https') return true
@@ -120,6 +126,10 @@ export function validateAwarenessStates(
 ): void {
   if (!ctx) return // server-internal awareness (DirectConnection) carries no client ctx
   for (const [clientId, state] of states) {
+    // Shape guard first: a malformed frame may carry a null / non-object state,
+    // and reading `.user` off it would throw — violating the MUST-NOT-throw
+    // contract below (a remotely triggerable crash). Skip it as non-presence.
+    if (!state || typeof state !== 'object') continue
     const user = (state as {
       user?: { id?: unknown; name?: unknown; color?: unknown; avatar?: unknown }
     }).user

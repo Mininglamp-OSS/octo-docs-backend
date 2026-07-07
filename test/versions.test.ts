@@ -1019,3 +1019,92 @@ describe('listVersionsHandler — kind param + counts response', () => {
     vi.mocked(docVersionRepo.countsByKind).mockRestore()
   })
 })
+
+// ── whiteboard doc_type gate: create/preview/restore reject boards (§11.5/§11.6) ─
+// Whiteboard rows share the doc_version table (schema_version=2) but must not
+// flow through the ProseMirror version path: gateSchema(2, 15) never trips, so
+// without a doc_type guard a board blob would preview as 200 + silently-empty
+// rich text, restore would stamp a mis-schema safety snapshot on the board row
+// and fire a spurious no-op write/broadcast on the live board. All three routes
+// reject a board up front with a fast 409, doing NO decode and NO DB/live write.
+describe('version routes — whiteboard doc_type gate', () => {
+  const boardGuard = {
+    meta: {
+      doc_id: 'b_1',
+      document_name: 'octo:s1:f_default:wb:b_1',
+      doc_type: 'board',
+      permission_epoch: 7,
+    },
+    role: 'admin',
+  } as never
+
+  it('createVersionHandler rejects a board with 409 and writes no version row', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const fetchSpy = vi.spyOn(persistence, 'fetch')
+    const createSpy = vi.spyOn(docVersionRepo, 'create')
+
+    const res = mockRes()
+    await createVersionHandler(req({ docId: 'b_1' }, { body: { label: 'x' } }), res as never)
+
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('version_unsupported_doc_type')
+    // No live snapshot fetch and no mis-schema-stamped board version row.
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(createSpy).not.toHaveBeenCalled()
+
+    fetchSpy.mockRestore()
+    createSpy.mockRestore()
+  })
+
+  it('getVersionStateHandler rejects a board with 409 (no decode, no 200+empty)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'b_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('version_unsupported_doc_type')
+    // The gate short-circuits before the row is ever loaded/decoded.
+    expect(getStateSpy).not.toHaveBeenCalled()
+
+    getStateSpy.mockRestore()
+  })
+
+  it('restoreVersionHandler rejects a board with 409 (no safety snapshot, no live write/broadcast)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
+
+    const res = mockRes()
+    await restoreVersionHandler(req({ docId: 'b_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('version_unsupported_doc_type')
+    // restoreVersion never runs: no transaction (no safety-snapshot row), no
+    // live-document reconcile/broadcast.
+    expect(getStateSpy).not.toHaveBeenCalled()
+    expect(transaction).not.toHaveBeenCalled()
+    expect(applyRestoreToLiveDoc).not.toHaveBeenCalled()
+
+    getStateSpy.mockRestore()
+  })
+
+  it('a rich-text doc (no board doc_type) is NOT gated — the guard is board-specific', async () => {
+    // Regression guard: the doc_type check must not affect ordinary documents.
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', permission_epoch: 7 },
+      role: 'admin',
+    } as never)
+    vi.spyOn(persistence, 'fetch').mockResolvedValue(null)
+    const createSpy = vi.spyOn(docVersionRepo, 'create').mockResolvedValue(7)
+
+    const res = mockRes()
+    await createVersionHandler(req({ docId: 'd_1' }, { body: { label: 'ok' } }), res as never)
+
+    expect(res.statusCode).toBe(201)
+    expect(createSpy).toHaveBeenCalledTimes(1)
+
+    createSpy.mockRestore()
+    vi.mocked(persistence.fetch).mockRestore()
+  })
+})
