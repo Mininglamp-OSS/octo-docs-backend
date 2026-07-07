@@ -282,6 +282,7 @@ describe('POST /:docId/access-requests/:requestId/deny', () => {
 
   it('marks denied -> 200, no grant', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(true)
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
       doc_id: 'd_1',
       uid: 'u_applicant',
@@ -313,5 +314,49 @@ describe('POST /:docId/access-requests/:requestId/deny', () => {
     await denyHandler()(req(), res as never)
     expect(res.statusCode).toBe(404)
     expect(vi.mocked(docAccessRequestRepo.decide)).not.toHaveBeenCalled()
+  })
+
+  // Regression (§ Jerry-Xin review 遗留非阻塞): deny MUST gate ok on a genuine
+  // pending -> denied transition, mirroring approve. decide() owns the only
+  // WHERE status=pending guard; when it reports no row transitioned we return
+  // 409 not_pending instead of a false ok:true. These pin that contract.
+  const requestRow = (status: number) => ({
+    doc_id: 'd_1',
+    uid: 'u_applicant',
+    requested_role: 1,
+    reason: '',
+    status,
+    request_id: 'req_x',
+    decided_by: 'u_admin',
+    created_at: new Date(0),
+    updated_at: new Date(0),
+  })
+
+  it('denying an already-decided (non-pending) request -> 409 not_pending', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(requestRow(REQUEST_STATUS_APPROVED))
+    // Real repo returns false: the WHERE status=pending UPDATE matched no row.
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(false)
+    const res = mockRes()
+    await denyHandler()(req(), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({ error: 'not_pending' })
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
+
+  it('decide() returns false (lost race) -> 409, decide runs, no grant', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(requestRow(1))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(false)
+    const res = mockRes()
+    await denyHandler()(req(), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(vi.mocked(docAccessRequestRepo.decide)).toHaveBeenCalledWith({
+      docId: 'd_1',
+      requestId: 'req_x',
+      status: REQUEST_STATUS_DENIED,
+      decidedBy: 'u_admin',
+    })
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
 })
