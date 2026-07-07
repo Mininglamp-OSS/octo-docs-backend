@@ -31,7 +31,7 @@ import {
   FILE_BEARING_TYPES,
 } from './schema/index.js'
 import type { WhiteboardElement } from './schema/index.js'
-import { getElementsMap, getFilesMap, readEntry, readElements } from './ydoc.js'
+import { getElementsMap, getFilesMap, readEntry, readElements, type YElements } from './ydoc.js'
 
 /** Deterministic fractional-index key for an element that lacks a valid one. */
 function fillIndexKey(seq: number): string {
@@ -69,13 +69,23 @@ function planRepair(doc: Y.Doc, scope: ReadonlySet<string> | null): RepairPlan {
   const current = readElements(doc)
 
   // Pass 1: decide survivors (drop bad id/type or dangling-image) over all ids,
-  // so reference pruning in pass 2 sees the correct surviving-id set.
+  // so reference pruning in pass 2 sees the correct surviving-id set. A survivor
+  // whose tombstone flag is set (isDeleted === true) keeps its key (§1.1) but is
+  // NOT a valid reference target: `referenceable` is therefore the non-tombstoned
+  // subset, and it — not `survivors` — is what pass 2 passes as elementIds so a
+  // ref to a tombstoned element is pruned exactly like a ref to an absent one
+  // (M-5, types.ts §elementIds = the non-tombstoned id set).
   const survivors = new Set<string>()
+  const referenceable = new Set<string>()
   const dropAll: string[] = []
   for (const id of allIds) {
     const n = normalizeElement(current.get(id), { fileIds })
-    if (n) survivors.add(id)
-    else dropAll.push(id)
+    if (n) {
+      survivors.add(id)
+      if (n.isDeleted !== true) referenceable.add(id)
+    } else {
+      dropAll.push(id)
+    }
   }
 
   // Deterministic index fill: indexless survivors (sorted by id) get a stable
@@ -93,7 +103,7 @@ function planRepair(doc: Y.Doc, scope: ReadonlySet<string> | null): RepairPlan {
   const candidates = scope ? [...survivors].filter((id) => scope.has(id)) : [...survivors]
   for (const id of candidates.sort()) {
     const el = current.get(id)!
-    const n = normalizeElement(el, { elementIds: survivors, fileIds }) as WhiteboardElement
+    const n = normalizeElement(el, { elementIds: referenceable, fileIds }) as WhiteboardElement
     const final: Record<string, unknown> = { ...n }
     const fill = indexFill.get(id)
     if (fill !== undefined) final.index = fill
@@ -197,6 +207,71 @@ export function repairWhiteboardState(state: Uint8Array | null): {
 }
 
 /**
+ * True if element `id` is removed as a *reference target*: hard-deleted (key
+ * gone from the elements map) or tombstoned (isDeleted === true). Mirrors the
+ * `referenceable` set built in planRepair — a removed id must not keep any
+ * dependent's containerId/frameId/boundElements alive (M-5).
+ */
+function isRemovedTarget(elements: YElements, id: string): boolean {
+  const yEl = elements.get(id)
+  if (!(yEl instanceof Y.Map)) return true // hard-deleted / never a proper element
+  return yEl.get('isDeleted') === true // tombstoned
+}
+
+/**
+ * Ids of surviving elements that reference any id in `removed` via
+ * containerId / frameId / boundElements. Used to expand the live observer scope
+ * on a delete so the dependents get re-normalized (their now-dangling refs
+ * pruned) even though only the deleted id itself changed in the transaction.
+ */
+function referrersOf(doc: Y.Doc, removed: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>()
+  if (removed.size === 0) return out
+  for (const [id, el] of readElements(doc)) {
+    if (removed.has(id)) continue
+    if (typeof el.containerId === 'string' && removed.has(el.containerId)) {
+      out.add(id)
+      continue
+    }
+    if (typeof el.frameId === 'string' && removed.has(el.frameId)) {
+      out.add(id)
+      continue
+    }
+    if (
+      Array.isArray(el.boundElements) &&
+      (el.boundElements as Array<{ id?: unknown }>).some(
+        (b) => b && typeof b.id === 'string' && removed.has(b.id),
+      )
+    ) {
+      out.add(id)
+    }
+  }
+  return out
+}
+
+/**
+ * Load-path (cold-start / failover) repair of a LIVE doc (BE-M11).
+ *
+ * `repairLiveDoc` rewrites fields directly on the doc, so the corrective structs
+ * are attributed to the doc's OWN clientID — which on a freshly loaded live doc
+ * is the node's RANDOM clientID. Two nodes cold-repairing the same persisted
+ * blob on failover would then emit DIFFERENT bytes (see the CONTROL case in
+ * whiteboardRepairDeterminism.test.ts). afterLoadDocument must therefore route
+ * the persisted-state convergence through the fixed-REPAIR_CLIENT_ID
+ * materialization: compute the canonical state off the current bytes, then merge
+ * it back under REPAIR_ORIGIN (gate 1 keeps the observer from re-firing). The
+ * repair structs now carry REPAIR_CLIENT_ID identically on every node, so the
+ * live docs converge byte-for-byte. Returns true if it changed the doc.
+ */
+export function coldRepairLiveDoc(doc: Y.Doc): boolean {
+  const before = Y.encodeStateAsUpdate(doc)
+  const { state, changed } = repairWhiteboardState(before.length > 0 ? before : null)
+  if (!changed) return false
+  Y.applyUpdate(doc, state, REPAIR_ORIGIN)
+  return true
+}
+
+/**
  * Attach the repair observer to a live whiteboard doc (wired on document load,
  * §4.1). The observer skips its own REPAIR_ORIGIN writes (gate 1) and scopes
  * normalization to the changed element ids (gate 3). Returns a disposer.
@@ -217,7 +292,18 @@ export function attachWhiteboardRepair(doc: Y.Doc): () => void {
         changed.add(e.path[0] as string)
       }
     }
-    if (changed.size > 0) repairLiveDoc(doc, changed)
+    if (changed.size === 0) return
+    // A delete (hard key removal OR tombstone flip) orphans elements that
+    // reference the removed id. The scoped pass only sees the deleted id itself,
+    // so expand the scope to its dependents; otherwise a surviving text whose
+    // container was just deleted keeps its dangling containerId forever (M-5,
+    // P1-3). Detect removals among the changed ids, then pull in their referrers.
+    const removed = new Set<string>()
+    for (const id of changed) {
+      if (isRemovedTarget(elements, id)) removed.add(id)
+    }
+    for (const refId of referrersOf(doc, removed)) changed.add(refId)
+    repairLiveDoc(doc, changed)
   }
 
   const onFiles = (events: Y.YEvent<Y.Map<unknown>>[], txn: Y.Transaction) => {

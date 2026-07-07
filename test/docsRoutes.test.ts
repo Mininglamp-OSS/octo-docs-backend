@@ -147,8 +147,19 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
 })
 
 describe('POST /api/v1/docs — create key codec (XIN-83 hop-2 join 404)', () => {
-  function postReq(body: Record<string, unknown>) {
-    return { uid: 'u_1', params: {}, body, query: {} } as never
+  // The handler sources the space solely from the enforced X-Space-Id header
+  // (req.spaceId); the body.spaceId fallback was removed. Mirror the GET helper
+  // req() above and set a top-level spaceId, defaulting to the body's spaceId so
+  // the mint cases carry a valid header. Pass an explicit spaceId (e.g. '') to
+  // drive the missing-header guard.
+  function postReq(body: Record<string, unknown>, spaceId?: string) {
+    return {
+      uid: 'u_1',
+      spaceId: spaceId ?? (body.spaceId as string) ?? 's1',
+      params: {},
+      body,
+      query: {},
+    } as never
   }
 
   beforeEach(() => {
@@ -200,7 +211,8 @@ describe('POST /api/v1/docs — create key codec (XIN-83 hop-2 join 404)', () =>
 
   it('returns 400 when spaceId is missing', async () => {
     const res = mockRes()
-    await createDocHandler(postReq({}), res as never)
+    // No X-Space-Id header reaches the handler (req.spaceId === '').
+    await createDocHandler(postReq({}, ''), res as never)
     expect(res.statusCode).toBe(400)
     expect((res.body as { error: string }).error).toBe('spaceId required')
   })

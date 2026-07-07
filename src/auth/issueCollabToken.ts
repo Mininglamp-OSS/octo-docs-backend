@@ -8,19 +8,18 @@
  * existence/status check moved forward to the issuance endpoint"), so the WS
  * onAuthenticate does not recompute it.
  *
- * Both documents and whiteboards are served. They differ only in how the key
- * resolves to a doc_meta row (appendix B):
- *   - document  `octo:{space}:{folder}:{doc}`        -> lookup by document_name
- *   - whiteboard `octo:{space}:{folder}:wb:{board}`  -> {board} IS the doc_id
- *     (a doc_meta row with doc_type='board'), so it resolves by doc_id.
+ * Both documents and whiteboards are served, resolved the SAME way — by
+ * document_name — through the shared resolveDocMetaByName resolver (appendix B):
+ *   - document  `octo:{space}:{folder}:{doc}`
+ *   - whiteboard `octo:{space}:{folder}:wb:{board}`  (the board's document_name
+ *     IS this 5-segment key; a board row is doc_type='board')
  * Authorization (resolveRole = doc_member + owner) and signing are identical for
  * both — a board owner gets admin, a board member gets their stored role.
  */
 import { signCollabToken, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
 import { parseDocumentName } from '../permission/documentName.js'
-import { docMetaRepo } from '../db/repos/docMetaRepo.js'
-import { resolveRole } from '../permission/resolveRole.js'
+import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -39,8 +38,8 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
   const uid = identity.uid
 
-  // Validate / parse documentName (reject malformed keys; whiteboard keys are
-  // accepted and routed by doc_id below).
+  // Validate / parse documentName first so a structurally malformed key is a
+  // 403 (distinct from a well-formed key that resolves to no row => 404).
   let parsed
   try {
     parsed = parseDocumentName(documentName)
@@ -48,25 +47,16 @@ export async function issueCollabToken(octoToken: string, documentName: string):
     return { ok: false, status: 403, error: 'forbidden' }
   }
 
-  // Resolve the addressed doc_meta row. Documents are keyed by document_name (an
-  // exact match implicitly validates the whole key); whiteboards are keyed by
-  // doc_id (parsed.board), so the space/folder segments are validated explicitly
-  // to keep the §8.1 key/row consistency invariant.
-  let meta
-  if (parsed.kind === 'whiteboard') {
-    meta = await docMetaRepo.getByDocId(parsed.board)
-    // The `:wb:` namespace addresses boards only — a non-board (or missing)
-    // doc_id is "no such whiteboard".
-    if (!meta || meta.status === 0 || meta.doc_type !== 'board') {
-      return { ok: false, status: 404, error: 'not_found' }
-    }
-    if (parsed.space !== meta.space_id || parsed.folder !== meta.folder_id) {
-      return { ok: false, status: 403, error: 'forbidden' }
-    }
-  } else {
-    meta = await docMetaRepo.getByDocumentName(documentName)
-    if (!meta || meta.status === 0) return { ok: false, status: 404, error: 'not_found' }
-    if (parsed.folder !== meta.folder_id) return { ok: false, status: 403, error: 'forbidden' }
+  // Resolve the addressed doc_meta row through the SHARED document_name resolver
+  // (same path documents and the WS recheck use). An exact document_name match
+  // implicitly validates every segment, so there is no board-only doc_id branch
+  // anymore. A null here means the well-formed key addresses no live row.
+  const meta = await resolveDocMetaByName(documentName)
+  if (!meta) return { ok: false, status: 404, error: 'not_found' }
+  // The `:wb:` namespace addresses boards only — a resolved row that is not a
+  // board (corrupt key/row pairing) is "no such whiteboard".
+  if (parsed.kind === 'whiteboard' && meta.doc_type !== 'board') {
+    return { ok: false, status: 404, error: 'not_found' }
   }
 
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).

@@ -150,6 +150,40 @@ describe('repairLiveDoc — M-5 dangling containerId cleanup (§3.6.2/§3.6.3)',
     expect(t.containerId).toBeNull()
     expect(t.boundFlavor).toEqual({ keep: 1 })
   })
+
+  it('prunes a containerId pointing at a TOMBSTONED container, not only a hard-absent one (P1-2)', () => {
+    // The container is present but soft-deleted (isDeleted === true). Deletions
+    // are tombstones that KEEP the key (§1.1), so the container id is still in
+    // the elements map — but it must NOT count as a valid reference target. The
+    // bound text's containerId therefore has to be pruned exactly as if the
+    // container were hard-absent.
+    const doc = buildDoc({
+      box: clean('box', 'a0', { isDeleted: true }),
+      t: clean('t', 'a1', { type: 'text', containerId: 'box' }),
+    })
+    expect(repairLiveDoc(doc)).toBe(true)
+    const t = readElements(doc).get('t')!
+    expect(t.containerId).toBeNull()
+    // the tombstoned container keeps its key — repair never hard-deletes it.
+    expect(readElements(doc).has('box')).toBe(true)
+    expect((readElements(doc).get('box') as Record<string, unknown>).isDeleted).toBe(true)
+    // idempotent: the ref is already pruned on a second pass.
+    expect(repairLiveDoc(doc)).toBe(false)
+  })
+
+  it('also prunes boundElements / frameId that point at a tombstoned element (P1-2)', () => {
+    const doc = buildDoc({
+      frame: clean('frame', 'a0', { isDeleted: true }),
+      child: clean('child', 'a1', {
+        frameId: 'frame',
+        boundElements: [{ id: 'frame', type: 'text' }],
+      }),
+    })
+    expect(repairLiveDoc(doc)).toBe(true)
+    const child = readElements(doc).get('child')!
+    expect(child.frameId).toBeNull()
+    expect(child.boundElements).toEqual([]) // dangling bound ref filtered out
+  })
 })
 
 describe('attachWhiteboardRepair — live observer (§4.1 gates 1 & 3)', () => {
@@ -191,5 +225,38 @@ describe('attachWhiteboardRepair — live observer (§4.1 gates 1 & 3)', () => {
     }, 'user')
     // not repaired (observer detached) -> illegal version remains
     expect(readElements(doc).get('b')!.version).toBe(0)
+  })
+
+  it('re-prunes a dependent when its container is HARD-deleted live (P1-3 scope expansion)', () => {
+    // box + a bound text, both already canonical so the load pass is quiet.
+    const doc = buildDoc({
+      box: clean('box', 'a0'),
+      t: clean('t', 'a1', { type: 'text', containerId: 'box' }),
+    })
+    const dispose = attachWhiteboardRepair(doc)
+    // A user hard-deletes the container. Only `box` is in the transaction scope;
+    // the surviving text `t` did NOT change, yet its containerId now dangles and
+    // must be re-pruned (the scope is expanded to `box`'s referrers).
+    doc.transact(() => {
+      doc.getMap(ELEMENTS_FIELD).delete('box')
+    }, 'user')
+    expect(readElements(doc).has('box')).toBe(false)
+    expect(readElements(doc).get('t')!.containerId).toBeNull()
+    dispose()
+  })
+
+  it('re-prunes a dependent when its container is TOMBSTONED live (P1-3, tombstone shape)', () => {
+    const doc = buildDoc({
+      box: clean('box', 'a0'),
+      t: clean('t', 'a1', { type: 'text', containerId: 'box' }),
+    })
+    const dispose = attachWhiteboardRepair(doc)
+    // Soft-delete: flip isDeleted on the container. `box` keeps its key, so only
+    // `box` is in scope, but the text bound to it must still be re-pruned.
+    doc.transact(() => {
+      ;(doc.getMap(ELEMENTS_FIELD).get('box') as Y.Map<unknown>).set('isDeleted', true)
+    }, 'user')
+    expect(readElements(doc).get('t')!.containerId).toBeNull()
+    dispose()
   })
 })

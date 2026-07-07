@@ -16,7 +16,7 @@
 import { describe, it, expect } from 'vitest'
 import * as Y from 'yjs'
 import { repairWhiteboardState } from '../src/whiteboard/repair.js'
-import { repairLiveDoc } from '../src/whiteboard/repair.js'
+import { repairLiveDoc, coldRepairLiveDoc } from '../src/whiteboard/repair.js'
 import { readElements } from '../src/whiteboard/ydoc.js'
 import { ELEMENTS_FIELD, FILES_FIELD, REPAIR_CLIENT_ID } from '../src/whiteboard/schema/index.js'
 
@@ -167,5 +167,49 @@ describe('BE-M11 repair write-back determinism', () => {
     }
     expect(mk(1001)).not.toEqual(mk(2002)) // divergence without the fix
     expect(mk(REPAIR_CLIENT_ID)).toEqual(Buffer.from(results[0].state)) // fix converges
+  })
+})
+
+describe('BE-M11 load-path (afterLoadDocument) repair determinism', () => {
+  const input = buildIllegalState()
+
+  // Exactly what afterLoadDocument does on each node: load the SAME persisted
+  // blob into a LIVE Y.Doc whose clientID is the node's RANDOM id, then run the
+  // load-path repair (coldRepairLiveDoc). This is the production path P1-1 fixes
+  // — a plain repairLiveDoc here would attribute the corrective structs to the
+  // random clientID and diverge on failover (proven by the CONTROL above).
+  const loadNode = (clientId: number) => {
+    const doc = new Y.Doc()
+    doc.clientID = clientId // node-specific RANDOM clientID
+    Y.applyUpdate(doc, input)
+    const changed = coldRepairLiveDoc(doc)
+    const bytes = Buffer.from(Y.encodeStateAsUpdate(doc))
+    doc.destroy()
+    return { changed, bytes }
+  }
+
+  it('repairs the loaded state (changed = true)', () => {
+    expect(loadNode(1001).changed).toBe(true)
+  })
+
+  it('two nodes with DIFFERENT random clientIDs converge byte-identically', () => {
+    const a = loadNode(1001)
+    const b = loadNode(2002)
+    expect(a.bytes).toEqual(b.bytes)
+  })
+
+  it('the converged load-path bytes equal the fixed-clientID materialization', () => {
+    // afterLoadDocument's live-doc result matches repairWhiteboardState (the
+    // failover cold-start path) byte-for-byte, so both cold paths agree.
+    expect(loadNode(4242).bytes).toEqual(Buffer.from(repairWhiteboardState(input).state))
+  })
+
+  it('is a no-op on an already-repaired live doc (changed = false)', () => {
+    const canonical = repairWhiteboardState(input).state
+    const doc = new Y.Doc()
+    doc.clientID = 9999
+    Y.applyUpdate(doc, canonical)
+    expect(coldRepairLiveDoc(doc)).toBe(false)
+    doc.destroy()
   })
 })

@@ -20,7 +20,7 @@ import { recheckCurrentRoleCached } from '../permission/recheck.js'
 import { roleAtLeast } from '../permission/role.js'
 import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
 import { parseDocumentName } from '../permission/documentName.js'
-import { attachWhiteboardRepair, repairLiveDoc } from '../whiteboard/repair.js'
+import { attachWhiteboardRepair, coldRepairLiveDoc } from '../whiteboard/repair.js'
 
 /**
  * Per-node epoch watermark (§4.5 step 4): beforeHandleMessage reads this local
@@ -210,7 +210,12 @@ export function createServer() {
       if (kind !== 'whiteboard') return
       const dispose = attachWhiteboardRepair(data.document)
       repairDisposers.set(data.documentName, dispose)
-      repairLiveDoc(data.document) // converge persisted state on load
+      // Converge persisted state on load through the fixed-clientID
+      // materialization so two nodes cold-repairing the same blob on failover
+      // emit byte-identical structs (BE-M11); a plain repairLiveDoc here would
+      // attribute the corrective writes to this node's RANDOM clientID and
+      // diverge on failover.
+      coldRepairLiveDoc(data.document)
     },
 
     // A4 (§5.2): backend-autonomous KIND_AUTO snapshots. afterStoreDocument
