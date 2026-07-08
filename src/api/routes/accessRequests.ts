@@ -24,7 +24,7 @@ import {
   REQUEST_STATUS_APPROVED,
   REQUEST_STATUS_DENIED,
 } from '../../db/repos/docAccessRequestRepo.js'
-import { requireDocRole } from '../guard.js'
+import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
@@ -48,6 +48,17 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
   const meta = await docMetaRepo.getByDocId(docId)
   if (!meta || meta.status === 0) {
     res.status(404).json({ error: 'not_found' })
+    return
+  }
+  // Space-scope gate (P2): a doc in another space must be indistinguishable
+  // from a missing one, so a cross-space hit returns 404 BEFORE any status
+  // branch. This submit route is the only one in the router that skips
+  // requireDocRole (submit needs no doc role), so without this check a caller
+  // whose server-resolved space is A could probe or write an access-request row
+  // against a doc in space B — a cross-space existence/state oracle plus a
+  // cross-space write. Reusing the shared guard helper keeps this identical to
+  // the role-guarded routes and hardens both the human and bot mounts at once.
+  if (!requireSameSpace(res, meta, req.spaceId!)) {
     return
   }
   if (meta.status === 2) {

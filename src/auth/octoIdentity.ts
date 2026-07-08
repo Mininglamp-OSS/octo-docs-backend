@@ -27,6 +27,16 @@ export interface OctoIdentity {
   verifyToken(token: string): Promise<{ uid: string; name?: string } | null>
 
   /**
+   * (a-bot) Resolve a bot bearer token to its trusted bot uid and the bot's
+   * space. Calls octo-server's already-existing POST /v1/auth/verify-bot, which
+   * validates the token against the `robot` table and server-side reverse-looks-up
+   * the bot's space from its most recent active `space_member` row. The space is
+   * therefore never client-supplied (anti-spoof). Returns null when the token is
+   * missing/invalid (caller => 401 / unauthorized).
+   */
+  verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null>
+
+  /**
    * (b) Look up a single user by uid. Returns null if the user does not exist
    * (used by §8.4 PUT members to reject ghost members => 404 user_not_found).
    *
@@ -35,6 +45,19 @@ export interface OctoIdentity {
    * authenticated caller's own octo session token.
    */
   getUser(uid: string, callerToken?: string): Promise<OctoUser | null>
+
+  /**
+   * (b-bot) Look up a single user by uid on the BOT path, authenticating with
+   * the bot's own bearer token. Calls octo-server's already-existing bot
+   * user-info route GET /v1/bot/user/info?uid=... with `Authorization: Bearer
+   * <botToken>` (the authBot realm), not the AuthMiddleware-guarded
+   * GET /v1/users/:uid route the human path uses. The 200-vs-404 signal is the
+   * same anti ghost-member existence check: 200 -> OctoUser, 404 -> null.
+   *
+   * This is why the bot path no longer needs OCTO_SERVER_TOKEN: the bot resolves
+   * the target user with its own token instead of a privileged service token.
+   */
+  getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null>
 
   /** (b) Batch profile lookup for awareness cursors (§4.7(b)). */
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>
@@ -71,6 +94,39 @@ export class HttpOctoIdentity implements OctoIdentity {
     return { uid: body.uid, name: body.name }
   }
 
+  async verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null> {
+    if (!token) return null
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/auth/verify-bot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bot_token: token }),
+      })
+    } catch {
+      // Authoritative identity source unreachable => treat as unverified.
+      return null
+    }
+    if (!res.ok) return null
+    const body = (await res.json().catch(() => null)) as
+      | { bot_uid?: string; space_id?: string }
+      | null
+    if (!body || typeof body.bot_uid !== 'string' || body.bot_uid === '') return null
+    // The space is whatever octo-server reverse-resolved from the bot's active
+    // space_member row; it is never a client-supplied value (anti-spoof).
+    //
+    // A bot with no resolvable space MUST NOT be authorized: reject it here
+    // (return null, the unverified-identity signal) rather than passing an empty
+    // spaceId downstream. Every doc guard scopes on req.spaceId, so an empty
+    // space would silently defeat that scoping (empty === empty matches nothing
+    // real, but bypasses the intended isolation). Enforcing it at the identity
+    // layer means verifyBotMiddleware 401s a spaceless bot via its existing
+    // null check, with no per-middleware special case, and keeps the invariant
+    // "a verified bot identity always carries a real space" in one place.
+    if (typeof body.space_id !== 'string' || body.space_id === '') return null
+    return { uid: body.bot_uid, spaceId: body.space_id }
+  }
+
   async getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
     // octo-server requires auth on /v1/users/:uid: prefer a configured service
     // token, else fall back to the caller's own session token. Never logged.
@@ -83,6 +139,29 @@ export class HttpOctoIdentity implements OctoIdentity {
     } catch {
       return null
     }
+    if (res.status === 404) return null
+    if (!res.ok) return null
+    const body = (await res.json().catch(() => null)) as
+      | { uid?: string; name?: string; avatar?: string }
+      | null
+    if (!body || typeof body.uid !== 'string') return null
+    return { uid: body.uid, name: body.name ?? '', avatar: body.avatar }
+  }
+
+  async getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
+    // The bot resolves the target user with its own bearer token against the
+    // authBot-guarded bot user-info route — no OCTO_SERVER_TOKEN needed. Never
+    // logged. An empty token can never authenticate, so short-circuit to null.
+    if (!botToken) return null
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/bot/user/info?uid=${encodeURIComponent(uid)}`, {
+        headers: { Authorization: `Bearer ${botToken}` },
+      })
+    } catch {
+      return null
+    }
+    // 404 is the anti ghost-member signal (user does not exist) => null.
     if (res.status === 404) return null
     if (!res.ok) return null
     const body = (await res.json().catch(() => null)) as
@@ -121,6 +200,14 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
     return this.delegate.getUser(uid, callerToken)
+  }
+
+  getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
+    return this.delegate.getUserAsBot(uid, botToken)
+  }
+
+  verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null> {
+    return this.delegate.verifyBot(token)
   }
 
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {

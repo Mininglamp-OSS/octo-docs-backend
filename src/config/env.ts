@@ -30,6 +30,29 @@ function bool(name: string, fallback: boolean): boolean {
 
 export type OctoIdentityMode = 'http' | 'middleware'
 
+/**
+ * Parse the Express `trust proxy` setting from env (§8.4). The REST API runs
+ * behind nginx (see app.ts), so `req.ip` must be derived from the
+ * X-Forwarded-For chain, not the socket peer — otherwise every client collapses
+ * to the proxy address and the per-IP rate limiter shares one bucket across all
+ * traffic. Accepted forms:
+ *   - unset / '' -> 1 (trust exactly one proxy hop: the standard single-nginx
+ *     topology this service documents)
+ *   - 'true' / 'false' -> boolean (avoid 'true' in prod: it is permissive and
+ *     lets clients spoof X-Forwarded-For)
+ *   - an integer -> number of trusted hops in front of the app
+ *   - anything else -> passed through verbatim (a preset like 'loopback' or a
+ *     subnet/CIDR list Express understands)
+ */
+export function parseTrustProxy(raw: string): boolean | number | string {
+  const v = raw.trim()
+  if (v === '') return 1
+  if (v.toLowerCase() === 'true') return true
+  if (v.toLowerCase() === 'false') return false
+  if (/^\d+$/.test(v)) return Number(v)
+  return v
+}
+
 /** Dev-only fallback secret; must never reach production (see requireSafeSigningSecret). */
 const DEV_SIGNING_SECRET = 'dev-only-change-me'
 
@@ -101,6 +124,11 @@ export const config = {
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
   httpPort: num('HTTP_PORT', 3000),
 
+  // Express `trust proxy` value. The REST API sits behind nginx, so this must be
+  // set for req.ip (and thus the per-IP rate limiter) to see the real client
+  // rather than the proxy. Defaults to 1 (one nginx hop); see parseTrustProxy.
+  trustProxy: parseTrustProxy(str('TRUST_PROXY', '')),
+
   mysql: {
     host: str('MYSQL_HOST', '127.0.0.1'),
     port: num('MYSQL_PORT', 3306),
@@ -114,6 +142,20 @@ export const config = {
     host: str('REDIS_HOST', '127.0.0.1'),
     port: num('REDIS_PORT', 6379),
     prefix: str('REDIS_PREFIX', 'octo-docs'),
+  },
+
+  // Per-IP request throttle applied to the REST route chains (§8.4). Guards the
+  // authenticated/authorizing metadata endpoints on both the human (/api/v1/docs)
+  // and bot (/v1/bot/docs) mounts against abuse. Keyed on the real client IP,
+  // which requires `trustProxy` above to be set correctly for the deployment.
+  // Defaults are generous enough not to affect normal interactive/bot usage;
+  // tune down only if abuse is observed. The /healthz probe is mounted ahead of
+  // the limiter and stays unthrottled.
+  rateLimit: {
+    // Rolling window length.
+    windowMs: num('RATE_LIMIT_WINDOW_MS', 60_000),
+    // Max requests per IP per window before a 429 is returned.
+    max: num('RATE_LIMIT_MAX', 300),
   },
 
   collabToken: {
@@ -130,9 +172,14 @@ export const config = {
   octoIdentity: {
     mode: str('OCTO_IDENTITY_MODE', 'http') as OctoIdentityMode,
     serverBaseUrl: str('OCTO_SERVER_BASE_URL', 'http://127.0.0.1:8080'),
-    // Optional service token sent as the `token` header on octo-server lookups
-    // (e.g. GET /v1/users/:uid, which requires auth). Empty = not configured;
-    // callers then fall back to the authenticated user's own session token.
+    // Service token sent as the `token` header on octo-server lookups (e.g.
+    // GET /v1/users/:uid, which requires auth) on the HUMAN path. Empty = not
+    // configured; callers then fall back to the authenticated user's own session
+    // token. OPTIONAL for the human path (/api/v1/docs). No longer required for
+    // the bot path (/v1/bot/docs): the bot resolves the target user with its own
+    // bearer token via GET /v1/bot/user/info (see octoIdentity.getUserAsBot), so
+    // the anti ghost-member existence check in members/forwardGrant works with
+    // OCTO_SERVER_TOKEN empty.
     serviceToken: str('OCTO_SERVER_TOKEN', ''),
   },
 

@@ -16,6 +16,10 @@ declare global {
     interface Request {
       uid?: string
       octoToken?: string
+      // Set only on the bot mount (verifyBot): the bot's own bearer token, used
+      // to authenticate bot-realm octo-server lookups (the anti ghost-member
+      // existence check in members/forwardGrant). Never set on the human path.
+      botToken?: string
     }
   }
 }
