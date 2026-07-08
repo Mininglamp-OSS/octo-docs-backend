@@ -13,10 +13,12 @@
  *      is mounted on the bot path.
  *   2. It MUST NOT read or trust a client-supplied `X-Space-Id` header — the space
  *      is only ever the server-side reverse lookup (anti-spoof).
- *   3. It MUST NOT set req.octoToken. The bot path has no caller session token;
- *      downstream octo-server lookups (the anti ghost-member existence check in
- *      members/forwardGrant) rely on the configured OCTO_SERVER_TOKEN serviceToken
- *      instead. This is why serviceToken is a deploy prerequisite for the bot path.
+ *   3. It MUST NOT set req.octoToken. The bot path has no caller session token.
+ *      Instead it stashes the bot's own bearer token on req.botToken, which the
+ *      downstream anti ghost-member existence check (members/forwardGrant) uses
+ *      to call octo-server's bot user-info route (GET /v1/bot/user/info) on the
+ *      bot-token realm. OCTO_SERVER_TOKEN is therefore no longer required for the
+ *      bot path.
  *
  * Mount order: FIRST on the bot router, before any metadata router. On verify
  * failure return 401 (same envelope as authMiddleware).
@@ -44,7 +46,12 @@ export async function verifyBotMiddleware(
   // Space comes solely from the server-side reverse lookup; any client X-Space-Id
   // is deliberately ignored here (anti-spoof).
   req.spaceId = identity.spaceId
-  // Intentionally NOT setting req.octoToken: the bot path authenticates its
-  // octo-server lookups with the configured serviceToken, never a caller token.
+  // Stash the bot's own bearer token so downstream handlers can authenticate
+  // their octo-server lookups on the bot-token realm — specifically the anti
+  // ghost-member existence check in members/forwardGrant, which calls
+  // GET /v1/bot/user/info with this token (see HttpOctoIdentity.getUserAsBot).
+  // This is NOT req.octoToken: the bot path has no caller session token, and the
+  // bot realm (authBot) is separate from the human session/service-token realm.
+  req.botToken = token
   next()
 }

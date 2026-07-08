@@ -96,6 +96,18 @@ describe('verifyBotMiddleware — bot identity injection (§ v4.3)', () => {
     expect((r as unknown as { octoToken?: string }).octoToken).toBeUndefined()
   })
 
+  it('stashes the bot bearer token on req.botToken for downstream bot-realm lookups', async () => {
+    setOctoIdentity(stubIdentity(async () => ({ uid: 'bot_1', spaceId: 's_1' })))
+    const r = req({ authorization: 'Bearer the-bot-token' })
+    const next = vi.fn()
+
+    await verifyBotMiddleware(r, mockRes() as never, next)
+
+    expect((r as unknown as { botToken?: string }).botToken).toBe('the-bot-token')
+    // still no caller session token on the bot path
+    expect((r as unknown as { octoToken?: string }).octoToken).toBeUndefined()
+  })
+
   it('ignores a client-supplied X-Space-Id and uses the server-resolved space (anti-spoof)', async () => {
     setOctoIdentity(stubIdentity(async () => ({ uid: 'bot_1', spaceId: 's_real' })))
     const r = req({ authorization: 'Bearer bot-tok', 'X-Space-Id': 's_spoofed' })

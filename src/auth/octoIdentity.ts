@@ -46,6 +46,19 @@ export interface OctoIdentity {
    */
   getUser(uid: string, callerToken?: string): Promise<OctoUser | null>
 
+  /**
+   * (b-bot) Look up a single user by uid on the BOT path, authenticating with
+   * the bot's own bearer token. Calls octo-server's already-existing bot
+   * user-info route GET /v1/bot/user/info?uid=... with `Authorization: Bearer
+   * <botToken>` (the authBot realm), not the AuthMiddleware-guarded
+   * GET /v1/users/:uid route the human path uses. The 200-vs-404 signal is the
+   * same anti ghost-member existence check: 200 -> OctoUser, 404 -> null.
+   *
+   * This is why the bot path no longer needs OCTO_SERVER_TOKEN: the bot resolves
+   * the target user with its own token instead of a privileged service token.
+   */
+  getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null>
+
   /** (b) Batch profile lookup for awareness cursors (§4.7(b)). */
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>
 }
@@ -135,6 +148,29 @@ export class HttpOctoIdentity implements OctoIdentity {
     return { uid: body.uid, name: body.name ?? '', avatar: body.avatar }
   }
 
+  async getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
+    // The bot resolves the target user with its own bearer token against the
+    // authBot-guarded bot user-info route — no OCTO_SERVER_TOKEN needed. Never
+    // logged. An empty token can never authenticate, so short-circuit to null.
+    if (!botToken) return null
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/bot/user/info?uid=${encodeURIComponent(uid)}`, {
+        headers: { Authorization: `Bearer ${botToken}` },
+      })
+    } catch {
+      return null
+    }
+    // 404 is the anti ghost-member signal (user does not exist) => null.
+    if (res.status === 404) return null
+    if (!res.ok) return null
+    const body = (await res.json().catch(() => null)) as
+      | { uid?: string; name?: string; avatar?: string }
+      | null
+    if (!body || typeof body.uid !== 'string') return null
+    return { uid: body.uid, name: body.name ?? '', avatar: body.avatar }
+  }
+
   async getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
     const results = await Promise.all(uids.map((u) => this.getUser(u, callerToken)))
     return results.filter((u): u is OctoUser => u !== null)
@@ -164,6 +200,10 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
     return this.delegate.getUser(uid, callerToken)
+  }
+
+  getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
+    return this.delegate.getUserAsBot(uid, botToken)
   }
 
   verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null> {

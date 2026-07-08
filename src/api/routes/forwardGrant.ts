@@ -49,7 +49,11 @@ forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Respo
   }
 
   // Anti ghost-member: the target uid must be a real octo user (mirrors PUT members).
-  const user = await getOctoIdentity().getUser(uid, req.octoToken)
+  // Bot mount (req.botToken set by verifyBot) resolves with the bot's own token
+  // via the bot user-info route; human path resolves with the caller/service token.
+  const user = req.botToken
+    ? await getOctoIdentity().getUserAsBot(uid, req.botToken)
+    : await getOctoIdentity().getUser(uid, req.octoToken)
   if (!user) {
     res.status(404).json({ error: 'user_not_found' })
     return

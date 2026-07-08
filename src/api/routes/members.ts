@@ -52,8 +52,13 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'role must be reader|writer|admin' })
     return
   }
-  // verify target uid exists in octo (anti ghost-member).
-  const user = await getOctoIdentity().getUser(uid, req.octoToken)
+  // verify target uid exists in octo (anti ghost-member). On the bot mount
+  // (req.botToken set by verifyBot) resolve with the bot's own token via the
+  // bot user-info route; on the human path resolve with the caller/service
+  // token via GET /v1/users/:uid. Either way a miss => 404 user_not_found.
+  const user = req.botToken
+    ? await getOctoIdentity().getUserAsBot(uid, req.botToken)
+    : await getOctoIdentity().getUser(uid, req.octoToken)
   if (!user) {
     res.status(404).json({ error: 'user_not_found' })
     return
