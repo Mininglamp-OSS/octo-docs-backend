@@ -42,6 +42,12 @@ function fillIndexKey(seq: number): string {
 /** Deep-ish equality good enough for element field values (primitives + JSON). */
 function fieldEquals(a: unknown, b: unknown): boolean {
   if (a === b) return true
+  // NaN is never === itself, so the strict check above misses NaN/NaN. Treat two
+  // NaNs as equal (Object.is semantics) — otherwise a surviving NaN in a
+  // passed-through unknown field would fail both the diff-empty gate and the
+  // per-field write guard, so repair would emit a corrective write on every pass
+  // and never converge (breaks idempotence + BE-M11 determinism).
+  if (a !== a && b !== b) return true
   if (typeof a !== typeof b) return false
   if (a && b && typeof a === 'object') return JSON.stringify(a) === JSON.stringify(b)
   return false

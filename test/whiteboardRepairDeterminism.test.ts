@@ -278,3 +278,67 @@ describe('BE-M11 gen-2 re-repair byte-determinism (REPAIR_CLIENT_ID self-collisi
     expect(late.x).toBe(0)
   })
 })
+
+describe('BE-M11 repair converges when an element carries a NaN in an unknown field', () => {
+  // normalizeElement clamps only the known FINITE_FIELDS/opacity; unknown fields
+  // are passed through verbatim (§6, normalize.ts `{...src}`). A NaN living in
+  // such a passed-through field survives normalization AND the Yjs
+  // encodeStateAsUpdate/applyUpdate round-trip as a real number (Number.isNaN).
+  // fieldEquals must treat NaN/NaN as equal (Object.is semantics) or the
+  // diff-empty gate (objectEquals) and the per-field write guard never hold, so
+  // planRepair emits a corrective write on EVERY pass — the state grows without
+  // bound and repair never stabilizes (breaks idempotence + BE-M11 determinism).
+  function buildNaNUnknownFieldState(): Uint8Array {
+    const doc = new Y.Doc()
+    doc.transact(() => {
+      const el = doc.getMap(ELEMENTS_FIELD)
+      const m = new Y.Map()
+      // fully legal known fields (so the element survives repair intact) plus an
+      // unknown field carrying a NaN that repair must leave untouched yet still
+      // recognise as unchanged on the next pass.
+      m.set('id', 'e_nan')
+      m.set('type', 'rectangle')
+      m.set('version', 1)
+      m.set('versionNonce', 7)
+      m.set('index', 'a1')
+      m.set('customScore', NaN) // unknown field, NaN — passed through verbatim
+      el.set('e_nan', m as Y.Map<unknown>)
+    }, 'seed')
+    const out = Y.encodeStateAsUpdate(doc)
+    doc.destroy()
+    return out
+  }
+
+  const input = buildNaNUnknownFieldState()
+
+  it('the NaN really survives the Yjs round-trip as a NaN number', () => {
+    const doc = decode(input)
+    const el = readElements(doc).get('e_nan')!
+    doc.destroy()
+    expect(Number.isNaN(el.customScore)).toBe(true)
+  })
+
+  it('gen-2 repair reports no change and is byte-identical to gen-1 (converges)', () => {
+    const gen1 = repairWhiteboardState(input)
+    const gen2 = repairWhiteboardState(gen1.state)
+    // Before the fieldEquals NaN fix: gen2.changed was true and the byte length
+    // grew every generation — repair never converged.
+    expect(gen2.changed).toBe(false)
+    expect(Buffer.from(gen2.state)).toEqual(Buffer.from(gen1.state))
+  })
+
+  it('the unknown NaN field is preserved as NaN through repair (not dropped/mutated)', () => {
+    const doc = decode(repairWhiteboardState(input).state)
+    const el = readElements(doc).get('e_nan')!
+    doc.destroy()
+    expect(Number.isNaN(el.customScore)).toBe(true)
+  })
+
+  it('re-repairing the repaired live doc is a no-op (diff-empty gate holds)', () => {
+    const gen1 = repairWhiteboardState(input).state
+    const doc = decode(gen1)
+    expect(repairLiveDoc(doc)).toBe(false)
+    expect(Buffer.from(Y.encodeStateAsUpdate(doc))).toEqual(Buffer.from(gen1))
+    doc.destroy()
+  })
+})
