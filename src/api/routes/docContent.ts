@@ -39,6 +39,21 @@ function isValidPath(path: unknown): path is number[] {
   return Array.isArray(path) && path.length > 0 && path.every((n) => Number.isInteger(n) && (n as number) >= 0)
 }
 
+/**
+ * A root-container insert: the empty path `[]` addresses the doc root and is
+ * legal ONLY for `insert` with `inside_start` / `inside_end` (insert as the
+ * doc's first / last child — the sole way to write the first block into an
+ * empty document). `before` / `after` and replace/delete against the root stay
+ * rejected via isValidPath, which still requires a non-empty path.
+ */
+function isRootInsertPosition(path: unknown, position: unknown): boolean {
+  return (
+    Array.isArray(path) &&
+    path.length === 0 &&
+    (position === 'inside_start' || position === 'inside_end')
+  )
+}
+
 /** Structural (shape-only) validation of the op batch — a bad shape is a 400. */
 function validateOpsShape(ops: unknown): ops is DocEditOp[] {
   if (!Array.isArray(ops) || ops.length === 0) return false
@@ -50,9 +65,9 @@ function validateOpsShape(ops: unknown): ops is DocEditOp[] {
       const positions = ['before', 'after', 'inside_start', 'inside_end']
       return (
         !!at &&
-        isValidPath(at.path) &&
         typeof at.position === 'string' &&
         positions.includes(at.position) &&
+        (isValidPath(at.path) || isRootInsertPosition(at.path, at.position)) &&
         Array.isArray(o.content)
       )
     }

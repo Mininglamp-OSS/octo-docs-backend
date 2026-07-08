@@ -98,7 +98,73 @@ describe('applyIncrementalOps — insert', () => {
       .content[0]!.content.map((p) => (p.content ?? []).map((c) => c.text ?? '').join(''))
     expect(endInner).toEqual(['mid', 'tail'])
   })
+
+  // ── empty-document / root-container first-block insert (XIN-574) ───────────────
+  it('insert inside_start at root (path []) writes the first block into an empty doc', () => {
+    const empty = PMNode.fromJSON(schema, { type: 'doc' } as Parameters<typeof PMNode.fromJSON>[1])
+    const out = applyIncrementalOps(
+      empty,
+      [{ type: 'insert', at: { path: [], position: 'inside_start' }, content: [para('first')] }],
+      schema,
+    )
+    expect(topTexts(out)).toEqual(['first'])
+  })
+
+  it('insert inside_end at root (path []) writes the first block into an empty doc', () => {
+    const empty = PMNode.fromJSON(schema, { type: 'doc' } as Parameters<typeof PMNode.fromJSON>[1])
+    const out = applyIncrementalOps(
+      empty,
+      [{ type: 'insert', at: { path: [], position: 'inside_end' }, content: [para('only')] }],
+      schema,
+    )
+    expect(topTexts(out)).toEqual(['only'])
+  })
+
+  it('root inside_start prepends and inside_end appends on a NON-empty doc', () => {
+    const doc = docNode([para('A'), para('B')])
+    expect(
+      topTexts(
+        applyIncrementalOps(
+          doc,
+          [{ type: 'insert', at: { path: [], position: 'inside_start' }, content: [para('head')] }],
+          schema,
+        ),
+      ),
+    ).toEqual(['head', 'A', 'B'])
+    expect(
+      topTexts(
+        applyIncrementalOps(
+          doc,
+          [{ type: 'insert', at: { path: [], position: 'inside_end' }, content: [para('tail')] }],
+          schema,
+        ),
+      ),
+    ).toEqual(['A', 'B', 'tail'])
+  })
+
+  it('root before / after (path []) is rejected — only inside_start/end address the root', () => {
+    const empty = PMNode.fromJSON(schema, { type: 'doc' } as Parameters<typeof PMNode.fromJSON>[1])
+    for (const position of ['before', 'after'] as const) {
+      expect(() =>
+        applyIncrementalOps(
+          empty,
+          [{ type: 'insert', at: { path: [], position }, content: [para('x')] }],
+          schema,
+        ),
+      ).toThrow(AnchorNotFoundError)
+    }
+  })
+
+  it('two root inserts at the same position (path []) → InvalidOpsError (duplicate anchor)', () => {
+    const empty = PMNode.fromJSON(schema, { type: 'doc' } as Parameters<typeof PMNode.fromJSON>[1])
+    const ops: DocEditOp[] = [
+      { type: 'insert', at: { path: [], position: 'inside_start' }, content: [para('X')] },
+      { type: 'insert', at: { path: [], position: 'inside_start' }, content: [para('Y')] },
+    ]
+    expect(() => applyIncrementalOps(empty, ops, schema)).toThrow(InvalidOpsError)
+  })
 })
+
 
 describe('applyIncrementalOps — replace / delete', () => {
   it('replace a single block swaps exactly that block', () => {

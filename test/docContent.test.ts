@@ -76,6 +76,18 @@ function liveView(content: unknown[]) {
   }
 }
 
+/** A live-read view of an EMPTY document (GET returns `{type:'doc'}`, baseVersion AA==). */
+function emptyLiveView() {
+  const doc = new Y.Doc()
+  doc.get(COLLAB_FIELD, Y.XmlFragment) // materialise the (empty) collab fragment
+  return {
+    pmDoc: PMNode.fromJSON(schema, yDocToProsemirrorJSON(doc, COLLAB_FIELD) as Parameters<typeof PMNode.fromJSON>[1]),
+    baseSV: Y.encodeStateVector(doc),
+    preEditState: Y.encodeStateAsUpdate(doc),
+  }
+}
+
+
 /** transaction() mock routing SQL to a metaRow; role recheck spied separately. */
 function mockTx(metaRow: { owner_id: string; permission_epoch: number; status: number } | null) {
   vi.mocked(transaction).mockImplementation(async (fn: never) => {
@@ -448,3 +460,97 @@ describe('PATCH /content — attachment reference validation', () => {
     vi.mocked(docVersionRepo.createTx).mockRestore()
   })
 })
+
+// ── XIN-574 empty-document / root-container first-block insert ──────────────────
+describe('PATCH /content — empty-document first-block insert (root path [])', () => {
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(writerGuard))
+
+  it('insert inside_start at root of an empty doc writes the first block and commits (200)', async () => {
+    const view = emptyLiveView()
+    vi.mocked(readLiveForEdit).mockResolvedValue(view)
+    vi.mocked(commitLiveEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 42 })
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(7)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': `"${encodeBaseVersion(view.baseSV)}"` },
+          body: { ops: [{ type: 'insert', at: { path: [], position: 'inside_start' }, content: [para('first')] }] },
+        },
+      ),
+      res as never,
+    )
+
+    expect(res.statusCode).toBe(200)
+    // The op reached the live commit (shape + pre-flight both accepted the root insert).
+    expect(commitLiveEdit).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(commitLiveEdit).mock.calls[0]![3]).toEqual([
+      { type: 'insert', at: { path: [], position: 'inside_start' }, content: [para('first')] },
+    ])
+    // A safety snapshot of the pre-edit (empty) state was still recorded.
+    expect(createSpy).toHaveBeenCalledTimes(1)
+    createSpy.mockRestore()
+  })
+
+  it('insert inside_end at root of an empty doc also commits (200)', async () => {
+    const view = emptyLiveView()
+    vi.mocked(readLiveForEdit).mockResolvedValue(view)
+    vi.mocked(commitLiveEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 42 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(8)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': `"${encodeBaseVersion(view.baseSV)}"` },
+          body: { ops: [{ type: 'insert', at: { path: [], position: 'inside_end' }, content: [para('only')] }] },
+        },
+      ),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(commitLiveEdit).toHaveBeenCalledTimes(1)
+    vi.mocked(docVersionRepo.createTx).mockRestore()
+  })
+
+  it('insert before/after at root (path []) is a 400 invalid_body — never reaches the live read', async () => {
+    for (const position of ['before', 'after']) {
+      const res = mockRes()
+      await patchDocContentHandler(
+        req(
+          { docId: 'd_1' },
+          {
+            headers: { 'if-match': '"AA=="' },
+            body: { ops: [{ type: 'insert', at: { path: [], position }, content: [para('x')] }] },
+          },
+        ),
+        res as never,
+      )
+      expect(res.statusCode).toBe(400)
+      expect((res.body as { error: string }).error).toBe('invalid_body')
+    }
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+
+  it('replace/delete against root (path []) stays a 400 invalid_body', async () => {
+    for (const op of [
+      { type: 'replace', range: { from: { path: [] }, to: { path: [] } }, content: [para('x')] },
+      { type: 'delete', range: { from: { path: [] }, to: { path: [] } } },
+    ]) {
+      const res = mockRes()
+      await patchDocContentHandler(
+        req({ docId: 'd_1' }, { headers: { 'if-match': '"AA=="' }, body: { ops: [op] } }),
+        res as never,
+      )
+      expect(res.statusCode).toBe(400)
+      expect((res.body as { error: string }).error).toBe('invalid_body')
+    }
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+})
+

@@ -284,10 +284,29 @@ export function applyIncrementalOps(currentDoc: PMNode, ops: DocEditOp[], schema
   for (const op of ops) {
     if (op.type === 'insert') {
       if (!op.at || !Array.isArray(op.at.path)) throw new InvalidOpsError('insert requires at.path')
-      const anchor = resolveBlockPath(currentDoc, op.at.path)
-      checkExpect(anchor.node, op.expect)
+      let pos: number
+      let node: PMNode
+      if (op.at.path.length === 0) {
+        // Root-container insert: the empty path addresses the doc root itself.
+        // Legal ONLY for inside_start / inside_end (insert as the doc's first /
+        // last child) — this is the sole way to write the first block into an
+        // empty document, where there is no existing child to anchor a
+        // before/after against. before/after against the root have no
+        // meaningful sibling position and stay rejected (AnchorNotFoundError).
+        if (op.at.position !== 'inside_start' && op.at.position !== 'inside_end') {
+          throw new AnchorNotFoundError('root anchor supports only inside_start/inside_end')
+        }
+        node = currentDoc
+        // Doc content spans [0, currentDoc.content.size]; inside_start prepends
+        // at 0, inside_end appends at content.size (both == 0 for an empty doc).
+        pos = op.at.position === 'inside_start' ? 0 : currentDoc.content.size
+      } else {
+        const anchor = resolveBlockPath(currentDoc, op.at.path)
+        node = anchor.node
+        pos = insertionPos(anchor, op.at.position)
+      }
+      checkExpect(node, op.expect)
       const nodes = parseContent(op.content, schema)
-      const pos = insertionPos(anchor, op.at.position)
       resolved.push({
         kind: 'insert',
         sortPos: pos,
