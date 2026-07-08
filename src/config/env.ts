@@ -319,6 +319,30 @@ export const config = {
     maxPathDepth: num('DOC_BODY_EDIT_MAX_PATH_DEPTH', 32),
   },
 
+  // Typst-based PDF export. The document's persisted state is rendered to Typst
+  // source (renderTypst.ts) and compiled to PDF by spawning the standalone
+  // `typst` binary (typstService.ts). No resident process; each compile is a
+  // short-lived sandboxed child. These bounds cap concurrency, queueing, compile
+  // time and per-image download size.
+  typstExport: {
+    // Path to the `typst` binary; empty => resolved from PATH.
+    binaryPath: str('TYPST_EXPORT_BINARY', ''),
+    // Max concurrent typst compiles; the rest queue.
+    maxConcurrent: num('TYPST_EXPORT_MAX_CONCURRENT', 2),
+    // Max compiles allowed to WAIT; over this the route returns 503.
+    maxQueue: num('TYPST_EXPORT_MAX_QUEUE', 10),
+    // Hard per-compile timeout; on expiry the child process is killed.
+    compileTimeoutMs: num('TYPST_EXPORT_COMPILE_TIMEOUT_MS', 20_000),
+    // Max image bytes downloaded per attachment for embedding (DoS bound).
+    maxImageBytes: num('TYPST_EXPORT_MAX_IMAGE_BYTES', 10 * 1024 * 1024),
+    // Max number of images embedded in one export (count bound). Prevents a doc
+    // with many image attachments from forcing count x maxImageBytes downloads.
+    maxImageCount: num('TYPST_EXPORT_MAX_IMAGE_COUNT', 50),
+    // Aggregate byte budget across all embedded images in one export. Once the
+    // running total would exceed this, remaining images are dropped.
+    maxImageTotalBytes: num('TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
+  },
+
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
   // + unload flush). Shipped behind a default-OFF gate (gray release); when
