@@ -53,5 +53,10 @@ export async function verifyBotMiddleware(
   // This is NOT req.octoToken: the bot path has no caller session token, and the
   // bot realm (authBot) is separate from the human session/service-token realm.
   req.botToken = token
+  // Surface the bot's human owner (robot.creator_uid) when octo-server resolved
+  // one. The doc-create path uses it to auto-grant that owner admin so the bot's
+  // human owner can access docs the bot creates. Absent for a bot with no human
+  // creator (e.g. a platform bot), in which case the grant is skipped.
+  req.botOwnerUid = identity.ownerUid
   next()
 }

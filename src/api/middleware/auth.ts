@@ -20,6 +20,11 @@ declare global {
       // to authenticate bot-realm octo-server lookups (the anti ghost-member
       // existence check in members/forwardGrant). Never set on the human path.
       botToken?: string
+      // Set only on the bot mount (verifyBot): the uid of the human who owns the
+      // bot (robot.creator_uid, from the verify-bot reverse lookup). Absent for a
+      // bot with no human creator. Used by the doc-create path to auto-grant the
+      // owner admin so the bot's human owner can see docs the bot creates.
+      botOwnerUid?: string
     }
   }
 }

@@ -19,7 +19,7 @@ afterEach(() => {
 })
 
 describe('HttpOctoIdentity.verifyBot — /v1/auth/verify-bot', () => {
-  it('posts the bot token and maps bot_uid/space_id to uid/spaceId', async () => {
+  it('posts the bot token and maps bot_uid/space_id/owner_uid to uid/spaceId/ownerUid', async () => {
     const fetchMock = vi.fn(async () =>
       botResponse({ bot_uid: 'bot_9', bot_name: 'Helper', owner_uid: 'u_owner', space_id: 's_42' }),
     )
@@ -28,12 +28,32 @@ describe('HttpOctoIdentity.verifyBot — /v1/auth/verify-bot', () => {
     const identity = new HttpOctoIdentity('http://octo.test')
     const result = await identity.verifyBot('bot-bearer-token')
 
-    expect(result).toEqual({ uid: 'bot_9', spaceId: 's_42' })
+    expect(result).toEqual({ uid: 'bot_9', spaceId: 's_42', ownerUid: 'u_owner' })
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [url, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit]
     expect(url).toBe('http://octo.test/v1/auth/verify-bot')
     expect(init.method).toBe('POST')
     expect(JSON.parse(init.body as string)).toEqual({ bot_token: 'bot-bearer-token' })
+  })
+
+  it('omits ownerUid when the bot has no human creator (owner_uid empty)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => botResponse({ bot_uid: 'bot_9', owner_uid: '', space_id: 's_42' })),
+    )
+    const identity = new HttpOctoIdentity('http://octo.test')
+    // A platform bot with no human owner: owner_uid comes back '' and must not
+    // surface as an ownerUid key (the doc-create grant is then skipped).
+    expect(await identity.verifyBot('t')).toEqual({ uid: 'bot_9', spaceId: 's_42' })
+  })
+
+  it('omits ownerUid when the response has no owner_uid field', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => botResponse({ bot_uid: 'bot_9', space_id: 's_42' })),
+    )
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.verifyBot('t')).toEqual({ uid: 'bot_9', spaceId: 's_42' })
   })
 
   it('returns null when octo-server reverse-resolves no space (spaceless bot must not be authorized)', async () => {

@@ -300,6 +300,25 @@ export const config = {
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
 
+  // Bot incremental doc-body edit request-shape bounds (PATCH /:docId/content).
+  // These fail fast at the route shape gate, BEFORE the no-lock op resolution +
+  // PMNode.fromJSON + Y.Doc hydration in editDocBody, so an oversized batch is
+  // rejected without spending that CPU/memory. The global express.json 1mb cap
+  // and the post-apply maxDocBytes gate remain; these close the gap in between.
+  docBodyEdit: {
+    // Upper bound on ops per PATCH batch. Well above any realistic single edit
+    // (a document restructure touches a handful of blocks), low enough that a
+    // scripted bot cannot fan out unbounded resolution work under the 1mb cap.
+    maxOps: num('DOC_BODY_EDIT_MAX_OPS', 500),
+    // Upper bound on a single op's serialized `content` payload. Keeps one op
+    // from carrying most of the 1mb body as nodes that must each be parsed.
+    maxOpContentBytes: num('DOC_BODY_EDIT_MAX_OP_CONTENT_BYTES', 256 * 1024),
+    // Upper bound on a block-path length. Real ProseMirror nesting (doc > list >
+    // listItem > paragraph > ...) stays in single digits; 32 is generous while
+    // capping the per-index descent work resolveBlockPath does per anchor.
+    maxPathDepth: num('DOC_BODY_EDIT_MAX_PATH_DEPTH', 32),
+  },
+
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
   // + unload flush). Shipped behind a default-OFF gate (gray release); when

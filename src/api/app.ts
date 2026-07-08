@@ -31,6 +31,7 @@ import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
+import { docContentRouter } from './routes/docContent.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
   const app = express()
@@ -75,6 +76,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   api.use(linkCardRouter) // /:docId/link-card (OG fetch, §3.5 ⑰)
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
+  api.use(docContentRouter) // /:docId/content (bot incremental body edit + live read)
 
   app.use('/api/v1/docs', api)
 
@@ -100,13 +102,27 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   botApi.use(linkCardRouter)
   botApi.use(commentsRouter)
   botApi.use(versionsRouter)
+  botApi.use(docContentRouter)
   app.use('/v1/bot/docs', botApi)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return
+    // Body-parser (express.json) failures arrive here as typed errors. Map them
+    // to their contract codes instead of letting them bubble to a 500 (defect ③):
+    //   - malformed JSON body  -> 400 invalid_body
+    //   - body over the size limit -> 413 doc_too_large
+    const type = (err as { type?: unknown }).type
+    if (type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'invalid_body' })
+      return
+    }
+    if (type === 'entity.too.large') {
+      res.status(413).json({ error: 'doc_too_large' })
+      return
+    }
     // eslint-disable-next-line no-console
     console.error('REST error:', err)
-    if (res.headersSent) return
     res.status(500).json({ error: 'internal_error' })
   })
 
