@@ -71,7 +71,7 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |
-| `OCTO_SERVER_TOKEN` | service token for octo-server lookups. Optional on the human path; **required on the bot path** (`/v1/bot/docs`) for the anti ghost-member existence check | §4.7 / v4.3 bot API |
+| `OCTO_SERVER_TOKEN` | service token for octo-server lookups on the human path (optional). The bot path (`/v1/bot/docs`) resolves the anti ghost-member existence check via the bot's own token against the bot user-info route, so this service token is no longer required for bot member-add or forward-grant | §4.7 / v4.3 bot API |
 | `MAX_DOC_BYTES` | single-doc size hard cap (~10MB) | §9.5 |
 | `ATTACHMENT_BUCKET` | object-storage bucket (presign stub) | §3.5 |
 
