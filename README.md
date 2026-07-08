@@ -54,6 +54,8 @@ Key design invariants (from the contract):
 - **Node.js ≥ 20** (developed on v22), npm.
 - **MySQL 8** (authoritative store).
 - **Redis 5+** (pub/sub broadcast bus, epoch cache, connection registry).
+- **`typst` binary** (only for PDF export) — a single static Rust binary; see
+  [PDF export (Typst)](#pdf-export-typst).
 
 MySQL and Redis are only needed to **run the server** and for integration
 flows. The **unit test suite runs fully offline** (mocks / in-memory).
@@ -74,6 +76,10 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | `OCTO_SERVER_TOKEN` | service token for octo-server lookups on the human path (optional). The bot path (`/v1/bot/docs`) resolves the anti ghost-member existence check via the bot's own token against the bot user-info route, so this service token is no longer required for bot member-add or forward-grant | §4.7 / v4.3 bot API |
 | `MAX_DOC_BYTES` | single-doc size hard cap (~10MB) | §9.5 |
 | `ATTACHMENT_BUCKET` | object-storage bucket (presign stub) | §3.5 |
+| `TYPST_EXPORT_BINARY` | path to the `typst` binary (empty ⇒ resolved from `PATH`) | PDF export |
+| `TYPST_EXPORT_MAX_CONCURRENT` / `TYPST_EXPORT_MAX_QUEUE` | compile concurrency + queue bound (over queue ⇒ 503) | PDF export |
+| `TYPST_EXPORT_COMPILE_TIMEOUT_MS` | hard per-compile timeout (child killed on expiry) | PDF export |
+| `TYPST_EXPORT_MAX_IMAGE_BYTES` | per-attachment image download cap for embedding | PDF export |
 
 ---
 
@@ -102,6 +108,51 @@ npm run dev
 npm run build
 npm start
 ```
+
+## PDF export (Typst)
+
+Documents are exported to PDF server-side by rendering the persisted document to
+[Typst](https://typst.app) source and compiling it with the standalone `typst`
+binary:
+
+```
+POST /api/v1/docs/:docId/export/pdf   (reader role)  →  application/pdf
+```
+
+The request pipeline is: authorise (reader) → load the authoritative persisted
+Y.Doc → convert to ProseMirror JSON → render to Typst source (`src/export/
+renderTypst.ts`) → compile with a short-lived `typst` child process
+(`src/export/typstService.ts`). Typst has **no resident process** and **no
+network access** at compile time, so image bytes are pre-downloaded
+(size-bounded) into a per-compile sandbox root that `typst --root` cannot escape.
+
+### Installing the `typst` binary
+
+Typst is a single static Rust binary (~30MB) with no browser or LaTeX
+dependency. Install it on the machine that runs this backend:
+
+```bash
+# macOS
+brew install typst
+
+# Linux (musl static release; pick your arch)
+curl -fsSL https://github.com/typst/typst/releases/download/v0.13.1/typst-x86_64-unknown-linux-musl.tar.xz \
+  | tar -xJ -C /tmp \
+  && sudo install -m 0755 /tmp/typst-x86_64-unknown-linux-musl/typst /usr/local/bin/typst
+
+typst --version   # verify
+```
+
+The bundled `Dockerfile` already installs the pinned `typst` binary plus the
+Noto CJK and emoji fonts. If you run the backend **outside** the image (e.g.
+directly on a host), install `typst` as above and make sure the host has CJK and
+emoji fonts (`Noto Sans CJK` / `Noto Color Emoji`, or the platform equivalents
+like PingFang / Apple Color Emoji on macOS) — Typst resolves fonts from the
+system font book, so glyph coverage follows the host's installed fonts.
+
+Set `TYPST_EXPORT_BINARY` if the binary is not on `PATH`; tune
+`TYPST_EXPORT_MAX_CONCURRENT` / `TYPST_EXPORT_MAX_QUEUE` /
+`TYPST_EXPORT_COMPILE_TIMEOUT_MS` / `TYPST_EXPORT_MAX_IMAGE_BYTES` as needed.
 
 ## Tests
 
