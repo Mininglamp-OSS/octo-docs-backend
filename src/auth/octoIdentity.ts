@@ -27,14 +27,17 @@ export interface OctoIdentity {
   verifyToken(token: string): Promise<{ uid: string; name?: string } | null>
 
   /**
-   * (a-bot) Resolve a bot bearer token to its trusted bot uid and the bot's
-   * space. Calls octo-server's already-existing POST /v1/auth/verify-bot, which
-   * validates the token against the `robot` table and server-side reverse-looks-up
-   * the bot's space from its most recent active `space_member` row. The space is
-   * therefore never client-supplied (anti-spoof). Returns null when the token is
-   * missing/invalid (caller => 401 / unauthorized).
+   * (a-bot) Resolve a bot bearer token to its trusted bot uid, the bot's space,
+   * and — when the bot has a human creator — that creator's uid. Calls
+   * octo-server's already-existing POST /v1/auth/verify-bot, which validates the
+   * token against the `robot` table, reverse-looks-up the bot's space from its
+   * most recent active `space_member` row, and returns `owner_uid` (the bot's
+   * `robot.creator_uid`). The space is therefore never client-supplied
+   * (anti-spoof). `ownerUid` is omitted when the bot has no human creator (e.g. a
+   * platform bot). Returns null when the token is missing/invalid (caller => 401 /
+   * unauthorized).
    */
-  verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null>
+  verifyBot(token: string): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null>
 
   /**
    * (b) Look up a single user by uid. Returns null if the user does not exist
@@ -94,7 +97,7 @@ export class HttpOctoIdentity implements OctoIdentity {
     return { uid: body.uid, name: body.name }
   }
 
-  async verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null> {
+  async verifyBot(token: string): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null> {
     if (!token) return null
     let res: Response
     try {
@@ -109,7 +112,7 @@ export class HttpOctoIdentity implements OctoIdentity {
     }
     if (!res.ok) return null
     const body = (await res.json().catch(() => null)) as
-      | { bot_uid?: string; space_id?: string }
+      | { bot_uid?: string; space_id?: string; owner_uid?: string }
       | null
     if (!body || typeof body.bot_uid !== 'string' || body.bot_uid === '') return null
     // The space is whatever octo-server reverse-resolved from the bot's active
@@ -124,7 +127,13 @@ export class HttpOctoIdentity implements OctoIdentity {
     // null check, with no per-middleware special case, and keeps the invariant
     // "a verified bot identity always carries a real space" in one place.
     if (typeof body.space_id !== 'string' || body.space_id === '') return null
-    return { uid: body.bot_uid, spaceId: body.space_id }
+    // owner_uid is the bot's robot.creator_uid (the human who owns the bot).
+    // octo-server returns '' for a bot with no human creator (e.g. a platform
+    // bot); surface it only when it is a real uid so callers can skip the
+    // owner-grant step cleanly.
+    const ownerUid =
+      typeof body.owner_uid === 'string' && body.owner_uid !== '' ? body.owner_uid : undefined
+    return { uid: body.bot_uid, spaceId: body.space_id, ...(ownerUid ? { ownerUid } : {}) }
   }
 
   async getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
@@ -206,7 +215,7 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
     return this.delegate.getUserAsBot(uid, botToken)
   }
 
-  verifyBot(token: string): Promise<{ uid: string; spaceId: string } | null> {
+  verifyBot(token: string): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null> {
     return this.delegate.verifyBot(token)
   }
 

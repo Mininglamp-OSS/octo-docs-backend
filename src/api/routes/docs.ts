@@ -4,8 +4,10 @@
  */
 import { Router, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
-import { refreshAndPublish } from '../../permission/epoch.js'
+import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
+import { ROLE_ADMIN } from '../../permission/role.js'
 import { newDocId } from '../../util/ids.js'
 import { requireDocRole } from '../guard.js'
 
@@ -50,6 +52,27 @@ docsRouter.post('/', async (req: Request, res: Response) => {
     docType: typeof docType === 'string' && docType !== '' ? docType : 'doc',
     createdBy: uid,
   })
+  // Bot path only: the doc owner is the bot itself (ownerId = bot uid), so the
+  // bot's human owner would otherwise have no membership and could not see the
+  // doc. Auto-grant that human owner admin. req.botOwnerUid is set solely by
+  // verifyBot (from octo-server's robot.creator_uid reverse lookup) and only when
+  // a real human creator exists — it is never set on the human mount, so this
+  // block is a no-op there. Skip when the owner is the bot itself (no distinct
+  // human owner, e.g. a platform bot) to avoid a redundant self-membership row.
+  // This is purely additive: the doc's owner field and the bot's own access are
+  // unchanged (§4.2 owner is implicit admin); the human owner is added on top.
+  const botOwnerUid = req.botOwnerUid
+  if (botOwnerUid && botOwnerUid !== uid) {
+    await docMemberRepo.upsertDirect({
+      docId,
+      uid: botOwnerUid,
+      roleNum: ROLE_ADMIN,
+      grantedBy: uid,
+    })
+    // Mirror the PUT /members mutation: a doc_member change bumps the epoch and
+    // broadcasts the invalidation (§4.5) so any listener recomputes access.
+    await bumpEpoch(docId, documentName, botOwnerUid)
+  }
   const meta = await docMetaRepo.getByDocId(docId)
   res.status(201).json({
     docId,
