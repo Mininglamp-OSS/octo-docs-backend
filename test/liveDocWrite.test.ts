@@ -103,4 +103,39 @@ describe('commitLiveEdit — guarded write', () => {
     await commitLiveEdit('doc:1', 'u_1', first.newSV, ops2, schema)
     expect(topTexts(h.liveDoc)).toEqual(['A', 'X', 'B', 'Y'])
   })
+
+  // ── defect ②: a delete-only edit must still advance the base version ──────────
+  it('§②: a delete-only edit advances the base version (state vector moves)', async () => {
+    const before = Y.encodeStateVector(h.liveDoc)
+    const del: DocEditOp[] = [{ type: 'delete', range: { from: { path: [0] }, to: { path: [0] } } }]
+    const { newSV } = await commitLiveEdit('doc:1', 'u_1', before, del, schema)
+    expect(topTexts(h.liveDoc)).toEqual(['B']) // content really changed
+    // Without the version bump a delete-only reconcile leaves the SV byte-identical.
+    expect(newSV).not.toEqual(before)
+  })
+
+  it('§②: reusing the pre-delete base version after a delete-only edit is a stale write (412)', async () => {
+    const preDelete = Y.encodeStateVector(h.liveDoc)
+    await commitLiveEdit('doc:1', 'u_1', preDelete, [
+      { type: 'delete', range: { from: { path: [0] }, to: { path: [0] } } },
+    ], schema)
+
+    // The client reuses its now-stale pre-delete token for a follow-up write.
+    const insert: DocEditOp[] = [{ type: 'insert', at: { path: [0], position: 'after' }, content: [para('X')] }]
+    await expect(commitLiveEdit('doc:1', 'u_1', preDelete, insert, schema)).rejects.toBeInstanceOf(
+      BaseVersionStaleError,
+    )
+    // Rejected before mutation: still just ['B'] from the delete above.
+    expect(topTexts(h.liveDoc)).toEqual(['B'])
+  })
+
+  it('§②: the edit-version counter stays out of the ProseMirror body', async () => {
+    await commitLiveEdit('doc:1', 'u_1', Y.encodeStateVector(h.liveDoc), [
+      { type: 'delete', range: { from: { path: [0] }, to: { path: [0] } } },
+    ], schema)
+    // GET content reads only COLLAB_FIELD — the bump lives in a separate Y field.
+    const json = yDocToProsemirrorJSON(h.liveDoc, COLLAB_FIELD) as { type: string }
+    expect(json.type).toBe('doc')
+    expect(topTexts(h.liveDoc)).toEqual(['B'])
+  })
 })

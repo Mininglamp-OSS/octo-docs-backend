@@ -32,6 +32,34 @@ import {
 } from './docBodyEdit.js'
 
 /**
+ * Doc-private field holding the monotonic edit-version counter (defect ②). It is
+ * a top-level Y.Map, deliberately NOT the ProseMirror COLLAB_FIELD fragment, so
+ * it never appears in GET content, conversion, or version restore (all of which
+ * read only COLLAB_FIELD).
+ */
+export const EDIT_VERSION_FIELD = '__editVersion'
+
+/**
+ * Advance the doc's edit-version counter so EVERY committed edit moves the state
+ * vector forward — including a delete-only edit (defect ②).
+ *
+ * A pure delete records only tombstones, and Y.encodeStateVector tracks each
+ * client's *insert* clock, not deletions, so a delete-only reconcile leaves the
+ * state vector byte-identical. The baseVersion token is that state vector, so
+ * without this the token was unchanged after a delete and a client could reuse
+ * its pre-delete token to slip a stale write past the optimistic-concurrency
+ * guard (delete then insert with the old token both returned 200). Incrementing
+ * a counter integrates one new struct on the acting doc's clock, so the state
+ * vector advances on insert, replace, AND delete-only alike; the old token then
+ * fails the guard with 412. Clocks only grow, so the marker is GC-stable.
+ */
+function advanceEditVersion(doc: Y.Doc): void {
+  const meta = doc.getMap(EDIT_VERSION_FIELD)
+  const current = meta.get('n')
+  meta.set('n', (typeof current === 'number' ? current : 0) + 1)
+}
+
+/**
  * Read the live document for editing: its ProseMirror doc, the base state vector
  * the pre-flight compares the client token against, and the raw pre-edit state
  * (the size-gate hydration source and the safety-snapshot bytes). Read-only —
@@ -99,8 +127,11 @@ export async function commitLiveEdit(
       )
       // (3) Resolve anchors + apply ops (still pre-mutation; throws map to 4xx).
       const newDoc = applyIncrementalOps(currentDoc, ops, schema)
-      // (4) The single, last mutation.
+      // (4) The single, last content mutation.
       reconcileFragment(newDoc, fragment)
+      // (5) Advance the edit-version counter so a delete-only edit also moves the
+      //     state vector forward (defect ②); the token is read AFTER this bump.
+      advanceEditVersion(doc)
       newSV = Y.encodeStateVector(doc)
       bytes = Y.encodeStateAsUpdate(doc).length
     })

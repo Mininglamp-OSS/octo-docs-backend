@@ -107,9 +107,22 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return
+    // Body-parser (express.json) failures arrive here as typed errors. Map them
+    // to their contract codes instead of letting them bubble to a 500 (defect ③):
+    //   - malformed JSON body  -> 400 invalid_body
+    //   - body over the size limit -> 413 doc_too_large
+    const type = (err as { type?: unknown }).type
+    if (type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'invalid_body' })
+      return
+    }
+    if (type === 'entity.too.large') {
+      res.status(413).json({ error: 'doc_too_large' })
+      return
+    }
     // eslint-disable-next-line no-console
     console.error('REST error:', err)
-    if (res.headersSent) return
     res.status(500).json({ error: 'internal_error' })
   })
 
