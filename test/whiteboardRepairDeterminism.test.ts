@@ -95,11 +95,15 @@ describe('BE-M11 repair write-back determinism', () => {
     }
   })
 
-  it('produces the same surviving element set (drops bad-type + dangling-image)', () => {
+  it('produces the same surviving element set (drops bad-type, KEEPS split-insert dangling-image)', () => {
     const doc = decode(results[0].state)
     const ids = [...readElements(doc).keys()].sort()
     doc.destroy()
-    expect(ids).toEqual(['e_a', 'e_m', 'e_txt', 'e_z', 'img_ok'])
+    // e_bad (unknown type) is dropped. img_dangling (image whose file is absent)
+    // is now KEPT (XIN-604 P0): a cold-start snapshot may be mid split-insert, so
+    // absence is not delete evidence. It gets a deterministic synthetic index and
+    // survives on every node identically.
+    expect(ids).toEqual(['e_a', 'e_m', 'e_txt', 'e_z', 'img_dangling', 'img_ok'])
   })
 
   it('clears the dangling containerId (M-5) byte-identically across instances', () => {

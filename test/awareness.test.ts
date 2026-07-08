@@ -128,13 +128,13 @@ describe('awareness avatar sanitization (P2 XSS guard, non-fatal)', () => {
     return { present: 'avatar' in u, value: u.avatar, name: u.name }
   }
 
-  it('preserves safe avatar references (http/https, protocol- & root-relative, raster data URI)', () => {
+  it('preserves safe avatar references (http/https, root-/dot-relative path, raster data URI)', () => {
     for (const safe of [
       'https://cdn.example.com/a.png',
       'http://example.com/a.jpg',
-      '//cdn.example.com/a.webp', // protocol-relative
-      '/avatars/user-1.png', // root-relative
-      'avatars/user-1.gif', // relative path
+      '/avatars/user-1.png', // root-relative path
+      './avatars/user-1.png', // current-dir-relative path
+      '../shared/avatars/user-1.png', // parent-relative path
       'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==',
     ]) {
       const r = keepAvatar(safe)
@@ -148,6 +148,22 @@ describe('awareness avatar sanitization (P2 XSS guard, non-fatal)', () => {
       const r = keepAvatar(bad)
       expect(r.present, bad).toBe(false) // dangerous value stripped
       expect(r.name, bad).toBe('Ada') // rest of presence survives
+    }
+  })
+
+  it('fail-closed: strips scheme-smuggling / protocol-relative / bare-relative avatars (XIN-604 P1)', () => {
+    // The char allowlist permits `%` and `/`, so before the fail-closed fix these
+    // fell into the scheme-less accept path. Each is now rejected; presence lives.
+    for (const bad of [
+      'javascript%3Aalert(1)', // percent-encoded scheme -> decodes to javascript:
+      'data%3Aimage/svg+xml;base64,PHN2Zz4=', // encoded scheme -> decodes to data:
+      '//cdn.example.com/a.webp', // protocol-relative URL: cross-origin fetch vector
+      '1javascript:alert(1)', // scheme with non-letter lead -> not a valid path either
+      'avatars/user-1.gif', // bare relative (no leading / ./ ..) -> ambiguous, rejected
+    ]) {
+      const r = keepAvatar(bad)
+      expect(r.present, bad).toBe(false) // stripped
+      expect(r.name, bad).toBe('Ada') // presence survives
     }
   })
 

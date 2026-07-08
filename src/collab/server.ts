@@ -58,12 +58,18 @@ const DATA_IMAGE_RE = /^data:image\/(png|jpe?g|gif|webp);/i
  * `avatar` is an optional, cosmetic field the v1 whiteboard binding publishes
  * alongside `{ id, name }`. It is echoed to every other peer and rendered there,
  * so an attacker-controlled value must never carry a script vector. Accept only:
- *   - http(s) URLs, protocol-relative (`//host/…`), or scheme-less relative /
- *     root-relative paths (a path can't execute), and
- *   - `data:image/{png,jpeg,gif,webp}` raster data URIs.
- * Reject `javascript:` / `vbscript:` / other schemes, `data:text/*` and
- * `data:image/svg+xml` (SVG can embed script), any value containing markup or
- * control characters, oversize strings, and non-strings. Never throws.
+ *   - http(s) URLs,
+ *   - `data:image/{png,jpeg,gif,webp}` raster data URIs, and
+ *   - scheme-less values that are unambiguously a relative / root-relative PATH
+ *     (`/…`, `./…`, `../…`) — a path can't execute.
+ * Everything else is rejected FAIL-CLOSED (XIN-604 P1): `javascript:` /
+ * `vbscript:` / other schemes, a scheme smuggled behind percent-encoding
+ * (`javascript%3Aalert(1)`), a protocol-relative URL (`//host/x` — a
+ * cross-origin fetch vector, not a path), a value that only looks scheme-less
+ * because its scheme lacks a leading letter (`1javascript:alert(1)`),
+ * `data:text/*`, `data:image/svg+xml` (SVG can embed script), any value
+ * containing markup or control characters, oversize strings, and non-strings.
+ * Never throws.
  */
 export function isSafeAvatar(v: unknown): v is string {
   if (typeof v !== 'string' || v.length === 0 || v.length > AVATAR_MAX_LEN) return false
@@ -71,17 +77,41 @@ export function isSafeAvatar(v: unknown): v is string {
   // chars, whitespace, quotes and angle brackets outright, so no raw markup or
   // smuggled control byte can slip through to a rendering peer.
   if (!/^[A-Za-z0-9\-._~:/?#@!$&*+,;=%()]+$/.test(v)) return false
-  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(v)
-  // A scheme-less value has no executable scheme, so it is accepted even when it
-  // contains `%` or `//` (e.g. `javascript%3Aalert(1)`, `//host/x`). This is
-  // safe ONLY under the invariant that avatar is rendered EXCLUSIVELY as an
-  // <img src> — a URL sink that treats such values as inert paths/hosts, never
-  // as executable script. Do not reuse this value in an href/CSS/HTML sink
-  // without re-validating against that context.
-  if (!scheme) return true // relative or protocol-relative — no scheme, no script
-  const s = (scheme[1] ?? '').toLowerCase()
-  if (s === 'http' || s === 'https') return true
-  if (s === 'data') return DATA_IMAGE_RE.test(v) // raster data URIs only
+
+  const schemeOf = (s: string): string | null => {
+    const m = /^([a-z][a-z0-9+.-]*):/i.exec(s)
+    return m ? (m[1] ?? '').toLowerCase() : null
+  }
+  const rawScheme = schemeOf(v)
+
+  // Fail-closed against percent-encoded scheme smuggling: the allowlist permits
+  // `%`, so `javascript%3Aalert(1)` carries NO bare colon and would otherwise
+  // reach the scheme-less path. If percent-decoding introduces a scheme the raw
+  // value did not have, a downstream sink that decodes before use would
+  // resurrect it — reject. A malformed percent sequence (decode throws) is
+  // itself unsafe → reject.
+  if (v.includes('%')) {
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(v)
+    } catch {
+      return false
+    }
+    if (rawScheme === null && schemeOf(decoded) !== null) return false
+  }
+
+  if (rawScheme === null) {
+    // Scheme-less: accept ONLY an unambiguous relative / root-relative path,
+    // which carries neither an executable scheme nor a cross-origin host. A
+    // leading `//` is a protocol-relative URL (cross-origin fetch vector), NOT a
+    // path — reject it. Bare `host/x`-style values and everything else are
+    // rejected fail-closed.
+    if (v.startsWith('//')) return false
+    return v.startsWith('/') || v.startsWith('./') || v.startsWith('../')
+  }
+
+  if (rawScheme === 'http' || rawScheme === 'https') return true
+  if (rawScheme === 'data') return DATA_IMAGE_RE.test(v) // raster data URIs only
   return false // javascript:, vbscript:, file:, data:text/*, data:image/svg+xml, …
 }
 

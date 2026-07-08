@@ -3,6 +3,8 @@ import * as Y from 'yjs'
 import {
   repairLiveDoc,
   attachWhiteboardRepair,
+  coldRepairLiveDoc,
+  repairWhiteboardState,
 } from '../src/whiteboard/repair.js'
 import { readElements, getFilesMap } from '../src/whiteboard/ydoc.js'
 import {
@@ -94,8 +96,8 @@ describe('repairLiveDoc — normalization + idempotence', () => {
   })
 })
 
-describe('repairLiveDoc — files (§2) dangling image drop + GC', () => {
-  it('drops an image with a dangling fileId and GCs unreferenced files', () => {
+describe('repairLiveDoc — files (§2) cold-start KEEP absence-tolerance (XIN-604 P0)', () => {
+  it('does NOT drop an absent-file image or GC an unreferenced file on cold-start', () => {
     const doc = buildDoc(
       {
         img1: { id: 'img1', type: 'image', version: 1, versionNonce: 1, index: 'a0', fileId: 'present' },
@@ -106,13 +108,16 @@ describe('repairLiveDoc — files (§2) dangling image drop + GC', () => {
         orphan: { attachId: 'orphan', mimeType: 'image/png' },
       },
     )
-    repairLiveDoc(doc)
-    const ids = [...readElements(doc).keys()]
+    repairLiveDoc(doc) // scope null -> 'coldStart' whole-board pass
+    const ids = [...readElements(doc).keys()].sort()
     expect(ids).toContain('img1') // file present -> kept
-    expect(ids).not.toContain('img2') // dangling fileId -> dropped
+    // 'gone' may be the not-yet-landed file half of a split-transaction insert;
+    // KEEP tolerates its absence exactly like the live 'none' pass (no drop).
+    expect(ids).toContain('img2')
     const fileIds = [...getFilesMap(doc).keys()].sort()
-    // 'present' still referenced by img1; 'orphan' + 'gone' (never existed) GC'd
-    expect(fileIds).toEqual(['present'])
+    // 'orphan' has no referencing image but is NOT GC'd — its image may be in
+    // flight; only a genuine file deletion is delete evidence.
+    expect(fileIds).toEqual(['orphan', 'present'])
   })
 })
 
@@ -329,5 +334,67 @@ describe('attachWhiteboardRepair — split-transaction image/file insert (P1-1)'
     doc.transact(() => doc.getMap(FILES_FIELD).delete('F'), 'user')
     expect([...readElements(doc).keys()]).not.toContain('img') // dropped — file gone
     dispose()
+  })
+})
+
+describe('cold-start split-insert data-loss KEEP (XIN-604 P0, RCA-specified)', () => {
+  // Cold-start / failover materializes a persisted snapshot that can be captured
+  // BETWEEN the two writes of a split-transaction image insert (the element and
+  // its `files` entry are separate Yjs transactions, and the large file half can
+  // miss the persistence debounce window). The pre-fix cold path read the
+  // half-snapshot as delete evidence and permanently dropped the image/file.
+  // KEEP extends the live 'none' absence-tolerance to cold-start.
+
+  const encode = (doc: Y.Doc) => Y.encodeStateAsUpdate(doc)
+
+  it('1. persisted image element with NO file survives coldRepairLiveDoc (not dropped)', () => {
+    const doc = buildDoc({
+      img: { id: 'img', type: 'image', version: 1, versionNonce: 7, index: 'a0', fileId: 'pending' },
+    }) // note: no `files` entry for 'pending' — its file half has not landed yet
+    coldRepairLiveDoc(doc)
+    const el = readElements(doc).get('img')
+    expect(el).toBeDefined() // KEEP: absent-file image is NOT dropped at cold-start
+    expect(el!.fileId).toBe('pending') // and its fileId reference is preserved
+  })
+
+  it('2. persisted file with NO referencing image survives cold-repair (not GC\'d)', () => {
+    const doc = buildDoc(
+      { other: clean('other', 'a0') },
+      { orphanFile: { attachId: 'orphanFile', mimeType: 'image/png' } },
+    ) // 'orphanFile' has no image referencing it — its image half is in flight
+    coldRepairLiveDoc(doc)
+    expect([...getFilesMap(doc).keys()]).toContain('orphanFile') // KEEP: not GC'd
+  })
+
+  it('3. a normal complete state still converges on cold-repair with no erroneous deletion', () => {
+    const doc = buildDoc(
+      {
+        rect: clean('rect', 'a0'),
+        img: { id: 'img', type: 'image', version: 1, versionNonce: 7, index: 'a1', fileId: 'F' },
+      },
+      { F: { attachId: 'F', mimeType: 'image/png' } },
+    )
+    const before = [...readElements(doc).keys()].sort()
+    const changed = coldRepairLiveDoc(doc)
+    expect(changed).toBe(false) // already-canonical complete state: no churn
+    expect([...readElements(doc).keys()].sort()).toEqual(before) // nothing deleted
+    expect([...getFilesMap(doc).keys()]).toEqual(['F']) // referenced file kept
+  })
+
+  it('4. BE-M11 determinism holds: re-repair of a KEPT absent-file image is a byte-identical no-op', () => {
+    // An illegal-but-image element whose file is absent must (a) survive and
+    // (b) converge: the gen-2 cold repair of the gen-1 output writes nothing and
+    // produces byte-identical bytes, so N failover nodes never diverge.
+    const seed = buildDoc({
+      img_absent: { id: 'img_absent', type: 'image', version: 0, versionNonce: 7, fileId: 'missing' },
+    })
+    const gen1 = repairWhiteboardState(encode(seed))
+    const gen2 = repairWhiteboardState(gen1.state)
+    expect(gen2.changed).toBe(false) // converged — no re-repair churn
+    expect(Buffer.from(gen2.state)).toEqual(Buffer.from(gen1.state)) // byte-identical
+    const doc = new Y.Doc()
+    Y.applyUpdate(doc, gen1.state)
+    expect([...readElements(doc).keys()]).toContain('img_absent') // KEPT through repair
+    doc.destroy()
   })
 })

@@ -72,10 +72,17 @@ interface RepairPlan {
  * flight. GC must therefore act only on POSITIVE DELETE EVIDENCE, never on
  * absence alone:
  *
- *   'coldStart'  — the whole persisted state is materialized at once (cold-start
- *                  / failover / whole-board pass): nothing is in flight, so an
- *                  absent-file image really is dangling and an unreferenced file
- *                  really is orphaned — drop / GC both. Deterministic (BE-M11).
+ *   'coldStart'  — a whole-board / failover materialization pass. It shares the
+ *                  'none' absence-tolerance (XIN-604 KEEP): a persisted snapshot
+ *                  can be captured BETWEEN the two writes of a split-transaction
+ *                  insert — the persistence debounce window closes after the
+ *                  small image element lands but before the large file half does
+ *                  (or vice versa) — so an absent-file image / unreferenced file
+ *                  read back at cold-start is NOT proof of a dangling reference.
+ *                  Never drop an image or GC a file on absence here; act only on
+ *                  the positive delete evidence of the Set policy. The plan stays
+ *                  a pure function of the loaded state, so this is still
+ *                  deterministic (BE-M11).
  *   'none'       — a live insert/update or element-deletion pass: never drop an
  *                  image for an absent file and never GC a file. An absent
  *                  counterpart may simply not have arrived yet.
@@ -113,8 +120,13 @@ function planRepair(
     const fid = el.fileId
     const absent = typeof fid !== 'string' || !fileIds.has(fid)
     if (!absent) return false
-    if (files === 'coldStart') return true
-    if (files === 'none') return false
+    // KEEP (XIN-604 P0): cold-start tolerates an absent file exactly like the
+    // live 'none' pass. The `files` entry for an image can land seconds after
+    // the element (the large file half of a split-transaction insert can miss
+    // the persistence debounce window), so a cold-start snapshot may be captured
+    // mid-insert. Dropping the image on mere absence there permanently destroyed
+    // it in the CRDT. Only a positive file-deletion Set is delete evidence.
+    if (files === 'coldStart' || files === 'none') return false
     return typeof fid === 'string' && files.has(fid) // just-deleted file only
   }
 
@@ -164,24 +176,16 @@ function planRepair(
     if (!objectEquals(current.get(id)!, final)) writes.set(id, final)
   }
 
-  // File GC: a file with no surviving image element referencing it is dangling.
-  // Only performed on a whole-board cold-start pass — never on a live insert
-  // pass (a file whose image is a pending split-transaction insert must survive)
-  // and never on a file-deletion pass (the removed files are already gone from
-  // the map; their images are dropped via dropAbsentImage). See FilePolicy.
+  // File GC: KEEP (XIN-604 P0). A file with no surviving image referencing it is
+  // NOT proof of an orphan — not even on a cold-start pass. The image half of a
+  // split-transaction insert may not have landed yet, or the persisted snapshot
+  // was debounce-truncated between the two writes, so GCing an "unreferenced"
+  // file here permanently dropped a live image's backing file. This mirrors the
+  // live 'none' absence-tolerance: never GC a file on absence. Files removed by a
+  // genuine deletion are already gone from the map (the Set FilePolicy drops
+  // their images via dropAbsentImage), so no absence-driven GC pass is needed
+  // anywhere — fileGc stays empty.
   const fileGc: string[] = []
-  if (files === 'coldStart') {
-    const referenced = new Set<string>()
-    for (const id of survivors) {
-      const el = current.get(id)!
-      if (FILE_BEARING_TYPES.has(el.type as string) && typeof el.fileId === 'string') {
-        referenced.add(el.fileId)
-      }
-    }
-    for (const fid of [...fileIds].sort()) {
-      if (!referenced.has(fid)) fileGc.push(fid)
-    }
-  }
 
   const drops = scope ? dropAll.filter((id) => scope.has(id)) : dropAll
   return { writes, drops: drops.sort(), fileGc }
@@ -238,12 +242,13 @@ function applyPlan(doc: Y.Doc, plan: RepairPlan): boolean {
 /**
  * Repair the live in-memory doc. `scope` limits normalization to the changed
  * element ids (gate 3); pass `null` to consider the whole board. `files` gates
- * file GC on positive delete evidence (P1-1); it defaults to `'coldStart'` for a
- * whole-board pass (scope === null: nothing in flight, GC is safe) and to
- * `'none'` for a scoped live pass (an absent counterpart may be a
- * split-transaction insert still in flight). The file-deletion path passes an
- * explicit set of just-removed fileIds. Returns true if a corrective transaction
- * was written.
+ * file-related deletion on positive delete evidence (P1-1); it defaults to
+ * `'coldStart'` for a whole-board pass and to `'none'` for a scoped live pass.
+ * Both tolerate absence identically (XIN-604 KEEP): neither drops an image nor
+ * GCs a file merely because its counterpart is missing, since a whole-board pass
+ * can read a snapshot captured mid split-transaction insert. Only the
+ * file-deletion path (an explicit set of just-removed fileIds) is delete
+ * evidence. Returns true if a corrective transaction was written.
  */
 export function repairLiveDoc(
   doc: Y.Doc,
