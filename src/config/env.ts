@@ -300,6 +300,24 @@ export const config = {
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
 
+  // Typst-based PDF export. The document's persisted state is rendered to Typst
+  // source (renderTypst.ts) and compiled to PDF by spawning the standalone
+  // `typst` binary (typstService.ts). No resident process; each compile is a
+  // short-lived sandboxed child. These bounds cap concurrency, queueing, compile
+  // time and per-image download size.
+  typstExport: {
+    // Path to the `typst` binary; empty => resolved from PATH.
+    binaryPath: str('TYPST_EXPORT_BINARY', ''),
+    // Max concurrent typst compiles; the rest queue.
+    maxConcurrent: num('TYPST_EXPORT_MAX_CONCURRENT', 2),
+    // Max compiles allowed to WAIT; over this the route returns 503.
+    maxQueue: num('TYPST_EXPORT_MAX_QUEUE', 10),
+    // Hard per-compile timeout; on expiry the child process is killed.
+    compileTimeoutMs: num('TYPST_EXPORT_COMPILE_TIMEOUT_MS', 20_000),
+    // Max image bytes downloaded per attachment for embedding (DoS bound).
+    maxImageBytes: num('TYPST_EXPORT_MAX_IMAGE_BYTES', 10 * 1024 * 1024),
+  },
+
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
   // + unload flush). Shipped behind a default-OFF gate (gray release); when

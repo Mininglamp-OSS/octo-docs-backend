@@ -31,6 +31,7 @@ import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
+import { exportRouter } from './routes/export.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
   const app = express()
@@ -75,6 +76,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   api.use(linkCardRouter) // /:docId/link-card (OG fetch, §3.5 ⑰)
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
+  api.use(exportRouter) // /:docId/export/pdf (server-side Typst render)
 
   app.use('/api/v1/docs', api)
 
