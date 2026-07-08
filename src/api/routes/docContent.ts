@@ -18,8 +18,33 @@ import { readLiveForEdit } from '../../collab/liveDocWrite.js'
 import { editDocBody } from '../services/editDocBody.js'
 import { encodeBaseVersion, parseBaseVersion, type DocEditOp } from '../../collab/docBodyEdit.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
+import { config } from '../../config/env.js'
 
 export const docContentRouter = Router()
+
+/**
+ * The only doc_type this rich-text body-edit surface accepts. board/whiteboard
+ * (and any future non-ProseMirror body type) store a different Y.Doc shape, so
+ * feeding them ProseMirror block-ops would GET silent-empty and PATCH corrupt
+ * the blob. Both handlers reject a non-'doc' target BEFORE any decode/mutate;
+ * the guard is defensive and self-contained so it holds regardless of the merge
+ * order with the whiteboard stack.
+ */
+const BODY_EDITABLE_DOC_TYPE = 'doc'
+
+/**
+ * Reject a target whose doc_type is not the rich-text body type. Writes a
+ * 409 unsupported_doc_type and returns false when blocked. Applied to both the
+ * read and write handlers so a board/whiteboard doc can neither be read as empty
+ * rich text nor mutated into a spurious ProseMirror fragment.
+ */
+function requireBodyEditableDocType(res: Response, docType: string): boolean {
+  if (docType !== BODY_EDITABLE_DOC_TYPE) {
+    res.status(409).json({ error: 'unsupported_doc_type' })
+    return false
+  }
+  return true
+}
 
 /** Extract the base-version token from the If-Match header or the body mirror. */
 function readBaseVersion(req: Request): string | null {
@@ -82,12 +107,48 @@ function validateOpsShape(ops: unknown): ops is DocEditOp[] {
   })
 }
 
+/** Every block path referenced by an op (insert anchor, range endpoints). */
+function opPaths(op: DocEditOp): number[][] {
+  if (op.type === 'insert') return [op.at.path]
+  return [op.range.from.path, op.range.to.path]
+}
+
+/**
+ * Request-shape bounds enforced BEFORE the no-lock op resolution (DoS gate).
+ * validateOpsShape only checks structure; this caps magnitude so a ≤1mb body
+ * cannot force unbounded resolve / PMNode.fromJSON / Y.Doc hydration work:
+ *   - op count            → 413 too_many_ops
+ *   - single op content   → 413 op_content_too_large
+ *   - block-path depth    → 400 path_too_deep
+ * Content byte-size is measured on the already-parsed (≤1mb) body, so the check
+ * itself is bounded. Returns the error to send, or null when within bounds.
+ */
+function checkOpsBounds(ops: DocEditOp[]): { status: number; error: string } | null {
+  if (ops.length > config.docBodyEdit.maxOps) {
+    return { status: 413, error: 'too_many_ops' }
+  }
+  for (const op of ops) {
+    for (const path of opPaths(op)) {
+      if (path.length > config.docBodyEdit.maxPathDepth) {
+        return { status: 400, error: 'path_too_deep' }
+      }
+    }
+    if (op.type === 'insert' || op.type === 'replace') {
+      if (Buffer.byteLength(JSON.stringify(op.content)) > config.docBodyEdit.maxOpContentBytes) {
+        return { status: 413, error: 'op_content_too_large' }
+      }
+    }
+  }
+  return null
+}
+
 // ── GET /:docId/content — read the live body (reader) ─────────────────────────
 docContentRouter.get('/:docId/content', getDocContentHandler)
 
 export async function getDocContentHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
+  if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 
   try {
     const { pmDoc, baseSV } = await readLiveForEdit(guard.meta.document_name)
@@ -108,6 +169,7 @@ docContentRouter.patch('/:docId/content', patchDocContentHandler)
 export async function patchDocContentHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
   if (!guard) return
+  if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 
   const baseVersionRaw = readBaseVersion(req)
   if (baseVersionRaw === null) {
@@ -117,6 +179,12 @@ export async function patchDocContentHandler(req: Request, res: Response): Promi
   const ops = (req.body ?? {}).ops
   if (!validateOpsShape(ops)) {
     res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+  // Fail-fast request-shape bounds (DoS gate) before any op resolution.
+  const bounds = checkOpsBounds(ops)
+  if (bounds) {
+    res.status(bounds.status).json({ error: bounds.error })
     return
   }
 

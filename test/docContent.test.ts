@@ -21,7 +21,7 @@ import { readLiveForEdit, commitLiveEdit } from '../src/collab/liveDocWrite.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../src/db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
-import { schema, encodeBaseVersion, parseBaseVersion } from '../src/collab/docBodyEdit.js'
+import { schema, encodeBaseVersion, parseBaseVersion, BaseVersionStaleError } from '../src/collab/docBodyEdit.js'
 import { config } from '../src/config/env.js'
 import { SCHEMA_VERSION } from '../src/schema/index.js'
 
@@ -54,7 +54,7 @@ function req(
 }
 
 const writerGuard = {
-  meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', permission_epoch: 7 },
+  meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', permission_epoch: 7 },
   role: 'writer',
 } as never
 
@@ -551,6 +551,209 @@ describe('PATCH /content — empty-document first-block insert (root path [])', 
       expect((res.body as { error: string }).error).toBe('invalid_body')
     }
     expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+})
+
+// ── XIN-580 blocker 1: doc_type gate (board/whiteboard rejected 409) ────────────
+describe('doc_type gate — only rich-text doc bodies are editable/readable', () => {
+  const boardGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'board', permission_epoch: 7 },
+    role: 'writer',
+  } as never
+
+  it('GET /content on a board doc → 409 unsupported_doc_type, never reads the live body', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const res = mockRes()
+    await getDocContentHandler(req({ docId: 'd_1' }), res as never)
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('unsupported_doc_type')
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+
+  it('PATCH /content on a board doc → 409 unsupported_doc_type, no snapshot, no live write', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': '"AA=="' },
+          body: { ops: [{ type: 'insert', at: { path: [0], position: 'after' }, content: [para('X')] }] },
+        },
+      ),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('unsupported_doc_type')
+    // Rejected before any decode / mutate.
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+    expect(createSpy).not.toHaveBeenCalled()
+    expect(commitLiveEdit).not.toHaveBeenCalled()
+    createSpy.mockRestore()
+  })
+
+  it('a whiteboard doc is rejected the same way (any non-doc type)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'whiteboard', permission_epoch: 7 },
+      role: 'writer',
+    } as never)
+    const res = mockRes()
+    await getDocContentHandler(req({ docId: 'd_1' }), res as never)
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('unsupported_doc_type')
+  })
+})
+
+// ── XIN-580 blocker 2: request-shape bounds (DoS gate, fail fast pre-resolve) ───
+describe('PATCH /content — request-shape bounds (DoS gate)', () => {
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(writerGuard))
+
+  const insertAt0 = (content: unknown[]) => ({ type: 'insert', at: { path: [0], position: 'after' }, content })
+
+  it('op count over the cap → 413 too_many_ops, never reaches the live read', async () => {
+    const ops = Array.from({ length: config.docBodyEdit.maxOps + 1 }, () => insertAt0([para('x')]))
+    const res = mockRes()
+    await patchDocContentHandler(
+      req({ docId: 'd_1' }, { headers: { 'if-match': '"AQ=="' }, body: { ops } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(413)
+    expect((res.body as { error: string }).error).toBe('too_many_ops')
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+
+  it('a single op whose content exceeds the per-op byte cap → 413 op_content_too_large', async () => {
+    const huge = 'a'.repeat(config.docBodyEdit.maxOpContentBytes + 1)
+    const res = mockRes()
+    await patchDocContentHandler(
+      req({ docId: 'd_1' }, { headers: { 'if-match': '"AQ=="' }, body: { ops: [insertAt0([para(huge)])] } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(413)
+    expect((res.body as { error: string }).error).toBe('op_content_too_large')
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+
+  it('a block path deeper than the depth cap → 400 path_too_deep', async () => {
+    const deepPath = Array.from({ length: config.docBodyEdit.maxPathDepth + 1 }, () => 0)
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': '"AQ=="' },
+          body: { ops: [{ type: 'insert', at: { path: deepPath, position: 'after' }, content: [para('x')] }] },
+        },
+      ),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('path_too_deep')
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+
+  it('a deep range endpoint (delete) is also caught → 400 path_too_deep', async () => {
+    const deepPath = Array.from({ length: config.docBodyEdit.maxPathDepth + 1 }, () => 0)
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': '"AQ=="' },
+          body: { ops: [{ type: 'delete', range: { from: { path: [0] }, to: { path: deepPath } } }] },
+        },
+      ),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('path_too_deep')
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+  })
+
+  it('a batch at the caps still passes the bounds gate and commits', async () => {
+    const view = liveView([para('A'), para('B')])
+    vi.mocked(readLiveForEdit).mockResolvedValue(view)
+    vi.mocked(commitLiveEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 60 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(120)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': `"${encodeBaseVersion(view.baseSV)}"` },
+          body: { ops: [insertAt0([para('within bounds')])] },
+        },
+      ),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(commitLiveEdit).toHaveBeenCalledTimes(1)
+    vi.mocked(docVersionRepo.createTx).mockRestore()
+  })
+})
+
+// ── XIN-580 blocker 3: no orphan safety marker when the live commit is rejected ─
+describe('PATCH /content — safety marker is compensated on a rejected live commit', () => {
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(writerGuard))
+
+  it('a 412 at the authoritative live guard deletes the just-written marker (no orphan)', async () => {
+    const view = liveView([para('A'), para('B')])
+    vi.mocked(readLiveForEdit).mockResolvedValue(view)
+    // Phase 2 writes the marker (id 555); phase 3 live commit then drifts → 412.
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(555)
+    const deleteSpy = vi.spyOn(docVersionRepo, 'deleteById').mockResolvedValue()
+    vi.mocked(commitLiveEdit).mockRejectedValue(new BaseVersionStaleError())
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': `"${encodeBaseVersion(view.baseSV)}"` },
+          body: { ops: [{ type: 'insert', at: { path: [0], position: 'after' }, content: [para('X')] }] },
+        },
+      ),
+      res as never,
+    )
+
+    expect(res.statusCode).toBe(412)
+    expect((res.body as { error: string }).error).toBe('base_version_stale')
+    // The marker was written, then compensated away — exactly, and by id.
+    expect(createSpy).toHaveBeenCalledTimes(1)
+    expect(deleteSpy).toHaveBeenCalledTimes(1)
+    expect(deleteSpy).toHaveBeenCalledWith(555)
+    createSpy.mockRestore()
+    deleteSpy.mockRestore()
+  })
+
+  it('a successful live commit keeps the marker (no compensating delete)', async () => {
+    const view = liveView([para('A'), para('B')])
+    vi.mocked(readLiveForEdit).mockResolvedValue(view)
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(777)
+    const deleteSpy = vi.spyOn(docVersionRepo, 'deleteById').mockResolvedValue()
+    vi.mocked(commitLiveEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 70 })
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocContentHandler(
+      req(
+        { docId: 'd_1' },
+        {
+          headers: { 'if-match': `"${encodeBaseVersion(view.baseSV)}"` },
+          body: { ops: [{ type: 'insert', at: { path: [0], position: 'after' }, content: [para('X')] }] },
+        },
+      ),
+      res as never,
+    )
+
+    expect(res.statusCode).toBe(200)
+    expect(deleteSpy).not.toHaveBeenCalled()
+    vi.mocked(docVersionRepo.createTx).mockRestore()
+    deleteSpy.mockRestore()
   })
 })
 

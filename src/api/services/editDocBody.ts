@@ -181,6 +181,17 @@ export async function editDocBody(input: EditDocBodyInput): Promise<EditDocBodyR
   } catch (err) {
     // The authoritative in-transact guard backstops any change between the
     // pre-flight and this commit — a drift fails here with no mutation/broadcast.
+    // Phase 2 already committed the KIND_RESTORE_MARKER safety snapshot and
+    // released its locks, so a rejection here would otherwise leave an orphan
+    // restore point for an edit that never touched the body. Compensating-delete
+    // it so a rejected (e.g. 412) request leaves no doc_version side effect
+    // (locked contract: "does not affect version/restore behaviour"). A failure
+    // of the compensating delete must not mask the original edit error.
+    try {
+      await docVersionRepo.deleteById(txResult.safetyVersionId)
+    } catch {
+      /* best-effort rollback; surface the original edit error below */
+    }
     const mapped = mapEditError(err)
     if (mapped) return { ok: false, ...mapped }
     throw err
