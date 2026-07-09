@@ -22,6 +22,11 @@ function num(name: string, fallback: number): number {
   return n
 }
 
+function numMin(name: string, fallback: number, min: number): number {
+  const n = num(name, fallback)
+  return Math.max(min, n)
+}
+
 function bool(name: string, fallback: boolean): boolean {
   const v = process.env[name]
   if (v === undefined || v === '') return fallback
@@ -365,6 +370,40 @@ export const config = {
     // Aggregate byte budget across all embedded images in one export. Once the
     // running total would exceed this, remaining images are dropped.
     maxImageTotalBytes: num('TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
+  },
+
+  // docx-import untrusted-zip extraction limits. The extractor walks the zip
+  // WITHOUT touching the filesystem (entries stay in memory) and enforces these
+  // ceilings before any XML/media is handed downstream.
+  docxImport: {
+    // Max size of the uploaded .docx itself (compressed). Over this the route
+    // rejects before reading a byte of zip content.
+    maxUploadBytes: numMin('DOCX_IMPORT_MAX_UPLOAD_BYTES', 25 * 1024 * 1024, 1),
+    // Max TOTAL uncompressed bytes across all entries. The primary zip-bomb
+    // ceiling (a 1MB zip can inflate to gigabytes). Sum is tracked as entries
+    // inflate; the extractor aborts the instant this is crossed.
+    maxTotalUncompressedBytes: numMin('DOCX_IMPORT_MAX_TOTAL_UNCOMPRESSED_BYTES', 200 * 1024 * 1024, 1),
+    // Max uncompressed bytes for any SINGLE entry (word/document.xml can be big;
+    // this stops one crafted member from exhausting memory on its own).
+    maxEntryUncompressedBytes: numMin('DOCX_IMPORT_MAX_ENTRY_UNCOMPRESSED_BYTES', 100 * 1024 * 1024, 1),
+    // Max per-entry compression ratio (uncompressed/compressed). A ratio far
+    // above what real DEFLATE achieves on office XML flags a zip bomb early,
+    // before the absolute size ceilings are even reached.
+    maxCompressionRatio: numMin('DOCX_IMPORT_MAX_COMPRESSION_RATIO', 200, 1),
+    // Max number of entries in the archive (defends the entry-count DoS where a
+    // zip packs millions of tiny members).
+    maxEntries: numMin('DOCX_IMPORT_MAX_ENTRIES', 4096, 1),
+    // Max number of embedded media files (word/media/*) we will accept + upload.
+    maxMediaFiles: numMin('DOCX_IMPORT_MAX_MEDIA_FILES', 256, 0),
+    // Hard wall-clock ceiling for the WHOLE extract+parse. zip bombs and
+    // pathological XML burn CPU/time, not just bytes; on expiry the import is
+    // aborted regardless of how much has been read.
+    timeoutMs: numMin('DOCX_IMPORT_TIMEOUT_MS', 30_000, 1_000),
+    // Max concurrent imports (each holds an inflated document in memory); the
+    // rest queue. Mirrors the pdfExport back-pressure discipline.
+    maxConcurrent: numMin('DOCX_IMPORT_MAX_CONCURRENT', 2, 1),
+    // Max imports allowed to WAIT in the queue; over this the route returns 503.
+    maxQueue: numMin('DOCX_IMPORT_MAX_QUEUE', 10, 1),
   },
 
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
