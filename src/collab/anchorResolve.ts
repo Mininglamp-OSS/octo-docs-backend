@@ -90,8 +90,13 @@ function samePath(a: BlockPath, b: BlockPath): boolean {
  *
  * Only text-node characters contribute to the searched string (inline atoms such
  * as `mention` / `image` are skipped), so `from`/`to` are computed from a
- * per-character absolute-position table built while walking the block's inline
- * children — this stays correct even when a block mixes text and inline atoms.
+ * per-character absolute-position table (`posOf`) built while walking the block's
+ * inline children. A raw `indexOf` hit can be spurious, though: two text runs
+ * separated by an inline atom sit adjacent in the search string but are NOT
+ * contiguous in the document, so a needle could appear to match across the atom.
+ * Such a hit is rejected — a real occurrence's characters must be at consecutive
+ * absolute positions (`posOf[idx + k] === posOf[idx] + k`) — so the returned
+ * range never silently widens over an atom that was never part of the text.
  */
 export function findAnchorMatches(doc: PMNode, needle: string): AnchorMatch[] {
   if (needle.length === 0) return []
@@ -115,9 +120,27 @@ export function findAnchorMatches(doc: PMNode, needle: string): AnchorMatch[] {
     let idx = text.indexOf(needle)
     while (idx !== -1) {
       const from = posOf[idx]!
-      const to = posOf[idx + needle.length - 1]! + 1
-      matches.push({ blockPath: path, from, to })
-      idx = text.indexOf(needle, idx + needle.length)
+      // Reject a hit whose characters are not at consecutive absolute positions:
+      // an inline atom fell inside the span, so this run only appeared adjacent
+      // in the text-only search string and never existed continuously in the doc.
+      let contiguous = true
+      for (let k = 1; k < needle.length; k++) {
+        if (posOf[idx + k] !== from + k) {
+          contiguous = false
+          break
+        }
+      }
+      if (contiguous) {
+        // `to` is one past the last char; for a contiguous run this equals
+        // posOf[idx + needle.length - 1] + 1.
+        matches.push({ blockPath: path, from, to: from + needle.length })
+        idx = text.indexOf(needle, idx + needle.length)
+      } else {
+        // Keep scanning: a real (contiguous) occurrence may still start later,
+        // even inside this rejected span, so advance by one rather than skipping
+        // the whole needle width.
+        idx = text.indexOf(needle, idx + 1)
+      }
     }
   }
 

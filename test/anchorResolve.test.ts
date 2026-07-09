@@ -167,6 +167,51 @@ describe('findAnchorMatches', () => {
   })
 })
 
+// ── inline-atom mid-match: a needle must never span an inline atom ────────────────
+describe('findAnchorMatches — inline atom mid-match', () => {
+  // A paragraph mixing text and an inline atom: mention sits between "foo" and
+  // "bar". Only text-node characters feed the search string, so it reads
+  // "foobar" — but no continuous "foobar" run exists in the document. A
+  // round-trip check via textBetween splices the atom back out and hides the
+  // over-wide range, so the guard has to be on the position table itself.
+  function atomBetween() {
+    return fragmentOf([
+      {
+        type: 'paragraph',
+        content: [
+          { type: 'text', text: 'foo' },
+          { type: 'mention', attrs: { id: 'u1', label: 'alice' } },
+          { type: 'text', text: 'bar' },
+        ],
+      },
+    ])
+  }
+
+  it('does NOT match a needle whose span crosses an inline atom', () => {
+    const { fragment } = atomBetween()
+    const { doc } = initProseMirrorDoc(fragment, schema)
+    // "foobar" is only adjacent in the text-only search string; the mention
+    // breaks the run in the real document, so it must yield no match.
+    expect(findAnchorMatches(doc, 'foobar')).toEqual([])
+  })
+
+  it('still matches text lying entirely on one side of the atom', () => {
+    const { fragment } = atomBetween()
+    const { doc } = initProseMirrorDoc(fragment, schema)
+    // "foo" occupies PM positions 1..4; the mention atom is 4..5; "bar" is 5..8.
+    expect(findAnchorMatches(doc, 'foo')).toEqual([{ blockPath: [0], from: 1, to: 4 }])
+    expect(findAnchorMatches(doc, 'bar')).toEqual([{ blockPath: [0], from: 5, to: 8 }])
+  })
+
+  it('resolveAnchorInFragment reports the atom-crossing text as not found', () => {
+    const { fragment } = atomBetween()
+    // No real "foobar" occurrence survives, so the fail-loud contract applies.
+    expect(() => resolveAnchorInFragment(fragment, { anchorText: 'foobar' })).toThrow(
+      AnchorTextNotFoundError,
+    )
+  })
+})
+
 describe('selectAnchorMatch', () => {
   const matches = [
     { blockPath: [0], from: 1, to: 2 },

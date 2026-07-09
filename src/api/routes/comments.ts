@@ -47,6 +47,28 @@ const MAX_ANCHOR_BYTES = 4096
 /** Sentinel: anchor was present on the wire but is not well-formed/usable. */
 const INVALID_ANCHOR = Symbol('invalid_anchor')
 
+/**
+ * The only doc_type whose live body is a ProseMirror fragment `anchorText` can be
+ * resolved against. A sheet/board/whiteboard stores a different Y.Doc shape
+ * (COLLAB_FIELD is not a PM fragment), so feeding it to `initProseMirrorDoc`
+ * inside the resolver throws. Mirrors docContent.ts's `BODY_EDITABLE_DOC_TYPE`
+ * gate — kept local and self-contained so it holds regardless of merge order.
+ */
+const ANCHOR_RESOLVABLE_DOC_TYPE = 'doc'
+
+/**
+ * Reject `anchorText` resolution against a non-rich-text doc_type with a
+ * 409 unsupported_doc_type (same contract as docContent.ts). Returns false when
+ * blocked so the caller stops before opening/parsing the live document.
+ */
+function requireAnchorResolvableDocType(res: Response, docType: string): boolean {
+  if (docType !== ANCHOR_RESOLVABLE_DOC_TYPE) {
+    res.status(409).json({ error: 'unsupported_doc_type' })
+    return false
+  }
+  return true
+}
+
 /** Parse a positive integer id from a path/body value, or null when malformed. */
 function parseId(raw: unknown): number | null {
   if (typeof raw === 'number') {
@@ -255,6 +277,9 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     end = endDec
   } else if (startDec === undefined && endDec === undefined && typeof anchorText === 'string' && anchorText.trim() !== '') {
     // (b) Bot path: resolve anchorText against the live document.
+    // Gate the doc_type BEFORE touching the live doc: a non-'doc' target stores a
+    // non-ProseMirror Y.Doc, so the resolver's initProseMirrorDoc would throw.
+    if (!requireAnchorResolvableDocType(res, guard.meta.doc_type)) return
     const blockPath = parseBlockPath((req.body as Record<string, unknown>).blockPath)
     const occurrence = parseOccurrence((req.body as Record<string, unknown>).occurrence)
     if (blockPath === INVALID_DISAMBIGUATION) {
@@ -279,7 +304,13 @@ export async function createCommentHandler(req: Request, res: Response): Promise
         res.status(422).json({ error: 'anchor_text_not_found' })
         return
       }
-      throw err
+      // Any other failure (bad fragment, live-doc read error, …) is unexpected.
+      // This is a bare async Express handler, so a re-thrown rejection would
+      // escape as an unhandled rejection — never reaching app.ts's central error
+      // middleware — and the client request would hang until timeout. Convert it
+      // to a 500 internal_error here, matching docContent.ts's try/catch.
+      res.status(500).json({ error: 'internal_error' })
+      return
     }
   } else {
     // Neither a full legacy anchor pair nor a usable anchorText.

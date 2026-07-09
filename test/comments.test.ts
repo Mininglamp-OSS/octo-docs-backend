@@ -72,9 +72,9 @@ function req(opts: {
   } as never
 }
 
-const readerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1' }, role: 'reader' } as never
-const writerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1' }, role: 'writer' } as never
-const adminGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1' }, role: 'admin' } as never
+const readerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'reader' } as never
+const writerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'writer' } as never
+const adminGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'admin' } as never
 
 /** Make requireDocRole emulate a 403 the way the real guard does (write + null). */
 function forbidGuard() {
@@ -405,6 +405,72 @@ describe('POST create (reader can comment)', () => {
       res as never,
     )
     expect(res.statusCode).toBe(404)
+  })
+})
+
+// ── bot anchorText path: doc_type gate + unexpected-error handling (P1-2) ─────────
+describe('POST create — anchorText resolution guards (P1-2)', () => {
+  const whiteboardGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'whiteboard' },
+    role: 'reader',
+  } as never
+
+  it('rejects anchorText on a non-doc doc_type with 409 unsupported_doc_type (never resolves)', async () => {
+    // A sheet/board/whiteboard stores a non-ProseMirror Y.Doc shape, so resolving
+    // anchorText against it would throw inside initProseMirrorDoc. The gate must
+    // fire BEFORE the live-doc resolver is ever touched (mirrors docContent.ts).
+    vi.mocked(requireDocRole).mockResolvedValue(whiteboardGuard)
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'hello' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('unsupported_doc_type')
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).not.toHaveBeenCalled()
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('maps an unexpected resolver failure to 500 internal_error (no hung request, no INSERT)', async () => {
+    // A non-contract error (e.g. initProseMirrorDoc throwing on a bad fragment)
+    // must become a 500 through the handler, not a re-thrown rejection: this
+    // handler is a bare async Express handler, so an escaping rejection would
+    // become an unhandled rejection and hang the client request until timeout.
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(resolveAnchorFromLiveDoc).mockRejectedValue(new Error('live doc read failed'))
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'hello' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(500)
+    expect((res.body as { error: string }).error).toBe('internal_error')
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('a partial explicit anchor (start only) + anchorText does NOT fall through to resolution → 400', async () => {
+    // Precedence guard: a half-supplied legacy pair must be rejected outright,
+    // never silently resolved via the anchorText path. Documents the current
+    // (correct) precedence so a future reorder cannot regress it silently.
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({
+        params: { docId: 'd_1' },
+        body: {
+          body: 'note',
+          anchorStart: Buffer.from('s').toString('base64'),
+          anchorText: 'fallback text',
+        },
+      }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).not.toHaveBeenCalled()
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
   })
 })
 
