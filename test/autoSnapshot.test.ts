@@ -36,6 +36,8 @@ import {
 } from '../src/collab/autoSnapshot.js'
 import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
 import { acquireLock } from '../src/db/redis.js'
+import { SCHEMA_VERSION } from '../src/schema/index.js'
+import { WB_SCHEMA_VERSION } from '../src/whiteboard/schema/index.js'
 
 const DOC = 'octo:s1:f1:d1'
 const ctx = (id: string) => ({ user: { id } }) as never
@@ -170,9 +172,33 @@ describe('unload', () => {
 
 // ── docId derivation ──────────────────────────────────────────────────────────
 describe('docId derivation', () => {
-  it('skips documents whose name does not parse to a document key', async () => {
+  it('snapshots whiteboard keys, deriving docId from the board segment (XIN-26 item 5)', async () => {
     vi.setSystemTime(0)
     await handleAfterStore('octo:s1:f1:wb:b1', ctx('u_w')) // whiteboard key
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(createAuto).toHaveBeenCalled()
+    // Board snapshots stamp the whiteboard schema line (WB_SCHEMA_VERSION),
+    // strictly isolated from the ProseMirror SCHEMA_VERSION (§11.5 / P2).
+    expect(createAuto.mock.calls[0]![0]).toMatchObject({
+      docId: 'b1',
+      documentName: 'octo:s1:f1:wb:b1',
+      schemaVersion: WB_SCHEMA_VERSION,
+    })
+  })
+
+  it('stamps the ProseMirror SCHEMA_VERSION on a rich-text doc snapshot (§11.5 isolation)', async () => {
+    vi.setSystemTime(0)
+    await handleAfterStore('octo:s1:f1:d1', ctx('u_d')) // 4-seg document key
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(createAuto).toHaveBeenCalled()
+    expect(createAuto.mock.calls[0]![0]).toMatchObject({ docId: 'd1', schemaVersion: SCHEMA_VERSION })
+    // sanity: the two schema lines are distinct, so the board branch is meaningful.
+    expect(SCHEMA_VERSION).not.toBe(WB_SCHEMA_VERSION)
+  })
+
+  it('skips a malformed key that parses to neither a document nor a whiteboard', async () => {
+    vi.setSystemTime(0)
+    await handleAfterStore('not-an-octo-key', ctx('u_w'))
     await vi.advanceTimersByTimeAsync(15_000)
     expect(createAuto).not.toHaveBeenCalled()
   })

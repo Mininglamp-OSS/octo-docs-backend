@@ -19,6 +19,8 @@ import { connectionRegistry } from '../permission/connectionRegistry.js'
 import { recheckCurrentRoleCached } from '../permission/recheck.js'
 import { roleAtLeast } from '../permission/role.js'
 import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
+import { parseDocumentName } from '../permission/documentName.js'
+import { attachWhiteboardRepair, coldRepairLiveDoc } from '../whiteboard/repair.js'
 
 /**
  * Per-node epoch watermark (§4.5 step 4): beforeHandleMessage reads this local
@@ -27,12 +29,91 @@ import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
  */
 const epochWatermark = new Map<string, number>()
 
+/**
+ * Per-document disposer for the whiteboard repair observer (§4.1), keyed by
+ * documentName. Set in afterLoadDocument for whiteboard keys, called in
+ * beforeUnloadDocument so the observer is torn down with the document.
+ */
+const repairDisposers = new Map<string, () => void>()
+
 export function setEpochWatermark(documentName: string, epoch: number): void {
   const cur = epochWatermark.get(documentName) ?? 0
   if (epoch > cur) epochWatermark.set(documentName, epoch)
 }
 
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/
+
+/**
+ * Reasonable cap for a relayed avatar reference — enough for a small raster
+ * data: thumbnail, short enough to keep awareness frames light. Longer values
+ * are treated as unsafe and stripped.
+ */
+const AVATAR_MAX_LEN = 2048
+/** Raster image data: URIs only — never svg/text, which can carry script. */
+const DATA_IMAGE_RE = /^data:image\/(png|jpe?g|gif|webp);/i
+
+/**
+ * True if `v` is a safe avatar reference to RELAY to peers (§8.3.1 / P2).
+ *
+ * `avatar` is an optional, cosmetic field the v1 whiteboard binding publishes
+ * alongside `{ id, name }`. It is echoed to every other peer and rendered there,
+ * so an attacker-controlled value must never carry a script vector. Accept only:
+ *   - http(s) URLs,
+ *   - `data:image/{png,jpeg,gif,webp}` raster data URIs, and
+ *   - scheme-less values that are unambiguously a relative / root-relative PATH
+ *     (`/…`, `./…`, `../…`) — a path can't execute.
+ * Everything else is rejected FAIL-CLOSED (XIN-604 P1): `javascript:` /
+ * `vbscript:` / other schemes, a scheme smuggled behind percent-encoding
+ * (`javascript%3Aalert(1)`), a protocol-relative URL (`//host/x` — a
+ * cross-origin fetch vector, not a path), a value that only looks scheme-less
+ * because its scheme lacks a leading letter (`1javascript:alert(1)`),
+ * `data:text/*`, `data:image/svg+xml` (SVG can embed script), any value
+ * containing markup or control characters, oversize strings, and non-strings.
+ * Never throws.
+ */
+export function isSafeAvatar(v: unknown): v is string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > AVATAR_MAX_LEN) return false
+  // Positive allowlist of URL / data-URI-safe characters: this excludes control
+  // chars, whitespace, quotes and angle brackets outright, so no raw markup or
+  // smuggled control byte can slip through to a rendering peer.
+  if (!/^[A-Za-z0-9\-._~:/?#@!$&*+,;=%()]+$/.test(v)) return false
+
+  const schemeOf = (s: string): string | null => {
+    const m = /^([a-z][a-z0-9+.-]*):/i.exec(s)
+    return m ? (m[1] ?? '').toLowerCase() : null
+  }
+  const rawScheme = schemeOf(v)
+
+  // Fail-closed against percent-encoded scheme smuggling: the allowlist permits
+  // `%`, so `javascript%3Aalert(1)` carries NO bare colon and would otherwise
+  // reach the scheme-less path. If percent-decoding introduces a scheme the raw
+  // value did not have, a downstream sink that decodes before use would
+  // resurrect it — reject. A malformed percent sequence (decode throws) is
+  // itself unsafe → reject.
+  if (v.includes('%')) {
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(v)
+    } catch {
+      return false
+    }
+    if (rawScheme === null && schemeOf(decoded) !== null) return false
+  }
+
+  if (rawScheme === null) {
+    // Scheme-less: accept ONLY an unambiguous relative / root-relative path,
+    // which carries neither an executable scheme nor a cross-origin host. A
+    // leading `//` is a protocol-relative URL (cross-origin fetch vector), NOT a
+    // path — reject it. Bare `host/x`-style values and everything else are
+    // rejected fail-closed.
+    if (v.startsWith('//')) return false
+    return v.startsWith('/') || v.startsWith('./') || v.startsWith('../')
+  }
+
+  if (rawScheme === 'http' || rawScheme === 'https') return true
+  if (rawScheme === 'data') return DATA_IMAGE_RE.test(v) // raster data URIs only
+  return false // javascript:, vbscript:, file:, data:text/*, data:image/svg+xml, …
+}
 
 /**
  * §8.3.1 presence identity + field validation — source-scoped and NON-FATAL.
@@ -44,10 +125,28 @@ const COLOR_RE = /^#[0-9a-fA-F]{6}$/
  * peers' pre-existing presence — which is why legitimate multi-user cursors
  * flow through untouched.
  *
- * On any failure (impersonated identity, bad color, oversized/non-string name)
- * we DROP the offending clientId from the map — rejecting that part of the
- * frame. We MUST NOT throw: a malformed or impostor awareness frame must never
- * crash the process or break other users' live collaboration (the prior
+ * Two tiers, by design:
+ *
+ *  1. IMPERSONATION is the only security-relevant rejection: a frame whose
+ *     `user.id` is not this connection's own uid is dropping the whole state
+ *     (a client must never publish presence claiming to be someone else).
+ *
+ *  2. `color` and `name` are OPTIONAL, cosmetic fields. They must never cause
+ *     the WHOLE presence state to be dropped — doing so silently kills the
+ *     user's entire presence broadcast for that frame, and because Hocuspocus
+ *     re-encodes the awareness update from only the surviving states, a dropped
+ *     state is never applied to the document awareness and therefore never
+ *     relayed (neither the local broadcast nor the Redis cross-node publish
+ *     fires). The v1 whiteboard binding publishes `{ id, name, avatar }` with
+ *     NO color at all, so the old whole-state drop on a missing/invalid color
+ *     meant the receiving peer got ZERO awareness frames (presence A->B = 0)
+ *     even though doc (type0) sync relayed fine. We instead SANITIZE the
+ *     offending field in place (strip an invalid/unsafe color so no CSS
+ *     injection value propagates; strip an oversized/non-string name) and let
+ *     the rest of the presence broadcast — standard Hocuspocus relay behavior.
+ *
+ * We MUST NOT throw: a malformed or impostor awareness frame must never crash
+ * the process or break other users' live collaboration (an earlier
  * implementation iterated the full broadcast set and threw, which crashed the
  * whole backend the moment a second user joined — a remotely triggerable DoS).
  */
@@ -57,16 +156,40 @@ export function validateAwarenessStates(
 ): void {
   if (!ctx) return // server-internal awareness (DirectConnection) carries no client ctx
   for (const [clientId, state] of states) {
-    const user = (state as { user?: { id?: unknown; name?: unknown; color?: unknown } }).user
+    // Shape guard first: a malformed frame may carry a null / non-object state,
+    // and reading `.user` off it would throw — violating the MUST-NOT-throw
+    // contract below (a remotely triggerable crash). Skip it as non-presence.
+    if (!state || typeof state !== 'object') continue
+    const user = (state as {
+      user?: { id?: unknown; name?: unknown; color?: unknown; avatar?: unknown }
+    }).user
     if (!user) continue // non-presence awareness data — nothing to validate
-    // identity must not be impersonated; color a valid hex (no CSS injection);
-    // name a string <= 64 chars.
-    const idOk = user.id === ctx.user.id
-    const colorOk = typeof user.color === 'string' && COLOR_RE.test(user.color)
-    const nameOk = typeof user.name === 'string' && user.name.length <= 64
-    if (!idOk || !colorOk || !nameOk) {
-      // Reject only this offending state; the rest of the frame is broadcast.
+
+    // (1) Identity binding: a connection may only publish presence under its OWN
+    // uid. A frame claiming a different id is impersonation -> drop the whole
+    // state. This is the single hard, security-relevant rejection.
+    if (user.id !== ctx.user.id) {
       states.delete(clientId)
+      continue
+    }
+
+    // (2) Cosmetic fields are sanitized, never fatal to the state. color is
+    // optional; only strip it when it is PRESENT and not a safe #RRGGBB hex (no
+    // CSS injection). A missing color is legitimate (whiteboard presence).
+    if ('color' in user && !(typeof user.color === 'string' && COLOR_RE.test(user.color))) {
+      delete (user as { color?: unknown }).color
+    }
+    // name is optional; strip it when present and not a string <= 64 chars.
+    if ('name' in user && !(typeof user.name === 'string' && user.name.length <= 64)) {
+      delete (user as { name?: unknown }).name
+    }
+    // avatar is optional (the v1 whiteboard binding publishes { id, name,
+    // avatar }); strip it when present and not a safe image reference so no
+    // script vector (javascript: URL, raw HTML, svg/text data URI) is relayed to
+    // peers that render it (P2). Sanitize-in-place, never fatal — same tier as
+    // color/name.
+    if ('avatar' in user && !isSafeAvatar(user.avatar)) {
+      delete (user as { avatar?: unknown }).avatar
     }
   }
 }
@@ -159,6 +282,28 @@ export function createServer() {
       validateAwarenessStates(data.states, data.context as AuthContext | undefined)
     },
 
+    // M2 (§4.1): for whiteboard keys, attach the server-authoritative repair
+    // observer to the freshly loaded live Y.Doc, then run one cold-start pass to
+    // converge any persisted illegal state. The observer scopes work to changed
+    // ids and skips its own REPAIR_ORIGIN writes (anti-self-excitation gates).
+    async afterLoadDocument(data) {
+      let kind: string
+      try {
+        kind = parseDocumentName(data.documentName).kind
+      } catch {
+        return // malformed key: nothing to repair (auth already rejected it)
+      }
+      if (kind !== 'whiteboard') return
+      const dispose = attachWhiteboardRepair(data.document)
+      repairDisposers.set(data.documentName, dispose)
+      // Converge persisted state on load through the fixed-clientID
+      // materialization so two nodes cold-repairing the same blob on failover
+      // emit byte-identical structs (BE-M11); a plain repairLiveDoc here would
+      // attribute the corrective writes to this node's RANDOM clientID and
+      // diverge on failover.
+      coldRepairLiveDoc(data.document)
+    },
+
     // A4 (§5.2): backend-autonomous KIND_AUTO snapshots. afterStoreDocument
     // fires after the authoritative state is persisted; the auto-snapshot
     // module owns the idle timer / min-interval fallback / Redis dedup. Gated
@@ -168,8 +313,13 @@ export function createServer() {
     },
 
     // A4 (§5.2): flush the last editing burst + clear the per-doc idle timer
-    // when the document unloads.
+    // when the document unloads. Also tear down the whiteboard repair observer.
     async beforeUnloadDocument(data) {
+      const dispose = repairDisposers.get(data.documentName)
+      if (dispose) {
+        dispose()
+        repairDisposers.delete(data.documentName)
+      }
       await handleBeforeUnload(data.documentName)
     },
   })

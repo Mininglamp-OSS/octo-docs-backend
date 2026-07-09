@@ -37,6 +37,7 @@ import { docVersionRepo } from '../db/repos/docVersionRepo.js'
 import { acquireLock, rkey } from '../db/redis.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import { SCHEMA_VERSION } from '../schema/index.js'
+import { WB_SCHEMA_VERSION } from '../whiteboard/schema/index.js'
 import type { AuthContext } from './authenticate.js'
 
 /** Per-document in-memory trigger state (process-local). */
@@ -65,15 +66,22 @@ function getState(documentName: string): DocAutoState {
 }
 
 /**
- * doc_id is the 4th segment of the documentName (docs are created as
- * buildDocumentName(space, folder, docId)), so we derive it without a DB hit —
- * the same identity other code relies on. Whiteboard / malformed keys yield
- * null and are skipped (the document backend does not snapshot them).
+ * doc_id is the 4th segment of a document key, or the board id (5th segment) of
+ * a whiteboard key — both are created with their id as doc_meta.doc_id, so we
+ * derive it without a DB hit. M2 (XIN-26 item 5): whiteboards keep the same auto
+ * crash-recovery snapshots as documents, hence the whiteboard branch here.
+ * Malformed keys yield null and are skipped. `schemaVersion` tracks the KIND's
+ * schema line, strictly isolated (§11.5 / §6): whiteboard boards stamp
+ * WB_SCHEMA_VERSION, rich-text docs stamp the ProseMirror SCHEMA_VERSION.
  */
-function deriveDocId(documentName: string): string | null {
+function deriveSnapshotTarget(
+  documentName: string,
+): { docId: string; schemaVersion: number } | null {
   try {
     const parsed = parseDocumentName(documentName)
-    return parsed.kind === 'document' ? parsed.doc : null
+    return parsed.kind === 'document'
+      ? { docId: parsed.doc, schemaVersion: SCHEMA_VERSION }
+      : { docId: parsed.board, schemaVersion: WB_SCHEMA_VERSION }
   } catch {
     return null
   }
@@ -86,15 +94,15 @@ function deriveDocId(documentName: string): string | null {
  * Returns true if a row was written.
  */
 async function writeAutoSnapshot(documentName: string, createdBy: string): Promise<boolean> {
-  const docId = deriveDocId(documentName)
-  if (!docId) return false
+  const target = deriveSnapshotTarget(documentName)
+  if (!target) return false
   const live = await persistence.fetch(documentName)
   const state = live ?? Y.encodeStateAsUpdate(new Y.Doc())
   await docVersionRepo.createAutoWithPrune({
-    docId,
+    docId: target.docId,
     documentName,
     state,
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: target.schemaVersion,
     createdBy,
     retainCount: config.autoSnapshot.retainCount,
     retainDays: config.autoSnapshot.retainDays,
