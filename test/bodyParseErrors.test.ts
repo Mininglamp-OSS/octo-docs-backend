@@ -47,6 +47,21 @@ describe('body-parser error mapping (§③)', () => {
     expect(await res.json()).toEqual({ error: 'doc_too_large' })
   })
 
+  it('oversized body on the sheet endpoint → 413 sheet_too_large (not doc_too_large)', async () => {
+    // The parse-time 413 fires before the route handler, so the sheet write path
+    // never reaches its own bounds. The central handler must still report the
+    // sheet-specific code so the /:docId/sheet 1MB rejection matches the read
+    // guard's sheet_too_large (issue #69 sheet contract), not doc_too_large.
+    const huge = JSON.stringify({ cells: { 'default!0:0': { v: 'x'.repeat(6 * 1024 * 1024) } } })
+    const res = await fetch(`${base}/v1/bot/docs/d_1/sheet`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer x' },
+      body: huge,
+    })
+    expect(res.status).toBe(413)
+    expect(await res.json()).toEqual({ error: 'sheet_too_large' })
+  })
+
   it('a well-formed JSON body is not caught by the parse-error mapping', async () => {
     // Valid JSON parses fine; it flows past the body parser to auth (401 here,
     // no valid bot token) — proving the mapping only fires on parse failures.

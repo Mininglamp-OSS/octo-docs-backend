@@ -34,6 +34,8 @@ import {
   SHEET_DIMS_FIELD as RESTORE_DIMS_FIELD,
 } from '../src/collab/versionRestore.js'
 import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
+import { advanceEditVersion } from '../src/collab/liveDocWrite.js'
+import { encodeBaseVersion, stateVectorsEqual } from '../src/collab/docBodyEdit.js'
 
 /** Build a Y.Doc binary state whose 'sheet' map holds the given cells. */
 function sheetState(cells: Record<string, SheetCell>): Uint8Array {
@@ -443,5 +445,98 @@ describe('applySheetCellsToYMap — P2: validate-all-then-apply atomicity', () =
     doc.transact(() => applySheetCellsToYMap(ymap, { [a]: null, [b]: { v: 3 } }))
     expect(ymap.has(a)).toBe(false)
     expect(ymap.get(b)).toEqual({ v: 3 })
+  })
+})
+
+/**
+ * commitLiveSheetEdit's Y.Doc core, exercised for real (XIN-664).
+ *
+ * The docSheetWrite unit test mocks commitLiveSheetEdit, so the ACTUAL mutation
+ * that runs on the shared live Y.Doc — applySheetCellsToYMap + advanceEditVersion,
+ * then re-encoding the state vector — was never covered end to end. The tester's
+ * real-machine run (XIN-661) hit the live path and exposed that only the mocked
+ * behavior had been asserted. This replays the exact transact body of
+ * commitLiveSheetEdit on a real Y.Doc (no hocuspocus/DB needed — the direct
+ * connection just hands the callback a doc) and asserts the three properties the
+ * write endpoint promises: {v,f,s} round-trips, {key:null} deletes, and the
+ * baseVersion token advances on BOTH a set and a delete-only edit.
+ */
+describe('commitLiveSheetEdit core — real Y.Doc write/delete round-trip + baseVersion advance', () => {
+  const key = sheetCellKey('default', 0, 0)
+
+  /** Mirror of commitLiveSheetEdit's transact body: guard, apply, bump, re-read. */
+  function commit(doc: Y.Doc, clientBaseVersion: Uint8Array, cells: Record<string, SheetCell | null>) {
+    let newSV!: Uint8Array
+    doc.transact(() => {
+      // (1) optimistic-concurrency guard — must match the caller's read.
+      if (!stateVectorsEqual(clientBaseVersion, Y.encodeStateVector(doc))) {
+        throw new Error('base_version_stale')
+      }
+      // (2) the single content mutation on the live 'sheet' map.
+      applySheetCellsToYMap(doc.getMap<SheetCell>(SHEET_YMAP_FIELD), cells)
+      // (3) advance the edit-version counter so a delete-only batch also moves SV.
+      advanceEditVersion(doc)
+      newSV = Y.encodeStateVector(doc)
+    })
+    return newSV
+  }
+
+  it('writes a {v,f,s} cell that reads back verbatim and advances the base version', () => {
+    const doc = new Y.Doc()
+    const sv0 = Y.encodeStateVector(doc)
+
+    const cell: SheetCell = { v: 'hello', f: '=A1*2', s: { bl: 1, cl: { rgb: '#FF0000' } } }
+    const sv1 = commit(doc, sv0, { [key]: cell })
+
+    // round-trips verbatim through the live map (style not dropped/flattened).
+    expect(doc.getMap<SheetCell>(SHEET_YMAP_FIELD).get(key)).toEqual(cell)
+    expect(yDocStateToSheetCells(Y.encodeStateAsUpdate(doc))[key]).toEqual(cell)
+    // baseVersion token advanced, so the old token can no longer pass the guard.
+    expect(stateVectorsEqual(sv0, sv1)).toBe(false)
+    expect(encodeBaseVersion(sv1)).not.toBe(encodeBaseVersion(sv0))
+  })
+
+  it('deletes a cell with {key:null}, leaving it absent, and still advances the base version', () => {
+    const doc = new Y.Doc()
+    // seed a cell to delete, capturing the post-seed token the client would hold.
+    const svSeed = commit(doc, Y.encodeStateVector(doc), { [key]: { v: 'gone' } })
+    expect(doc.getMap<SheetCell>(SHEET_YMAP_FIELD).has(key)).toBe(true)
+
+    // delete-only batch: Y.Map.delete records only a tombstone, so without
+    // advanceEditVersion the SV would be byte-identical — assert it advances.
+    const svDel = commit(doc, svSeed, { [key]: null })
+    expect(doc.getMap<SheetCell>(SHEET_YMAP_FIELD).has(key)).toBe(false)
+    expect(stateVectorsEqual(svSeed, svDel)).toBe(false)
+  })
+
+  it('a stale base version fails the guard before any mutation (no write, no SV move)', () => {
+    const doc = new Y.Doc()
+    const sv0 = Y.encodeStateVector(doc)
+    // advance the doc so sv0 is now stale.
+    commit(doc, sv0, { [key]: { v: 1 } })
+    const svCurrent = Y.encodeStateVector(doc)
+
+    const other = sheetCellKey('default', 1, 1)
+    expect(() => commit(doc, sv0, { [other]: { v: 2 } })).toThrow('base_version_stale')
+    // the rejected edit left nothing behind.
+    expect(doc.getMap<SheetCell>(SHEET_YMAP_FIELD).has(other)).toBe(false)
+    expect(stateVectorsEqual(svCurrent, Y.encodeStateVector(doc))).toBe(true)
+  })
+
+  it('the tester\'s A1-notation key is rejected, the contract key `default!0:0` is accepted', () => {
+    // Root cause of the XIN-661 TC3/TC5 422s: an A1-notation key ("A1") violates
+    // the cross-repo `${sheetId}!${row}:${col}` contract, so validation fails
+    // before any write. The canonical key round-trips through the same commit.
+    const doc = new Y.Doc()
+    const sv0 = Y.encodeStateVector(doc)
+    expect(() => commit(doc, sv0, { A1: { v: 'hello' } as SheetCell })).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    // no partial write from the rejected batch.
+    expect(doc.getMap<SheetCell>(SHEET_YMAP_FIELD).size).toBe(0)
+
+    const sv1 = commit(doc, sv0, { [key]: { v: 'hello' } })
+    expect(doc.getMap<SheetCell>(SHEET_YMAP_FIELD).get(key)).toEqual({ v: 'hello' })
+    expect(stateVectorsEqual(sv0, sv1)).toBe(false)
   })
 })
