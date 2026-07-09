@@ -12,6 +12,7 @@ import { getDocSheetHandler } from '../src/api/routes/docSheet.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { readLiveSheet } from '../src/collab/liveSheetWrite.js'
 import { encodeBaseVersion } from '../src/collab/docBodyEdit.js'
+import { encodeSheetCursor } from '../src/api/services/sheetPagination.js'
 import { config } from '../src/config/env.js'
 
 // ── mock req/res ────────────────────────────────────────────────────────────
@@ -35,8 +36,8 @@ function mockRes(): MockRes {
     },
   }
 }
-function req(params: Record<string, string>) {
-  return { uid: 'u_1', spaceId: 's1', params, headers: {} } as never
+function req(params: Record<string, string>, query: Record<string, string> = {}) {
+  return { uid: 'u_1', spaceId: 's1', params, query, headers: {} } as never
 }
 
 const sheetGuard = {
@@ -192,5 +193,210 @@ describe('large-sheet read guard', () => {
     await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
 
     expect(res.statusCode).toBe(200)
+  })
+})
+
+// ── paginated read (?limit / ?cursor) ────────────────────────────────────────
+describe('paginated sheet read', () => {
+  const originalBytes = config.sheetRead.maxCellBytes
+  const originalDefault = config.sheetRead.defaultPageLimit
+  const originalMax = config.sheetRead.maxPageLimit
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(sheetGuard))
+  afterEach(() => {
+    config.sheetRead.maxCellBytes = originalBytes
+    config.sheetRead.defaultPageLimit = originalDefault
+    config.sheetRead.maxPageLimit = originalMax
+  })
+
+  /** A 10-row single-column sheet, cells default!0:0 .. default!9:0. */
+  function tenRowSheet() {
+    const cells: Record<string, SheetCell> = {}
+    for (let r = 0; r < 10; r++) cells[`default!${r}:0`] = { v: `row-${r}` }
+    return cells
+  }
+
+  it('?limit=N returns the first page, dims, baseVersion, hasMore, and a nextCursor', async () => {
+    const view = liveSheet(tenRowSheet(), { c0: 120 })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '3' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      docId: string
+      sheetCells: Record<string, SheetCell>
+      sheetDims: Record<string, number>
+      baseVersion: string
+      hasMore: boolean
+      nextCursor: string | null
+    }
+    expect(Object.keys(body.sheetCells)).toEqual(['default!0:0', 'default!1:0', 'default!2:0'])
+    // dims come back on the first page.
+    expect(body.sheetDims).toEqual({ c0: 120 })
+    expect(body.baseVersion).toBe(encodeBaseVersion(view.baseSV))
+    expect(body.hasMore).toBe(true)
+    expect(typeof body.nextCursor).toBe('string')
+  })
+
+  it('following nextCursor returns the next page and omits dims', async () => {
+    const view = liveSheet(tenRowSheet(), { c0: 120 })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const first = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '3' }), first as never)
+    const nextCursor = (first.body as { nextCursor: string }).nextCursor
+
+    const second = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '3', cursor: nextCursor }), second as never)
+
+    expect(second.statusCode).toBe(200)
+    const body = second.body as { sheetCells: Record<string, SheetCell>; sheetDims?: object }
+    expect(Object.keys(body.sheetCells)).toEqual(['default!3:0', 'default!4:0', 'default!5:0'])
+    // dims are first-page-only.
+    expect(body.sheetDims).toBeUndefined()
+  })
+
+  it('walks the whole sheet across pages with no gap or overlap', async () => {
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet()))
+
+    const seen: string[] = []
+    let cursor: string | null = null
+    let guard = 0
+    for (;;) {
+      const res = mockRes()
+      const query: Record<string, string> = { limit: '4' }
+      if (cursor) query.cursor = cursor
+      await getDocSheetHandler(req({ docId: 'd_1' }, query), res as never)
+      const body = res.body as { sheetCells: Record<string, SheetCell>; hasMore: boolean; nextCursor: string | null }
+      seen.push(...Object.keys(body.sheetCells))
+      if (!body.hasMore) break
+      cursor = body.nextCursor
+      if (++guard > 50) throw new Error('did not terminate')
+    }
+    expect(seen.length).toBe(10)
+    expect(new Set(seen).size).toBe(10)
+  })
+
+  it('a large sheet is paginated instead of 413 (the read wall is lifted)', async () => {
+    // Same oversized grid that the whole-sheet read rejects with 413 — under a
+    // small cap, paginated mode serves it a page at a time with a 200.
+    config.sheetRead.maxCellBytes = 200
+    const cells: Record<string, SheetCell> = {}
+    for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}-value` }
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { sheetCells: Record<string, SheetCell>; hasMore: boolean }
+    // The byte cap bounded the page well below the full 40 cells.
+    expect(Object.keys(body.sheetCells).length).toBeLessThan(40)
+    expect(body.hasMore).toBe(true)
+  })
+
+  it('rejects a cursor whose snapshot moved with 409 sheet_changed', async () => {
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet()))
+    // A well-formed cursor pinned to a baseVersion that is not the live one.
+    const staleCursor = encodeSheetCursor({ v: 'STALE_BASE_VERSION==', k: 'default!2:0' })
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '3', cursor: staleCursor }), res as never)
+
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({ error: 'sheet_changed' })
+  })
+
+  it('rejects a malformed cursor with 400 invalid_cursor', async () => {
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet()))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { cursor: '!!!not-a-cursor!!!' }), res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: 'invalid_cursor' })
+  })
+
+  it('rejects a non-integer / non-positive limit with 400 invalid_limit', async () => {
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet()))
+
+    for (const bad of ['0', '-1', 'abc', '1.5']) {
+      const res = mockRes()
+      await getDocSheetHandler(req({ docId: 'd_1' }, { limit: bad }), res as never)
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: 'invalid_limit' })
+    }
+  })
+
+  it('clamps a limit above the max down to maxPageLimit', async () => {
+    config.sheetRead.maxPageLimit = 5
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet()))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '1000' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { sheetCells: Record<string, SheetCell>; hasMore: boolean }
+    expect(Object.keys(body.sheetCells).length).toBe(5)
+    expect(body.hasMore).toBe(true)
+  })
+
+  it('first page counts sheetDims against the byte cap so cells+dims stay within it (P1-b)', async () => {
+    // Small cap; a chunky dims map eats most of it. Before the fix the cells
+    // budget ignored dims, so the first page (cells + dims) could exceed the cap.
+    config.sheetRead.maxCellBytes = 400
+    const dims: Record<string, number> = {}
+    for (let c = 0; c < 20; c++) dims[`c${c}`] = 120 + c
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet(), dims))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      sheetCells: Record<string, SheetCell>
+      sheetDims: Record<string, number>
+      hasMore: boolean
+    }
+    // The whole first-page body (cells + dims, the two grid fields the caller
+    // receives) must not exceed the per-page byte cap.
+    const firstPageBytes = Buffer.byteLength(
+      JSON.stringify({ sheetCells: body.sheetCells, sheetDims: body.sheetDims }),
+    )
+    expect(firstPageBytes).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
+    // Dims still returned on the first page, and the walk still makes progress.
+    expect(body.sheetDims).toEqual(dims)
+    expect(body.hasMore).toBe(true)
+  })
+
+  it('subsequent pages keep the full byte budget (dims omitted, not reserved)', async () => {
+    // With dims charged only to the first page, page two must NOT keep reserving
+    // their bytes — it gets the whole cap for cells. Use a sheet large enough that
+    // the byte budget (not the cell supply) bounds BOTH pages, so the comparison
+    // reflects the budget difference rather than the sheet running out.
+    config.sheetRead.maxCellBytes = 400
+    const cells: Record<string, SheetCell> = {}
+    for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}` }
+    const dims: Record<string, number> = {}
+    for (let c = 0; c < 20; c++) dims[`c${c}`] = 120 + c
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells, dims))
+
+    const first = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), first as never)
+    const firstBody = first.body as { sheetCells: Record<string, SheetCell>; nextCursor: string | null }
+    expect(firstBody.nextCursor).not.toBeNull()
+
+    const second = mockRes()
+    await getDocSheetHandler(
+      req({ docId: 'd_1' }, { limit: '100', cursor: firstBody.nextCursor! }),
+      second as never,
+    )
+    const secondBody = second.body as { sheetCells: Record<string, SheetCell>; sheetDims?: object }
+    expect(secondBody.sheetDims).toBeUndefined()
+    // Page two, freed of the dims reservation, fits more cells than the first page.
+    expect(Object.keys(secondBody.sheetCells).length).toBeGreaterThan(
+      Object.keys(firstBody.sheetCells).length,
+    )
   })
 })

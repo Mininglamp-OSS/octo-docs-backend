@@ -319,13 +319,22 @@ export const config = {
     maxPathDepth: num('DOC_BODY_EDIT_MAX_PATH_DEPTH', 32),
   },
 
-  // Bot/human sheet content read (GET /:docId/sheet). Stage1 read-guard: the
-  // decoded cell + dims payload is bounded to this size and a larger sheet gets
-  // a clear 413 sheet_too_large instead of an unbounded response body. The live
-  // Y.Doc is already capped at maxDocBytes, so the decode + measure is bounded;
-  // paginated reads for oversized sheets are deferred to a later stage.
+  // Bot/human sheet content read (GET /:docId/sheet). maxCellBytes bounds a
+  // single response body: the whole-sheet read returns 413 sheet_too_large above
+  // it, and — since Stage3 — it also caps each page of a paginated read, so no
+  // one page can exceed it either. Paginated reads (query ?limit= / ?cursor=)
+  // lift the whole-sheet 413 wall for opted-in callers by slicing an oversized
+  // grid into byte-bounded pages; a caller passing neither param keeps the exact
+  // Stage1 whole-sheet behavior (backward compatible). The live Y.Doc is already
+  // capped at maxDocBytes, so every decode + measure below is bounded.
   sheetRead: {
     maxCellBytes: num('SHEET_READ_MAX_CELL_BYTES', 1024 * 1024),
+    // Cells per page when a caller opts into pagination without an explicit
+    // ?limit. The byte cap above is the hard bound; this is the count default.
+    defaultPageLimit: num('SHEET_READ_DEFAULT_PAGE_LIMIT', 1000),
+    // Upper bound a caller's ?limit is clamped to, so a large limit can never
+    // force an unbounded per-page slice (the byte cap still governs regardless).
+    maxPageLimit: num('SHEET_READ_MAX_PAGE_LIMIT', 10000),
   },
 
   // Bot/human sheet content write (PATCH /:docId/sheet). Request-shape bounds
