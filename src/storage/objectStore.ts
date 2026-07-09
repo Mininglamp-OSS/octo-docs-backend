@@ -195,20 +195,54 @@ export class LocalHmacObjectStore implements ObjectStore {
    * future read-proxy that validates inbound signed URLs.
    */
   verify(signedUrl: string): VerifyResult {
+    return this.parseAndVerify(signedUrl).result
+  }
+
+  /**
+   * Verify a signed URL for a concrete HTTP request (XIN-717): in addition to
+   * the signature + expiry checks, the URL's bound `X-Method` must match the
+   * actual HTTP method, so a GET-signed URL can never be replayed as a PUT. On
+   * success returns the physical object key (prefix-applied, the same key the
+   * signature covers) so the blob gateway knows where to store / read the bytes.
+   */
+  verifyRequest(
+    httpMethod: string,
+    signedUrl: string,
+  ): VerifyResult & { objectKey?: string; disposition?: string } {
+    const { result, method, physicalKey, disposition } = this.parseAndVerify(signedUrl)
+    if (!result.valid) return result
+    if (method !== httpMethod.toUpperCase()) {
+      return { valid: false, reason: 'bad_signature' }
+    }
+    return { valid: true, objectKey: physicalKey, disposition }
+  }
+
+  /**
+   * Shared parse + signature/expiry verification for both verify() and
+   * verifyRequest(). Reconstructs the physical object key from the URL path
+   * (stripping any configured base-path segment), recomputes the HMAC over
+   * (method + key + expiry [+ disposition]) and compares in constant time.
+   */
+  private parseAndVerify(signedUrl: string): {
+    result: VerifyResult
+    method?: 'PUT' | 'GET'
+    physicalKey?: string
+    disposition?: string
+  } {
     let url: URL
     try {
       url = new URL(signedUrl)
     } catch {
-      return { valid: false, reason: 'missing' }
+      return { result: { valid: false, reason: 'missing' } }
     }
     const method = url.searchParams.get('X-Method')
     const expiryStr = url.searchParams.get('X-Expiry')
     const signature = url.searchParams.get('X-Signature')
     if (!method || !expiryStr || !signature || (method !== 'PUT' && method !== 'GET')) {
-      return { valid: false, reason: 'missing' }
+      return { result: { valid: false, reason: 'missing' } }
     }
     const expiry = Number(expiryStr)
-    if (!Number.isFinite(expiry)) return { valid: false, reason: 'missing' }
+    if (!Number.isFinite(expiry)) return { result: { valid: false, reason: 'missing' } }
 
     // Reconstruct the physical object key from the path (decode each segment).
     // This is the prefixed key that was signed at mint time, so verification is
@@ -231,9 +265,16 @@ export class LocalHmacObjectStore implements ObjectStore {
     // legacy URLs without it verify against the original signature form.
     const disposition = url.searchParams.get('response-content-disposition') ?? ''
     const expected = sign(method, physicalKey, expiry, this.secret, disposition)
-    if (!safeEqualHex(expected, signature)) return { valid: false, reason: 'bad_signature' }
-    if (this.nowSec() >= expiry) return { valid: false, reason: 'expired' }
-    return { valid: true }
+    if (!safeEqualHex(expected, signature)) {
+      return { result: { valid: false, reason: 'bad_signature' } }
+    }
+    if (this.nowSec() >= expiry) return { result: { valid: false, reason: 'expired' } }
+    return {
+      result: { valid: true },
+      method,
+      physicalKey,
+      disposition: disposition === '' ? undefined : disposition,
+    }
   }
 }
 

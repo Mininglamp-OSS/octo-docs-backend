@@ -28,6 +28,19 @@ function bool(name: string, fallback: boolean): boolean {
   return v === '1' || v.toLowerCase() === 'true'
 }
 
+/**
+ * Parse the comma-separated `CORS_ALLOWED_ORIGINS` allowlist into trimmed,
+ * non-empty entries (XIN-717). Lives here (not in api/cors.ts) so the config
+ * module stays the single leaf that reads env, with no import cycle back from
+ * api/cors.ts. The single value `*` (reflect any origin) is preserved verbatim.
+ */
+export function parseAllowedOrigins(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((o) => o.trim())
+    .filter((o) => o !== '')
+}
+
 export type OctoIdentityMode = 'http' | 'middleware'
 
 /**
@@ -169,6 +182,18 @@ export const config = {
     publicWsUrl: resolveCollabPublicWsUrl(str('COLLAB_TOKEN_PUBLIC_WS_URL', '')),
   },
 
+  // Cross-Origin Resource Sharing (XIN-717). The front-end runs on its own
+  // origin and calls the REST API — and, with the local-hmac driver pointed at
+  // the docs-backend origin, the presigned attachment PUT/GET — cross-origin, so
+  // the browser preflights with OPTIONS and blocks any response without a
+  // matching Access-Control-Allow-Origin. Configure the allowed FE origin(s)
+  // here (comma-separated exact origins, e.g. `http://192.168.214.189:3010`, or
+  // the single value `*` to reflect any origin). Empty (default) allows no
+  // cross-origin request — set it per environment at deploy time. See src/api/cors.ts.
+  cors: {
+    allowedOrigins: parseAllowedOrigins(str('CORS_ALLOWED_ORIGINS', '')),
+  },
+
   octoIdentity: {
     mode: str('OCTO_IDENTITY_MODE', 'http') as OctoIdentityMode,
     serverBaseUrl: str('OCTO_SERVER_BASE_URL', 'http://127.0.0.1:8080'),
@@ -210,6 +235,14 @@ export const config = {
     // verification, so the signed key stays the pure object key. Empty (default)
     // preserves the legacy object-store.local host for back-compat.
     publicBaseUrl: str('ATTACHMENT_PUBLIC_BASE_URL', ''),
+    // Filesystem directory the self-hosted local-hmac blob gateway stores and
+    // serves uploaded bytes from (XIN-717). Only used when driver is
+    // 'local-hmac' AND publicBaseUrl points at this backend origin — then the
+    // browser PUTs/GETs the binary directly here and the gateway persists it
+    // under this directory. Empty (default) falls back to
+    // `<os.tmpdir()>/octo-docs-attachments`. Not used by the s3/minio drivers
+    // (those upload straight to object storage).
+    localDir: str('ATTACHMENT_LOCAL_DIR', ''),
     // S3-compatible (MinIO/S3/COS) driver settings. Used only when driver is
     // 's3'/'minio'. The endpoint is the PUBLIC, browser-reachable origin baked
     // into the signed URL host (never a docker-internal alias). Credentials come

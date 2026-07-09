@@ -17,6 +17,8 @@
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../config/env.js'
+import { corsMiddleware } from './cors.js'
+import { attachmentBlobGateway, localBlobGatewayEnabled } from './routes/attachmentBlob.js'
 import { authMiddleware } from './middleware/auth.js'
 import { spaceContextMiddleware } from './middleware/spaceContext.js'
 import { verifyBotMiddleware } from './middleware/verifyBot.js'
@@ -42,6 +44,23 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // per-IP rate limiter below — reflects the real client from X-Forwarded-For
   // rather than the proxy address. Configurable per deployment (config.trustProxy).
   app.set('trust proxy', opts.trustProxy ?? config.trustProxy)
+
+  // CORS + preflight (XIN-717). Mounted FIRST — ahead of the body parser, rate
+  // limiter and auth — so a cross-origin OPTIONS preflight from the front-end is
+  // answered 2xx with the CORS headers without being throttled, body-parsed or
+  // rejected by the auth chain, and every response carries Access-Control-Allow-
+  // Origin for the configured origin(s). Covers both the metadata API and the
+  // local-hmac attachment blob gateway below.
+  app.use(corsMiddleware)
+
+  // Self-hosted attachment blob gateway (XIN-717). Only relevant for the
+  // local-hmac driver, where the browser PUTs/GETs the binary directly at this
+  // origin. Mounted before express.json so it can read the raw upload stream;
+  // it claims ONLY signed requests (carrying X-Method + X-Signature) and passes
+  // everything else through, so it never shadows the routes below.
+  if (localBlobGatewayEnabled()) {
+    app.use(attachmentBlobGateway)
+  }
 
   app.use(express.json({ limit: '1mb' }))
 

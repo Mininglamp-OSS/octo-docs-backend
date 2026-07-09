@@ -109,6 +109,7 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `HOCUSPOCUS_PORT` | no (`1234`) | WS listener |
 | `HTTP_PORT` | no (`3000`) | REST listener |
 | `TRUST_PROXY` | **recommended behind a proxy** (`1`) | Express `trust proxy` value. The REST API sits behind nginx, so this must be set for `req.ip` — and the per-IP rate limiter — to resolve the real client from `X-Forwarded-For` instead of the proxy address. `1` = one nginx hop; use the hop count for deeper chains, a preset/CIDR like `loopback`, or `false` when exposed directly. Do **not** use `true` in prod (permissive: clients can spoof `X-Forwarded-For`). |
+| `CORS_ALLOWED_ORIGINS` | **yes when the FE is a different origin** | Comma-separated allowlist of front-end origins permitted to call the REST API and (with the local-hmac driver pointed at this backend origin) the presigned attachment PUT/GET. The browser preflights cross-origin requests with `OPTIONS` and blocks any response whose `Access-Control-Allow-Origin` does not match, so the FE origin **must** be listed or image upload/download fails (XIN-717). Exact origins (`http://192.168.214.189:3010`) or the single value `*` (reflect any origin). Empty (default) allows no cross-origin request. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
 | `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | recommended | authoritative store connection |
 | `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size |
@@ -159,6 +160,7 @@ Shared attachment vars:
 | `ATTACHMENT_DRIVER` | `local-hmac` | `local-hmac` \| `s3` \| `minio` |
 | `ATTACHMENT_BUCKET` | `octo-docs-attachments` | target bucket |
 | `ATTACHMENT_KEY_PREFIX` | _(empty)_ | object-key prefix so several apps share one bucket without colliding (e.g. a COS bucket shared with octo-server). Part of the signed key. |
+| `ATTACHMENT_LOCAL_DIR` | _(empty → `<os.tmpdir()>/octo-docs-attachments`)_ | filesystem directory the self-hosted **local-hmac blob gateway** stores/serves uploaded bytes from (XIN-717). Used only when `ATTACHMENT_DRIVER=local-hmac` **and** `ATTACHMENT_PUBLIC_BASE_URL` points at this backend origin — then the browser PUTs/GETs the binary directly here and this process persists it. Ignored by the `s3`/`minio` drivers (they upload straight to object storage). Dev / single-node self-hosted only. |
 | `ATTACHMENT_SIGNING_SECRET` | `dev-only-change-me` | HMAC key for `local-hmac`; **must** be overridden in prod |
 | `ATTACHMENT_UPLOAD_URL_TTL_SECONDS` | `300` | presigned PUT TTL |
 | `ATTACHMENT_READ_URL_TTL_SECONDS` | `600` | re-issued signed GET TTL |
