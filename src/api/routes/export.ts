@@ -45,16 +45,21 @@ export const exportRouter = Router()
 
 const EMPTY_DOC = { type: 'doc', content: [] }
 
-/** Map an image mime to a file extension for the compile-root filename. */
-function extForMime(mime: string): string {
-  switch (mime) {
-    case 'image/png': return 'png'
-    case 'image/jpeg': return 'jpg'
-    case 'image/gif': return 'gif'
-    case 'image/webp': return 'webp'
-    case 'image/svg+xml': return 'svg'
-    default: return 'bin'
-  }
+/**
+ * Derive the compile-root file extension from the image's ACTUAL magic bytes,
+ * not its declared mime. Uploads can be mislabeled (e.g. a JPEG saved as
+ * `111.png` and stored with mime image/png). typst picks its decoder from the
+ * file extension, so a `.png` name over JPEG bytes fails with "Invalid PNG
+ * signature" and aborts the whole compile. Naming the file by the sniffed
+ * format lets typst decode it correctly. Returns null for bytes we don't
+ * recognise (caller drops the image). Kept in sync with isSupportedImage.
+ */
+export function sniffImageExt(buf: Buffer): 'png' | 'jpg' | 'gif' | null {
+  if (buf.length < 4) return null
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png'
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg'
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif'
+  return null
 }
 
 /**
@@ -109,12 +114,13 @@ async function resolveInputs(
     // the WHOLE typst compile with a decode error. Sniff the magic bytes and
     // drop anything that isn't a real image, matching the best-effort intent
     // (a bad image is skipped, not fatal).
-    if (!isSupportedImage(bytes)) continue
+    const sniffedExt = sniffImageExt(bytes)
+    if (!sniffedExt) continue
     // Aggregate byte budget: enforce on the real downloaded size too (a lying/
     // absent sizeBytes can't smuggle past the per-image cap into the total).
     if (totalBytes + bytes.byteLength > maxImageTotalBytes) continue
     totalBytes += bytes.byteLength
-    const fileName = `img_${imgIdx++}.${extForMime(a.mime)}`
+    const fileName = `img_${imgIdx++}.${sniffedExt}`
     imagePaths.set(a.attachId, fileName)
     images.push({ fileName, bytes })
   }
@@ -131,16 +137,11 @@ async function resolveInputs(
  * entire export; a rejected image is dropped like any other unresolved image.
  */
 export function isSupportedImage(buf: Buffer): boolean {
-  if (buf.length < 4) return false
-  // PNG
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true
-  // JPEG
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true
-  // GIF87a / GIF89a
-  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return true
-  // NOTE: WebP and BMP are intentionally rejected — typst v0.13.1 cannot decode
-  // them and would fail the whole compile. Revisit if TYPST_VERSION is bumped.
-  return false
+  // Delegate to sniffImageExt so the accepted-format list and the extension
+  // used for the compile-root filename can never drift apart. typst v0.13.1
+  // decodes PNG/JPEG/GIF; WebP and BMP are intentionally rejected (they would
+  // fail the whole compile). Revisit if TYPST_VERSION is bumped.
+  return sniffImageExt(buf) !== null
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { collectReferencedAttachIds, isSupportedImage } from '../src/api/routes/export.js'
+import { collectReferencedAttachIds, isSupportedImage, sniffImageExt } from '../src/api/routes/export.js'
 
 // The PDF export must only download images the document actually references,
 // never the full attachment list (a doc can carry orphaned/unreferenced
@@ -69,5 +69,29 @@ describe('isSupportedImage', () => {
     const bmp = Buffer.from([0x42, 0x4d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     expect(isSupportedImage(webp)).toBe(false)
     expect(isSupportedImage(bmp)).toBe(false)
+  })
+})
+
+// typst picks its image decoder from the file EXTENSION. Uploads can be
+// mislabeled (a JPEG saved as `111.png`, stored with mime image/png); naming
+// the compile-root file `.png` over JPEG bytes fails with "Invalid PNG
+// signature" and aborts the whole export (HTTP 500). sniffImageExt derives the
+// extension from the actual magic bytes so typst decodes it correctly.
+describe('sniffImageExt', () => {
+  const bytes = (...b: number[]) => Buffer.from([...b, ...new Array(Math.max(0, 12 - b.length)).fill(0)])
+  it('returns the extension from the real magic bytes, ignoring any declared mime', () => {
+    expect(sniffImageExt(bytes(0x89, 0x50, 0x4e, 0x47))).toBe('png')
+    expect(sniffImageExt(bytes(0xff, 0xd8, 0xff))).toBe('jpg')
+    expect(sniffImageExt(bytes(0x47, 0x49, 0x46, 0x38))).toBe('gif')
+  })
+  it('picks jpg for JPEG bytes even when the upload claims png (the 500 repro)', () => {
+    // Real regression: `111.png` (mime image/png) whose bytes are actually JPEG.
+    const jpegBytes = bytes(0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46)
+    expect(sniffImageExt(jpegBytes)).toBe('jpg')
+  })
+  it('returns null for unrecognised / truncated buffers', () => {
+    expect(sniffImageExt(Buffer.from('not an image'))).toBeNull()
+    expect(sniffImageExt(Buffer.from([0x89, 0x50]))).toBeNull()
+    expect(sniffImageExt(Buffer.alloc(0))).toBeNull()
   })
 })
