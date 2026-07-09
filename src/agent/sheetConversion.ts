@@ -181,6 +181,43 @@ export function yDocStateToSheetCells(state: Uint8Array): Record<string, SheetCe
 }
 
 /**
+ * The split of a `{ key: cell|null }` edit batch into deletions and validated
+ * upserts — the output of the shared, DB-free, live-infra-free validation pass.
+ */
+export interface SheetCellBatch {
+  toDelete: string[]
+  toSet: Array<[string, SheetCell]>
+}
+
+/**
+ * Validate a whole `{ key: cell|null }` edit batch WITHOUT mutating anything,
+ * fail-closed. A null value is a deletion (key-shape-checked so a malformed key
+ * cannot be smuggled in); any other value is validated against the `{v,f,s}`
+ * contract. Throws SheetSnapshotInvalidError on the first deviation.
+ *
+ * Split out from applySheetCellsToYMap so the HTTP write path can run the exact
+ * same contract check in its no-lock pre-flight (fail a bad batch with 422
+ * before opening the live write connection) that the live mutation runs — one
+ * source of truth for the cell contract, never two subtly different validators.
+ */
+export function validateSheetCellBatch(cells: Record<string, SheetCell | null>): SheetCellBatch {
+  const toDelete: string[] = []
+  const toSet: Array<[string, SheetCell]> = []
+  for (const [key, cell] of Object.entries(cells)) {
+    if (cell == null) {
+      // Deletion is always safe; a hostile key simply targets a nonexistent
+      // entry. We still key-shape-check so a malformed key can't be smuggled in.
+      if (typeof key === 'string' && CELL_KEY_RE.test(key)) toDelete.push(key)
+      else throw new SheetSnapshotInvalidError(`delete: invalid cell key ${String(key).slice(0, 64)}`)
+    } else {
+      // Fail-closed: validate the {v,f,s} contract before writing into the doc.
+      toSet.push([key, validateSheetCell(key, cell)])
+    }
+  }
+  return { toDelete, toSet }
+}
+
+/**
  * Pure mutation applied INSIDE a Yjs transaction (live doc or transient).
  * A null/undefined cell deletes the key; otherwise it is set. Caller owns the
  * transaction so the whole edit lands as one update (one broadcast).
@@ -195,19 +232,7 @@ export function applySheetCellsToYMap(
   // disconnect, so a per-iteration set()-then-throw would broadcast a partial
   // write. Validate every entry FIRST; only mutate once the whole batch is known
   // good.
-  const toDelete: string[] = []
-  const toSet: Array<[string, SheetCell]> = []
-  for (const [key, cell] of Object.entries(cells)) {
-    if (cell == null) {
-      // Deletion is always safe; a hostile key simply targets a nonexistent
-      // entry. We still key-shape-check so a malformed key can't be smuggled in.
-      if (typeof key === 'string' && CELL_KEY_RE.test(key)) toDelete.push(key)
-      else throw new SheetSnapshotInvalidError(`delete: invalid cell key ${String(key).slice(0, 64)}`)
-    } else {
-      // Fail-closed: validate the {v,f,s} contract before writing into the doc.
-      toSet.push([key, validateSheetCell(key, cell)])
-    }
-  }
+  const { toDelete, toSet } = validateSheetCellBatch(cells)
   for (const key of toDelete) ymap.delete(key)
   for (const [key, cell] of toSet) ymap.set(key, cell)
 }
