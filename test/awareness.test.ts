@@ -190,6 +190,35 @@ describe('awareness display-name stamping (§4.7(b) / XIN-694, server-authoritat
     expect('name' in nameOf(states, 2)).toBe(false) // oversized stripped
     expect(states.has(2)).toBe(true) // state kept
   })
+
+  it('strips a script-vector client name on the fallback path but KEEPS presence (XSS guard)', () => {
+    // No trusted name → the client value is relayed, and it is attacker-chosen
+    // (the impersonation guard checks user.id, not user.name). This frame is
+    // rendered on every peer, so a name carrying a markup/script vector must be
+    // stripped fail-closed exactly as the sibling avatar field is. Reject the
+    // whole name, do not HTML-escape (escaping would corrupt the JSON contract).
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: 'user-1', name: '<img src=x onerror=alert(1)>' } }],
+      [2, { user: { id: 'user-1', name: '<script>alert(1)</script>' } }],
+      [3, { user: { id: 'user-1', name: 'plain">bad' } }],
+      [4, { user: { id: 'user-1', name: `ctrl${String.fromCharCode(7)}char` } }],
+    ])
+    validateAwarenessStates(states, ctxFor('user-1'))
+    for (const id of [1, 2, 3, 4]) {
+      expect('name' in nameOf(states, id)).toBe(false) // script-vector name stripped
+      expect(states.has(id)).toBe(true) // state kept (non-fatal)
+    }
+  })
+
+  it('preserves a legitimate unicode / punctuation client name on the fallback path', () => {
+    // The guard is reject-a-script-vector, not a restrictive charset: ordinary
+    // names with unicode, spaces, and safe punctuation must survive untouched.
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: 'user-1', name: '大背头 (Ada) & co.' } }],
+    ])
+    validateAwarenessStates(states, ctxFor('user-1'))
+    expect(nameOf(states, 1).name).toBe('大背头 (Ada) & co.')
+  })
 })
 
 describe('awareness avatar sanitization (P2 XSS guard, non-fatal)', () => {
