@@ -18,7 +18,7 @@
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../config/env.js'
 import { corsMiddleware } from './cors.js'
-import { attachmentBlobGateway, localBlobGatewayEnabled } from './routes/attachmentBlob.js'
+import { attachmentBlobGateway, localBlobGatewayEnabled, isSignedBlobRequest } from './routes/attachmentBlob.js'
 import { authMiddleware } from './middleware/auth.js'
 import { spaceContextMiddleware } from './middleware/spaceContext.js'
 import { verifyBotMiddleware } from './middleware/verifyBot.js'
@@ -58,8 +58,27 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // origin. Mounted before express.json so it can read the raw upload stream;
   // it claims ONLY signed requests (carrying X-Method + X-Signature) and passes
   // everything else through, so it never shadows the routes below.
+  //
+  // A per-IP rate limiter runs IN FRONT of the gateway so the blob PUT/GET
+  // surface cannot be flooded to bypass throttling (XIN-728). The limiter is
+  // applied only to requests the gateway actually claims — non-blob requests
+  // (healthz, the metadata/bot mounts, CORS preflight) skip it entirely and keep
+  // their own independent limiter budgets downstream.
   if (localBlobGatewayEnabled()) {
-    app.use(attachmentBlobGateway)
+    const blobLimiter = createRateLimiter(opts.rateLimit)
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (!isSignedBlobRequest(req)) {
+        next()
+        return
+      }
+      blobLimiter(req, res, (err?: unknown) => {
+        if (err) {
+          next(err)
+          return
+        }
+        attachmentBlobGateway(req, res, next)
+      })
+    })
   }
 
   app.use(express.json({ limit: '1mb' }))

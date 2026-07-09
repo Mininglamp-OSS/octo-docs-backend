@@ -33,23 +33,20 @@ export function localBlobGatewayEnabled(): boolean {
   return config.attachments.driver === 'local-hmac'
 }
 
-/** Collect the raw request body, rejecting once it exceeds `limit` bytes. */
-function readBody(req: Request, limit: number): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let size = 0
-    req.on('data', (chunk: Buffer) => {
-      size += chunk.length
-      if (size > limit) {
-        reject(Object.assign(new Error('payload_too_large'), { code: 'payload_too_large' }))
-        req.destroy()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => resolve(Buffer.concat(chunks)))
-    req.on('error', reject)
-  })
+/**
+ * Whether a request is a signed attachment PUT/GET this gateway should claim.
+ * A request is claimed only when it carries the `X-Method` + `X-Signature` query
+ * params the driver mints AND uses a PUT or GET method — so the gateway never
+ * shadows the metadata API / bot mount / healthz, none of which carry them.
+ * Exported so the app can gate the (rate-limited) gateway mount on the same
+ * predicate without every unrelated request paying for the limiter.
+ */
+export function isSignedBlobRequest(req: Request): boolean {
+  return (
+    typeof req.query['X-Signature'] === 'string' &&
+    typeof req.query['X-Method'] === 'string' &&
+    (req.method === 'PUT' || req.method === 'GET')
+  )
 }
 
 /**
@@ -68,11 +65,7 @@ function signedUrlOf(req: Request): string {
  */
 export function attachmentBlobGateway(req: Request, res: Response, next: NextFunction): void {
   // Not a signed attachment request — leave it for the rest of the app.
-  if (
-    typeof req.query['X-Signature'] !== 'string' ||
-    typeof req.query['X-Method'] !== 'string' ||
-    (req.method !== 'PUT' && req.method !== 'GET')
-  ) {
+  if (!isSignedBlobRequest(req)) {
     next()
     return
   }
@@ -96,11 +89,19 @@ export function attachmentBlobGateway(req: Request, res: Response, next: NextFun
 
 async function handlePut(req: Request, res: Response, objectKey: string): Promise<void> {
   // A single hard cap covering the larger (file) tier; the presign endpoint has
-  // already enforced the precise per-mime tier before minting the URL.
+  // already enforced the precise per-mime tier before minting the URL. The body
+  // is streamed straight to the blob store with this byte cap rather than fully
+  // buffered — memory stays bounded to one chunk, so concurrent large uploads
+  // (or a flood) cannot exhaust the heap, and anything past the limit is aborted
+  // with a 413 without buffering the remainder (XIN-728 OOM DoS).
   const limit = config.attachments.maxFileSizeBytes
-  let body: Buffer
+  const contentType =
+    typeof req.headers['content-type'] === 'string'
+      ? req.headers['content-type']
+      : 'application/octet-stream'
+  let result: { bytes: number }
   try {
-    body = await readBody(req, limit)
+    result = await getLocalBlobStore().putStream(objectKey, contentType, req, limit)
   } catch (err) {
     if ((err as { code?: string }).code === 'payload_too_large') {
       res.status(413).json({ error: 'payload_too_large' })
@@ -109,12 +110,7 @@ async function handlePut(req: Request, res: Response, objectKey: string): Promis
     res.status(400).json({ error: 'upload_read_failed' })
     return
   }
-  const contentType =
-    typeof req.headers['content-type'] === 'string'
-      ? req.headers['content-type']
-      : 'application/octet-stream'
-  await getLocalBlobStore().put(objectKey, contentType, body)
-  res.status(200).json({ ok: true, bytes: body.length })
+  res.status(200).json({ ok: true, bytes: result.bytes })
 }
 
 async function handleGet(
