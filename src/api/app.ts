@@ -32,6 +32,7 @@ import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
 import { docContentRouter } from './routes/docContent.js'
+import { docSheetRouter } from './routes/docSheet.js'
 import { exportRouter } from './routes/export.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
@@ -78,6 +79,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
   api.use(docContentRouter) // /:docId/content (bot incremental body edit + live read)
+  api.use(docSheetRouter) // /:docId/sheet (live spreadsheet content read, R-A)
   api.use(exportRouter) // /:docId/export/pdf (server-side Typst render)
 
   app.use('/api/v1/docs', api)
@@ -105,6 +107,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   botApi.use(commentsRouter)
   botApi.use(versionsRouter)
   botApi.use(docContentRouter)
+  botApi.use(docSheetRouter)
   app.use('/v1/bot/docs', botApi)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
