@@ -9,9 +9,9 @@ WORKDIR /app
 #   - font-noto-cjk  → Chinese/Japanese/Korean glyphs
 #   - font-noto-emoji → colour emoji (matches what the editor shows)
 RUN apk add --no-cache \
-      font-noto \
-      font-noto-cjk \
-      font-noto-emoji
+      font-noto=2026.06.01-r0 \
+      font-noto-cjk=0_git20220127-r1 \
+      font-noto-emoji=2.051-r0
 
 # Typst binary for server-side PDF export (renderTypst.ts / typstService.ts).
 #
@@ -22,7 +22,7 @@ RUN apk add --no-cache \
 # Compile concurrency is capped in typstService.ts (TYPST_EXPORT_MAX_CONCURRENT,
 # default 2).
 ARG TYPST_VERSION=v0.13.1
-RUN apk add --no-cache --virtual .typst-fetch curl tar xz \
+RUN apk add --no-cache --virtual .typst-fetch curl=8.21.0-r0 tar=1.35-r5 xz=5.8.3-r0 \
     && ARCH="$(uname -m)" \
     && case "$ARCH" in \
          x86_64) TARGET=x86_64-unknown-linux-musl ;; \
