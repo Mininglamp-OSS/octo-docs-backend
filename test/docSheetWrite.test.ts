@@ -362,7 +362,11 @@ describe('cumulative size gate', () => {
       await patchDocSheetHandler(req({ docId: 'd_1' }, { body: bodyFor(view, cells) }), res as never)
 
       expect(res.statusCode).toBe(413)
-      expect(res.body).toEqual({ error: 'doc_too_large' })
+      const body = res.body as { error: string; docBytes: number; limit: number }
+      expect(body.error).toBe('doc_too_large')
+      // Storage-dimension observability: docBytes over the maxDocBytes limit.
+      expect(body.limit).toBe(40)
+      expect(body.docBytes).toBeGreaterThan(40)
       // Gated in the no-lock pre-flight: no safety snapshot, no live write/broadcast.
       expect(createSpy).not.toHaveBeenCalled()
       expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
@@ -388,7 +392,12 @@ describe('cumulative size gate', () => {
       await patchDocSheetHandler(req({ docId: 'd_1' }, { body: bodyFor(view, cells) }), res as never)
 
       expect(res.statusCode).toBe(413)
-      expect(res.body).toEqual({ error: 'sheet_too_large' })
+      const body = res.body as { error: string; payloadBytes: number; limit: number }
+      expect(body.error).toBe('sheet_too_large')
+      // Read-payload-dimension observability, the SAME field name the read gate
+      // (GET /:docId/sheet) emits — write/read 413 bodies are consistent.
+      expect(body.limit).toBe(20)
+      expect(body.payloadBytes).toBeGreaterThan(20)
       expect(createSpy).not.toHaveBeenCalled()
       expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
     } finally {

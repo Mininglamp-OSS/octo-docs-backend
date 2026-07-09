@@ -52,7 +52,19 @@ export interface EditDocSheetInput {
 
 export type EditDocSheetResult =
   | { ok: true; bytes: number; baseVersion: string; newDocVersionSeq: number }
-  | { ok: false; status: number; error: string }
+  | {
+      ok: false
+      status: number
+      error: string
+      // Observability for the two size 413s (added info, no behavior change):
+      // sheet_too_large carries payloadBytes (the read-payload dimension),
+      // doc_too_large carries docBytes (the storage dimension). Both carry the
+      // `limit` they were measured against so the caller sees how far past the cap
+      // the write sits. Absent for non-size errors (412/422/403/…).
+      payloadBytes?: number
+      docBytes?: number
+      limit?: number
+    }
 
 interface LockedMetaRow {
   owner_id: string
@@ -105,12 +117,22 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
   // rejection here leaves no snapshot row and no live side effect.
   const { docBytes, payloadBytes } = measureSheetAfterEdit(preEditState, input.cells)
   // Align the write cap to the read cap so a written sheet is always GET-readable.
+  // Report payloadBytes/limit (the read-payload dimension) so the write-gate 413
+  // carries the SAME observability field the read gate emits (docSheet.ts).
   if (payloadBytes > config.sheetRead.maxCellBytes) {
-    return { ok: false, status: 413, error: 'sheet_too_large' }
+    return {
+      ok: false,
+      status: 413,
+      error: 'sheet_too_large',
+      payloadBytes,
+      limit: config.sheetRead.maxCellBytes,
+    }
   }
   // Hard persistence cap — the exact byte budget persistence.store enforces.
+  // Report docBytes/limit (the storage dimension) so a doc_too_large caller can
+  // tell it tripped the 10MB storage cap, not the 1MB read-payload cap.
   if (docBytes > config.maxDocBytes) {
-    return { ok: false, status: 413, error: 'doc_too_large' }
+    return { ok: false, status: 413, error: 'doc_too_large', docBytes, limit: config.maxDocBytes }
   }
 
   // ── 2. Auth-recheck + safety-snapshot transaction ─────────────────────────

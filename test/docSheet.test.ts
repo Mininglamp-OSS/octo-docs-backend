@@ -179,10 +179,10 @@ describe('large-sheet read guard', () => {
     await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
 
     expect(res.statusCode).toBe(413)
-    const body = res.body as { error: string; bytes: number; limit: number }
+    const body = res.body as { error: string; payloadBytes: number; limit: number }
     expect(body.error).toBe('sheet_too_large')
     expect(body.limit).toBe(200)
-    expect(body.bytes).toBeGreaterThan(200)
+    expect(body.payloadBytes).toBeGreaterThan(200)
   })
 
   it('serves a sheet that sits just under the cap', async () => {
@@ -398,5 +398,100 @@ describe('paginated sheet read', () => {
     expect(Object.keys(secondBody.sheetCells).length).toBeGreaterThan(
       Object.keys(firstBody.sheetCells).length,
     )
+  })
+})
+
+// ── write-gate-bypass oversized sheet: whole-read 413 but fully paginable ──────
+//
+// The core regression for this surface. A sheet whose READ PAYLOAD genuinely
+// exceeds maxCellBytes is not reachable through editDocSheet's PATCH write gate
+// (it aligns the write cap to the read cap so every written sheet stays
+// whole-read-readable). It IS reachable by seeding the live Y.Doc directly —
+// exactly what a version-restore of a historic oversized snapshot or a bulk
+// import does. liveSheet() builds the Y.Doc straight from raw cell maps, so it
+// stands in for those write-gate-bypass paths.
+//
+// The guarantee under test: such a sheet whole-reads 413 sheet_too_large (RED),
+// yet a paginated read walks every one of its cells page by page (GREEN). No
+// cell is stranded behind the whole-read wall. Uses the REAL default 1 MB cap
+// (not a lowered one) so the payload is TRULY over maxCellBytes.
+describe('write-gate-bypass oversized sheet is whole-read 413 but fully paginable', () => {
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(sheetGuard))
+
+  const CELL_COUNT = 1200
+  /**
+   * A single-column sheet whose decoded {sheetCells, sheetDims} JSON is > 1 MB.
+   * Each value is ~1 KB, so 1200 cells clears the default maxCellBytes (1 MB)
+   * with headroom — a genuinely oversized read payload, measured for real.
+   */
+  function oversizedSheet(): Record<string, SheetCell> {
+    const cells: Record<string, SheetCell> = {}
+    for (let r = 0; r < CELL_COUNT; r++) {
+      cells[`default!${r}:0`] = { v: `${r}-${'x'.repeat(1000)}` }
+    }
+    return cells
+  }
+
+  it('whole-read (no params) returns 413 sheet_too_large reporting payloadBytes over the 1 MB cap', async () => {
+    const cells = oversizedSheet()
+    // Sanity: the payload is truly over the default read cap before we assert.
+    const realBytes = Buffer.byteLength(JSON.stringify({ sheetCells: cells, sheetDims: {} }))
+    expect(realBytes).toBeGreaterThan(config.sheetRead.maxCellBytes)
+
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    const body = res.body as { error: string; payloadBytes: number; limit: number; hint: string }
+    expect(body.error).toBe('sheet_too_large')
+    expect(body.limit).toBe(config.sheetRead.maxCellBytes)
+    expect(body.payloadBytes).toBeGreaterThan(config.sheetRead.maxCellBytes)
+    // The 413 tells the caller how to retrieve it.
+    expect(body.hint).toContain('?limit=')
+  })
+
+  it('paginated read walks the whole oversized sheet page by page (every cell, no gap/overlap, each page under the cap)', async () => {
+    const cells = oversizedSheet()
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells))
+
+    const seen: string[] = []
+    let cursor: string | null = null
+    let pages = 0
+    let sawMultiplePages = false
+    for (;;) {
+      const res = mockRes()
+      // A limit far above maxPageLimit is clamped; the byte cap governs regardless.
+      const query: Record<string, string> = { limit: '100000' }
+      if (cursor) query.cursor = cursor
+      await getDocSheetHandler(req({ docId: 'd_1' }, query), res as never)
+
+      expect(res.statusCode).toBe(200)
+      const body = res.body as {
+        sheetCells: Record<string, SheetCell>
+        sheetDims?: Record<string, number>
+        hasMore: boolean
+        nextCursor: string | null
+      }
+      // No page may exceed the whole-read cap (cells + dims on page one).
+      const pageBytes = Buffer.byteLength(
+        JSON.stringify({ sheetCells: body.sheetCells, sheetDims: body.sheetDims ?? {} }),
+      )
+      expect(pageBytes).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
+
+      seen.push(...Object.keys(body.sheetCells))
+      if (!body.hasMore) break
+      sawMultiplePages = true
+      cursor = body.nextCursor
+      if (++pages > 100) throw new Error('pagination did not terminate')
+    }
+
+    // Every cell of the oversized sheet came back, exactly once — the whole-read
+    // 413 wall did not strand any cell.
+    expect(seen.length).toBe(CELL_COUNT)
+    expect(new Set(seen).size).toBe(CELL_COUNT)
+    // A >1 MB sheet under a 1 MB per-page cap must span more than one page.
+    expect(sawMultiplePages).toBe(true)
   })
 })
