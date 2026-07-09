@@ -105,6 +105,14 @@ export function validateSheetCell(key: unknown, value: unknown): SheetCell {
     if (v !== null && typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
       throw new SheetSnapshotInvalidError(`cell ${key}: v has invalid type`)
     }
+    // A numeric `v` must be finite. Infinity / -Infinity / NaN pass the typeof
+    // check but JSON.stringify serializes them to `null`, so they both mis-measure
+    // at the size gate (JSON.stringify(Infinity) === 'null') and round-trip through
+    // GET as a silent `{"v":null}` — a write-surface data loss. Reject fail-closed,
+    // mirroring validateSheetDim's Number.isFinite guard.
+    if (typeof v === 'number' && !Number.isFinite(v)) {
+      throw new SheetSnapshotInvalidError(`cell ${key}: v must be a finite number`)
+    }
     out.v = v as SheetCell['v']
   }
   if ('f' in rec) {
@@ -235,4 +243,48 @@ export function applySheetCellsToYMap(
   const { toDelete, toSet } = validateSheetCellBatch(cells)
   for (const key of toDelete) ymap.delete(key)
   for (const [key, cell] of toSet) ymap.set(key, cell)
+}
+
+/**
+ * Measure the sheet AFTER applying an edit batch, the two ways its downstream
+ * caps are enforced, so the write path can reject an oversized result in its
+ * no-lock pre-flight — BEFORE commitLiveSheetEdit applies the cells to the shared
+ * live Y.Doc, broadcasts them to peers, and only then fails at persistence.store.
+ * The sheet counterpart of docBodyEdit.sizeAfterEdit's 413 gate.
+ *
+ *   - docBytes: the encoded Y.Doc update length, hydrated from the LIVE
+ *     `preEditState` (so it carries the live clientId clocks + tombstones) exactly
+ *     as persistence.store caps it at config.maxDocBytes. A from-scratch encode
+ *     would be strictly smaller (fresh clientId, no accumulated history) and could
+ *     pass this pre-check only to have the live commit broadcast-then-fail on
+ *     store — the silent-fork hole this closes.
+ *   - payloadBytes: the decoded `{sheetCells, sheetDims}` JSON size, measured the
+ *     SAME way GET /:docId/sheet caps it at config.sheetRead.maxCellBytes, so a
+ *     batch can never write a sheet that GET then rejects with 413 (a
+ *     write-but-not-readable sheet reachable via chained PATCH→PATCH).
+ *
+ * Pure (no DB, no live infra): the caller compares the returned sizes against the
+ * configured caps and maps an overflow to 413.
+ */
+export function measureSheetAfterEdit(
+  preEditState: Uint8Array,
+  cells: Record<string, SheetCell | null>,
+): { docBytes: number; payloadBytes: number } {
+  const scratch = new Y.Doc()
+  Y.applyUpdate(scratch, preEditState)
+  const ymap = scratch.getMap<SheetCell>(SHEET_YMAP_FIELD)
+  // Apply the batch exactly as the live commit will (validate-all-then-apply), so
+  // the measured post-edit doc matches what commitLiveSheetEdit would persist.
+  scratch.transact(() => applySheetCellsToYMap(ymap, cells))
+  const docBytes = Y.encodeStateAsUpdate(scratch).length
+  // Decode + validate BOTH synced maps exactly as GET does (decodeSheetSnapshot /
+  // decodeSheetDimsSnapshot) so payloadBytes is byte-identical to the read body.
+  const rawCells: Record<string, unknown> = {}
+  for (const [key, val] of scratch.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
+  const rawDims: Record<string, unknown> = {}
+  for (const [key, val] of scratch.getMap(SHEET_DIMS_FIELD).entries()) rawDims[key] = val
+  const sheetCells = validateSheetCells(rawCells)
+  const sheetDims = validateSheetDims(rawDims)
+  const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))
+  return { docBytes, payloadBytes }
 }

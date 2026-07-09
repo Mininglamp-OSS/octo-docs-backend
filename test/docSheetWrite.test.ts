@@ -341,6 +341,134 @@ describe('optimistic concurrency & safety contract', () => {
   })
 })
 
+// ── cumulative size gate (P1-A): reject an oversized result BEFORE the live commit ─
+describe('cumulative size gate', () => {
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(writerGuard))
+
+  it('413 doc_too_large when the post-edit Y.Doc would exceed maxDocBytes, before any snapshot/commit', async () => {
+    const view = liveSheet({ 'default!0:0': { v: 'seed' } })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx(okMeta)
+
+    // A tiny persistence cap: the encoded scratch Y.Doc (seed + new cells) is a
+    // few hundred bytes, so the pre-flight size gate must reject the batch as a
+    // 413 rather than let commitLiveSheetEdit broadcast then fail on store.
+    const original = config.maxDocBytes
+    config.maxDocBytes = 40
+    try {
+      const res = mockRes()
+      const cells = { 'default!0:0': { v: 'a much larger replacement value' }, 'default!1:1': { v: 'more' } }
+      await patchDocSheetHandler(req({ docId: 'd_1' }, { body: bodyFor(view, cells) }), res as never)
+
+      expect(res.statusCode).toBe(413)
+      expect(res.body).toEqual({ error: 'doc_too_large' })
+      // Gated in the no-lock pre-flight: no safety snapshot, no live write/broadcast.
+      expect(createSpy).not.toHaveBeenCalled()
+      expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+    } finally {
+      config.maxDocBytes = original
+    }
+  })
+
+  it('413 sheet_too_large when the post-edit payload would exceed the read cap (write-but-not-readable)', async () => {
+    const view = liveSheet({ 'default!0:0': { v: 'seed' } })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx(okMeta)
+
+    // Align the write cap to the read cap: a batch that would push the decoded
+    // {sheetCells,sheetDims} payload past sheetRead.maxCellBytes must 413 here so
+    // the written sheet stays GET-readable (no chainable PATCH past the read cap).
+    const original = config.sheetRead.maxCellBytes
+    config.sheetRead.maxCellBytes = 20
+    try {
+      const res = mockRes()
+      const cells = { 'default!0:0': { v: 'a value well past the tiny read cap' } }
+      await patchDocSheetHandler(req({ docId: 'd_1' }, { body: bodyFor(view, cells) }), res as never)
+
+      expect(res.statusCode).toBe(413)
+      expect(res.body).toEqual({ error: 'sheet_too_large' })
+      expect(createSpy).not.toHaveBeenCalled()
+      expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+    } finally {
+      config.sheetRead.maxCellBytes = original
+    }
+  })
+
+  it('accepts a batch that stays within both caps', async () => {
+    const view = liveSheet({ 'default!0:0': { v: 'seed' } })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    vi.mocked(commitLiveSheetEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 50 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(9)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(
+      req({ docId: 'd_1' }, { body: bodyFor(view, { 'default!0:0': { v: 'small' } }) }),
+      res as never,
+    )
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(commitLiveSheetEdit)).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ── non-finite cell value (P1-B): reject fail-closed instead of silent null ────────
+describe('non-finite cell value', () => {
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(writerGuard))
+
+  it('422 sheet_cell_invalid on a non-finite numeric v (Infinity/-Infinity/NaN), before any lock/write', async () => {
+    for (const bad of [Infinity, -Infinity, NaN]) {
+      const view = liveSheet()
+      vi.mocked(readLiveSheet).mockResolvedValue(view)
+      const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+      mockTx(okMeta)
+
+      const res = mockRes()
+      await patchDocSheetHandler(
+        req({ docId: 'd_1' }, { body: bodyFor(view, { 'default!0:0': { v: bad } }) }),
+        res as never,
+      )
+
+      expect(res.statusCode).toBe(422)
+      expect(res.body).toEqual({ error: 'sheet_cell_invalid' })
+      expect(createSpy).not.toHaveBeenCalled()
+      expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+      createSpy.mockRestore()
+    }
+  })
+})
+
+// ── store-time failure preserves the safety snapshot (P2) ──────────────────────────
+describe('compensation delete is scoped to pre-mutation guard errors', () => {
+  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(writerGuard))
+
+  it('keeps the safety snapshot (no compensating delete) + 500 when the live commit fails AFTER the mutation/broadcast', async () => {
+    const view = liveSheet({ 'default!0:0': { v: 1 } })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    // A store-time failure (e.g. persistence.store maxDocBytes overflow / DB error)
+    // is thrown AFTER the cell already applied to the shared Y.Doc + broadcast to
+    // peers — NOT a mapped pre-mutation guard error.
+    vi.mocked(commitLiveSheetEdit).mockRejectedValue(new Error('store overflow after broadcast'))
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(88)
+    const delSpy = vi.spyOn(docVersionRepo, 'deleteById').mockResolvedValue(undefined)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(
+      req({ docId: 'd_1' }, { body: bodyFor(view, { 'default!0:0': { v: 2 } }) }),
+      res as never,
+    )
+
+    expect(res.statusCode).toBe(500)
+    expect(res.body).toEqual({ error: 'internal_error' })
+    // The snapshot is the only undo record for an edit peers have already seen —
+    // it MUST be preserved, so no compensating delete on a store-time failure.
+    expect(delSpy).not.toHaveBeenCalled()
+  })
+})
+
 // ── cell contract (fail-closed) ──────────────────────────────────────────────────
 describe('cell contract validation', () => {
   beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(writerGuard))

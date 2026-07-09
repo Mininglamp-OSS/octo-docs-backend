@@ -30,10 +30,12 @@ import { readLiveSheet, commitLiveSheetEdit } from '../../collab/liveSheetWrite.
 import { encodeBaseVersion, stateVectorsEqual, BaseVersionStaleError } from '../../collab/docBodyEdit.js'
 import {
   validateSheetCellBatch,
+  measureSheetAfterEdit,
   SheetSnapshotInvalidError,
   type SheetCell,
 } from '../../agent/sheetConversion.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
+import { config } from '../../config/env.js'
 import { roleAtLeast } from '../../permission/role.js'
 
 export interface EditDocSheetInput {
@@ -91,6 +93,26 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     throw err
   }
 
+  // size gate (P1-A, mirrors editDocBody's sizeAfterEdit > maxDocBytes gate):
+  // measure the post-edit sheet the SAME two ways its downstream caps are
+  // enforced and reject an overflow HERE — before commitLiveSheetEdit applies the
+  // cells to the shared live Y.Doc, broadcasts them to peers, and only then fails
+  // at persistence.store. Without this gate a compliant single-request batch that
+  // pushes the doc past maxDocBytes would broadcast-then-fail (a silent fork: the
+  // caller gets a 500, peers keep the edit, the DB reload later wins), and a
+  // chained PATCH→PATCH could grow the sheet past the read cap into a
+  // write-but-not-readable state (GET permanently 413s). No lock is held yet, so a
+  // rejection here leaves no snapshot row and no live side effect.
+  const { docBytes, payloadBytes } = measureSheetAfterEdit(preEditState, input.cells)
+  // Align the write cap to the read cap so a written sheet is always GET-readable.
+  if (payloadBytes > config.sheetRead.maxCellBytes) {
+    return { ok: false, status: 413, error: 'sheet_too_large' }
+  }
+  // Hard persistence cap — the exact byte budget persistence.store enforces.
+  if (docBytes > config.maxDocBytes) {
+    return { ok: false, status: 413, error: 'doc_too_large' }
+  }
+
   // ── 2. Auth-recheck + safety-snapshot transaction ─────────────────────────
   const txResult = await transaction(async (tx) => {
     // Lock the authoritative state row FIRST (yjs_document -> doc_meta order).
@@ -146,16 +168,30 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     // pre-flight and this commit — a drift fails here with no mutation/broadcast.
     // Phase 2 already committed the KIND_RESTORE_MARKER safety snapshot and
     // released its locks, so a rejection here would otherwise leave an orphan
-    // restore point for an edit that never touched the sheet. Compensating-delete
-    // it so a rejected (e.g. 412) request leaves no doc_version side effect. A
-    // failure of the compensating delete must not mask the original edit error.
-    try {
-      await docVersionRepo.deleteById(txResult.safetyVersionId)
-    } catch {
-      /* best-effort rollback; surface the original edit error below */
-    }
+    // restore point for an edit that never touched the sheet.
+    //
+    // P2: scope the compensating delete to PRE-MUTATION guard rejections only.
+    // commitLiveSheetEdit's state-vector guard (BaseVersionStaleError) is its
+    // first statement and applySheetCellsToYMap validates the whole batch
+    // (SheetSnapshotInvalidError) BEFORE it mutates — both throw with nothing
+    // applied or broadcast, so the snapshot is an orphan and must be deleted. Any
+    // OTHER failure (store-time overflow, a DB error on the disconnect flush) is
+    // thrown AFTER the cell already applied to the shared Y.Doc and broadcast to
+    // peers: the safety snapshot is then the ONLY undo record for a change peers
+    // have seen, so it MUST be preserved and the request fails 500 — deleting it
+    // would strip the sole restore point for a live, peer-visible edit.
     const mapped = mapEditError(err)
-    if (mapped) return { ok: false, ...mapped }
+    if (mapped) {
+      // Best-effort compensating delete; a failure must not mask the edit error.
+      try {
+        await docVersionRepo.deleteById(txResult.safetyVersionId)
+      } catch {
+        /* surface the original edit error below */
+      }
+      return { ok: false, ...mapped }
+    }
+    // Unknown / store-time failure: keep the snapshot, surface as 500 (the route
+    // maps a thrown error to internal_error).
     throw err
   }
 
