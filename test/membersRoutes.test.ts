@@ -10,7 +10,7 @@ vi.mock('../src/api/guard.js', () => ({
   requireDocRole: vi.fn(),
 }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
-  docMemberRepo: { upsertDirect: vi.fn(async () => {}) },
+  docMemberRepo: { upsertDirect: vi.fn(async () => {}), list: vi.fn(async () => []) },
 }))
 vi.mock('../src/permission/epoch.js', () => ({
   bumpEpoch: vi.fn(async () => {}),
@@ -53,6 +53,18 @@ function putMemberHandler() {
     }
   }
   throw new Error('put-member handler not found')
+}
+
+// Resolve the GET list-members handler from the Express router stack.
+function getMembersHandler() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for (const layer of (membersRouter as unknown as { stack: any[] }).stack) {
+    const route = layer.route
+    if (route && route.path === '/:docId/members' && route.methods?.get) {
+      return route.stack[route.stack.length - 1].handle as (req: unknown, res: unknown) => Promise<void>
+    }
+  }
+  throw new Error('get-members handler not found')
 }
 
 // Request carrying the authenticated caller's octo token (set by authMiddleware
@@ -121,5 +133,80 @@ describe('PUT /api/v1/docs/:docId/members — anti ghost-member check', () => {
 
     expect(res.statusCode).toBe(200)
     expect(getUser).toHaveBeenCalledWith('u_real', 'tok-xyz')
+  })
+})
+
+// GET list-members synthesizes the implicit owner (§4.2). The owner is an
+// implicit admin with no doc_member row, so a plain listing omitted it and
+// disagreed with `docs get` (which reports ownerId). The handler now prepends a
+// synthesized owner item {role:'admin', source:'owner', grantedBy:null} and
+// dedups any doc_member row for the same owner_id. doc and sheet share this
+// endpoint, so both are covered by driving the same handler with each doc_type.
+function getReq(docId = 'd_1') {
+  return { uid: 'u_admin', spaceId: 's1', params: { docId } } as never
+}
+
+// Point the guard at a specific owner_id + doc_type for one GET call.
+function guardWithOwner(ownerId: string, docType = 'doc') {
+  vi.mocked(requireDocRole).mockResolvedValue({
+    meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: ownerId, doc_type: docType },
+    role: 'admin',
+  } as never)
+}
+
+describe('GET /api/v1/docs/:docId/members — synthesized owner row', () => {
+  // Each case runs for a document AND a sheet (shared endpoint => identical
+  // behavior); the parity assertion is the doc/sheet double-coverage.
+  const docTypes = ['doc', 'sheet']
+
+  it('includes the owner (role=admin, source=owner) when there are no other members', async () => {
+    for (const docType of docTypes) {
+      guardWithOwner('u_owner', docType)
+      vi.mocked(docMemberRepo.list).mockResolvedValue([] as never)
+      const res = mockRes()
+      await getMembersHandler()(getReq(), res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect((res.body as { items: unknown[] }).items).toEqual([
+        { uid: 'u_owner', role: 'admin', source: 'owner', grantedBy: null },
+      ])
+    }
+  })
+
+  it('dedups an owner that also has a doc_member row into a single admin/owner item', async () => {
+    for (const docType of docTypes) {
+      guardWithOwner('u_owner', docType)
+      // Historical PUT upserted the owner as a writer direct row — must NOT
+      // surface as a second item, and must stay admin (owner not downgradable).
+      vi.mocked(docMemberRepo.list).mockResolvedValue([
+        { uid: 'u_owner', role: 2, source: 1, granted_by: 'u_owner' },
+      ] as never)
+      const res = mockRes()
+      await getMembersHandler()(getReq(), res as never)
+
+      expect(res.statusCode).toBe(200)
+      const items = (res.body as { items: Array<{ uid: string }> }).items
+      expect(items).toEqual([{ uid: 'u_owner', role: 'admin', source: 'owner', grantedBy: null }])
+      expect(items.filter((i) => i.uid === 'u_owner')).toHaveLength(1)
+    }
+  })
+
+  it('keeps direct/invite members alongside the owner without dropping or duplicating them', async () => {
+    for (const docType of docTypes) {
+      guardWithOwner('u_owner', docType)
+      vi.mocked(docMemberRepo.list).mockResolvedValue([
+        { uid: 'u_writer', role: 2, source: 1, granted_by: 'u_owner' }, // direct writer
+        { uid: 'u_reader', role: 1, source: 2, granted_by: 'u_admin' }, // invite reader
+      ] as never)
+      const res = mockRes()
+      await getMembersHandler()(getReq(), res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect((res.body as { items: unknown[] }).items).toEqual([
+        { uid: 'u_owner', role: 'admin', source: 'owner', grantedBy: null },
+        { uid: 'u_writer', role: 'writer', source: 'direct', grantedBy: 'u_owner' },
+        { uid: 'u_reader', role: 'reader', source: 'invite', grantedBy: 'u_admin' },
+      ])
+    }
   })
 })
