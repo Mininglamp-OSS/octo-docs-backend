@@ -23,14 +23,29 @@ function parseRole(v: unknown): Role | null {
 membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
+  const ownerId = guard.meta.owner_id
   const members = await docMemberRepo.list(req.params.docId!)
-  res.status(200).json({
-    items: members.map((m) => ({
+  // The owner is an implicit admin and intentionally has NO doc_member row
+  // (§4.2 owner => admin; DELETE owner_cannot_be_removed). A plain doc_member
+  // listing therefore omits it, even though `docs get` reports it as ownerId —
+  // an inconsistency between the two reads. Surface the owner explicitly as a
+  // synthesized item so `members list` and `docs get` agree on owner
+  // visibility. This is display-only: no doc_member row is written, so the
+  // implicit-owner semantics above stay intact. doc and sheet share this
+  // endpoint, so both gain the owner row identically.
+  const directMembers = members
+    // Dedup: if a doc_member row for the owner also exists (e.g. a historical
+    // PUT that upserted the owner), drop it so the owner appears exactly once,
+    // always as admin (owner is not downgradable), never as a duplicate row.
+    .filter((m) => m.uid !== ownerId)
+    .map((m) => ({
       uid: m.uid,
       role: roleName(Number(m.role)),
       source: m.source === 2 ? 'invite' : 'direct',
       grantedBy: m.granted_by,
-    })),
+    }))
+  res.status(200).json({
+    items: [{ uid: ownerId, role: 'admin', source: 'owner', grantedBy: null }, ...directMembers],
   })
 })
 
