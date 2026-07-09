@@ -341,4 +341,62 @@ describe('paginated sheet read', () => {
     expect(Object.keys(body.sheetCells).length).toBe(5)
     expect(body.hasMore).toBe(true)
   })
+
+  it('first page counts sheetDims against the byte cap so cells+dims stay within it (P1-b)', async () => {
+    // Small cap; a chunky dims map eats most of it. Before the fix the cells
+    // budget ignored dims, so the first page (cells + dims) could exceed the cap.
+    config.sheetRead.maxCellBytes = 400
+    const dims: Record<string, number> = {}
+    for (let c = 0; c < 20; c++) dims[`c${c}`] = 120 + c
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet(), dims))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      sheetCells: Record<string, SheetCell>
+      sheetDims: Record<string, number>
+      hasMore: boolean
+    }
+    // The whole first-page body (cells + dims, the two grid fields the caller
+    // receives) must not exceed the per-page byte cap.
+    const firstPageBytes = Buffer.byteLength(
+      JSON.stringify({ sheetCells: body.sheetCells, sheetDims: body.sheetDims }),
+    )
+    expect(firstPageBytes).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
+    // Dims still returned on the first page, and the walk still makes progress.
+    expect(body.sheetDims).toEqual(dims)
+    expect(body.hasMore).toBe(true)
+  })
+
+  it('subsequent pages keep the full byte budget (dims omitted, not reserved)', async () => {
+    // With dims charged only to the first page, page two must NOT keep reserving
+    // their bytes — it gets the whole cap for cells. Use a sheet large enough that
+    // the byte budget (not the cell supply) bounds BOTH pages, so the comparison
+    // reflects the budget difference rather than the sheet running out.
+    config.sheetRead.maxCellBytes = 400
+    const cells: Record<string, SheetCell> = {}
+    for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}` }
+    const dims: Record<string, number> = {}
+    for (let c = 0; c < 20; c++) dims[`c${c}`] = 120 + c
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells, dims))
+
+    const first = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), first as never)
+    const firstBody = first.body as { sheetCells: Record<string, SheetCell>; nextCursor: string | null }
+    expect(firstBody.nextCursor).not.toBeNull()
+
+    const second = mockRes()
+    await getDocSheetHandler(
+      req({ docId: 'd_1' }, { limit: '100', cursor: firstBody.nextCursor! }),
+      second as never,
+    )
+    const secondBody = second.body as { sheetCells: Record<string, SheetCell>; sheetDims?: object }
+    expect(secondBody.sheetDims).toBeUndefined()
+    // Page two, freed of the dims reservation, fits more cells than the first page.
+    expect(Object.keys(secondBody.sheetCells).length).toBeGreaterThan(
+      Object.keys(firstBody.sheetCells).length,
+    )
+  })
 })

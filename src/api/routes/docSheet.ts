@@ -152,6 +152,31 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
 }
 
 /**
+ * Byte budget for a page's CELLS. maxCellBytes caps the grid payload — the same
+ * `{ sheetCells, sheetDims }` object the whole-sheet read measures for its 413
+ * (see getDocSheetHandler). The first page also carries sheetDims (returned once,
+ * on page one), so budgeting only the cells against maxCellBytes let the first
+ * page's cells + dims together exceed the cap — the per-page byte wall was
+ * silently punched through whenever a sheet had non-trivial column/row overrides.
+ *
+ * Reserve everything in the grid payload EXCEPT the cells — the serialized dims
+ * plus the fixed `{ "sheetCells": …, "sheetDims": … }` framing — so the whole
+ * first page's grid payload (cells + dims) stays within maxCellBytes. Later pages
+ * omit dims and get the full budget.
+ *
+ * Floored at 0: paginateSheetCells always emits at least its first cell (progress
+ * guarantee), so even a pathologically large dims map still makes forward
+ * progress rather than returning an empty, non-advancing page.
+ */
+function firstPageCellBudget(isFirstPage: boolean, sheetDims: Record<string, number>): number {
+  if (!isFirstPage) return config.sheetRead.maxCellBytes
+  // Envelope = the grid payload with an empty cell map: the dims plus the object
+  // framing that will wrap the cells. Reserving it keeps cells + dims ≤ the cap.
+  const envelopeBytes = Buffer.byteLength(JSON.stringify({ sheetCells: {}, sheetDims }))
+  return Math.max(0, config.sheetRead.maxCellBytes - envelopeBytes)
+}
+
+/**
  * Serve one page of a paginated sheet read. The cells are sliced from the
  * already-decoded snapshot in canonical (sheetId, row, col) order, bounded by
  * both the caller's ?limit and the per-page byte cap (maxCellBytes) so no page
@@ -209,7 +234,7 @@ async function respondPaginatedSheet(
     args.sheetCells,
     afterKey,
     parsedLimit.limit,
-    config.sheetRead.maxCellBytes,
+    firstPageCellBudget(isFirstPage, args.sheetDims),
   )
   const nextCursor =
     page.hasMore && page.lastKey !== null

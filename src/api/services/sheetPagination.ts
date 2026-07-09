@@ -57,10 +57,22 @@ function parseCellKey(key: string): CellKeyParts | null {
 }
 
 /**
- * Total order over cell keys: sheetId lexicographically, then row, then col
- * numerically (so `default!2:0` sorts before `default!10:0`, unlike a raw string
- * sort). This is the stable page order a cursor walks; it is deterministic for a
+ * STRICT total order over cell keys: sheetId lexicographically, then row, then
+ * col numerically (so `default!2:0` sorts before `default!10:0`, unlike a raw
+ * string sort), and a raw-string tiebreak so two DISTINCT keys never compare
+ * equal. This is the stable page order a cursor walks; it is deterministic for a
  * given snapshot so the same page boundaries reproduce across page requests.
+ *
+ * The tiebreak is load-bearing, not cosmetic. CELL_KEY_RE (sheetConversion.ts)
+ * permits leading zeros in the row/col segments — `default!0:0` and
+ * `default!00:0` both validate and are DISTINCT entries in the flat 'sheet'
+ * Y.Map. Comparing only the parsed numbers made those two keys compare equal
+ * (Number('00') === Number('0')). The cursor walk skips consumed keys with
+ * `compareCellKeys(candidate, afterKey) <= 0`, so once one leading-zero variant
+ * became the cursor's `afterKey`, its sibling was judged `<= 0` too and silently
+ * dropped across the page boundary — a data-loss bug on paginated reads. Breaking
+ * the tie on the raw key makes the order strict: distinct keys are never equal,
+ * so the walk emits every cell exactly once.
  */
 export function compareCellKeys(a: string, b: string): number {
   const pa = parseCellKey(a)
@@ -70,7 +82,10 @@ export function compareCellKeys(a: string, b: string): number {
   if (pa.sheetId !== pb.sheetId) return pa.sheetId < pb.sheetId ? -1 : 1
   if (pa.row !== pb.row) return pa.row - pb.row
   if (pa.col !== pb.col) return pa.col - pb.col
-  return 0
+  // Numerically identical (sheetId + row + col) but the raw keys differ — a
+  // leading-zero variant. Tiebreak on the raw key so the order stays STRICT and
+  // the cursor walk cannot collapse two distinct cells into one skip.
+  return a < b ? -1 : a > b ? 1 : 0
 }
 
 /** Sorted cell keys in canonical page order. */

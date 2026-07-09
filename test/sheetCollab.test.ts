@@ -30,11 +30,13 @@ import {
   decodeSheetSnapshot,
   decodeSheetDimsSnapshot,
   reconcileSheetMap,
+  decodeTargetSnapshot,
   SHEET_YMAP_FIELD as RESTORE_SHEET_FIELD,
   SHEET_DIMS_FIELD as RESTORE_DIMS_FIELD,
 } from '../src/collab/versionRestore.js'
 import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
 import { advanceEditVersion } from '../src/collab/liveDocWrite.js'
+import { reconcileRestoreOntoDoc } from '../src/collab/liveRestore.js'
 import { encodeBaseVersion, stateVectorsEqual } from '../src/collab/docBodyEdit.js'
 
 /** Build a Y.Doc binary state whose 'sheet' map holds the given cells. */
@@ -296,6 +298,42 @@ describe('versionRestore — reconcileSheetMap', () => {
 
     expect(touched).toBe(false) // neither side has a 'sheet' map
     expect(Array.from(after)).toEqual(Array.from(before)) // byte-identical
+  })
+})
+
+describe('liveRestore — reconcileRestoreOntoDoc advances the base version (P1-a)', () => {
+  const keep = sheetCellKey('default', 0, 0)
+  const drop = sheetCellKey('default', 0, 1)
+
+  it('a delete-only sheet restore moves the state vector forward', () => {
+    // Seed a live doc from a two-cell sheet, then reconcile it (once) to a
+    // one-cell target so its fragment already holds the canonical empty doc — the
+    // SECOND reconcile below then changes only the sheet (a pure deletion), which
+    // is where the SV-reuse hazard lives.
+    const live = liveDocFrom(sheetState({ [keep]: { v: 'a' }, [drop]: { v: 'b' } }))
+    const oneCell = sheetState({ [keep]: { v: 'a' } })
+    live.transact(() => reconcileRestoreOntoDoc(live, decodeTargetSnapshot(oneCell), oneCell))
+
+    // Delete-only restore: target has NO cells, so reconcileSheetMap only issues
+    // deletes and the fragment reconcile is a no-op (already the empty doc).
+    const emptySheet = sheetState({})
+    const svBefore = Y.encodeStateVector(live)
+    live.transact(() => reconcileRestoreOntoDoc(live, decodeTargetSnapshot(emptySheet), emptySheet))
+
+    // The cell was deleted AND the base version advanced despite no insert.
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).size).toBe(0)
+    expect(stateVectorsEqual(svBefore, Y.encodeStateVector(live))).toBe(false)
+  })
+
+  it('the hazard is real: reconcileSheetMap alone leaves a delete-only SV byte-identical', () => {
+    // The "why" for the bump above — a pure delete records only tombstones, and
+    // Y.encodeStateVector tracks insert clocks, so without advanceEditVersion the
+    // token would be reusable across a delete-only restore.
+    const live = liveDocFrom(sheetState({ [keep]: { v: 'a' } }))
+    const svBefore = Y.encodeStateVector(live)
+    live.transact(() => reconcileSheetMap(live, sheetState({})))
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).size).toBe(0) // deletion happened
+    expect(stateVectorsEqual(svBefore, Y.encodeStateVector(live))).toBe(true) // yet SV unchanged
   })
 })
 

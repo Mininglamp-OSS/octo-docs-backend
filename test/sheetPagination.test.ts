@@ -39,6 +39,28 @@ describe('compareCellKeys — canonical (sheetId, row, col) order', () => {
     }
     expect(sortedCellKeys(cells)).toEqual(['default!1:0', 'default!1:2', 'default!5:0'])
   })
+
+  it('is a STRICT total order: leading-zero variants never compare equal', () => {
+    // CELL_KEY_RE permits leading zeros, so `default!0:0` and `default!00:0` are
+    // distinct keys that parse to the same (row, col). A numeric-only comparator
+    // returned 0 for them; the strict order must not (else the cursor walk drops
+    // one across a page boundary — the P0 data-loss bug).
+    expect(compareCellKeys('default!0:0', 'default!00:0')).not.toBe(0)
+    expect(compareCellKeys('default!00:0', 'default!0:0')).not.toBe(0)
+    // Antisymmetric: the two directions have opposite sign.
+    expect(
+      Math.sign(compareCellKeys('default!0:0', 'default!00:0')) +
+        Math.sign(compareCellKeys('default!00:0', 'default!0:0')),
+    ).toBe(0)
+    // A key only ever compares equal to itself.
+    expect(compareCellKeys('default!00:0', 'default!00:0')).toBe(0)
+    // Numeric ordering across the variants is still honoured (2 before 10).
+    const keys = ['default!10:0', 'default!00:0', 'default!2:0', 'default!0:0']
+    const sorted = keys.slice().sort(compareCellKeys)
+    expect(sorted.indexOf('default!2:0')).toBeLessThan(sorted.indexOf('default!10:0'))
+    // Every input survives the sort (nothing collapsed away).
+    expect(new Set(sorted).size).toBe(keys.length)
+  })
 })
 
 describe('sheet cursor codec', () => {
@@ -120,5 +142,30 @@ describe('paginateSheetCells — count + byte bounded slicing', () => {
     expect(page.cells).toEqual({})
     expect(page.lastKey).toBeNull()
     expect(page.hasMore).toBe(false)
+  })
+
+  it('paging over leading-zero-variant keys loses no cell (P0 regression)', () => {
+    // Distinct keys that a numeric-only comparator treated as equal. With a
+    // one-cell limit the cursor's afterKey becomes each key in turn, so a
+    // non-strict order would skip the equal-comparing sibling and drop it.
+    const variants: Record<string, SheetCell> = {
+      'default!0:0': { v: 'a' },
+      'default!00:0': { v: 'b' },
+      'default!0:00': { v: 'c' },
+      'default!1:0': { v: 'd' },
+    }
+    const seen: string[] = []
+    let afterKey: string | null = null
+    let guard = 0
+    for (;;) {
+      const page = paginateSheetCells(variants, afterKey, 1, 1_000_000)
+      seen.push(...Object.keys(page.cells))
+      if (!page.hasMore) break
+      afterKey = page.lastKey
+      if (++guard > 100) throw new Error('pagination did not terminate')
+    }
+    // Every distinct key emitted exactly once — nothing dropped, nothing repeated.
+    expect(seen.slice().sort()).toEqual(Object.keys(variants).slice().sort())
+    expect(new Set(seen).size).toBe(seen.length)
   })
 })
