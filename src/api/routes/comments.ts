@@ -9,6 +9,14 @@
  * Yjs RelativePosition bytes: base64 on the wire, decoded to a Buffer for the
  * BLOB columns and served back as base64. The server never parses them.
  *
+ * A root comment's anchors normally come from a browser's live selection. A bot
+ * has no live selection, so it may instead supply `anchorText` (+ optional
+ * `blockPath` / `occurrence` to disambiguate) and the server resolves it against
+ * the live document into the same anchor bytes (feature #70; see anchorResolve).
+ * The legacy explicit `anchorStart` / `anchorEnd` path is kept unchanged and
+ * always takes precedence, so the existing front-end selection flow is not
+ * affected.
+ *
  * Product decision: read => can comment, so creating a comment only needs the
  * reader role. Resolving/reopening a thread needs writer; deleting your own
  * comment (soft) needs to be its author; hard delete needs admin.
@@ -17,6 +25,12 @@ import { Router, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { roleAtLeast } from '../../permission/role.js'
 import { docCommentRepo, type DocComment } from '../../db/repos/docCommentRepo.js'
+import {
+  resolveAnchorFromLiveDoc,
+  AmbiguousAnchorError,
+  AnchorTextNotFoundError,
+} from '../../collab/anchorResolve.js'
+import type { BlockPath } from '../../collab/docBodyEdit.js'
 
 export const commentsRouter = Router()
 
@@ -67,6 +81,58 @@ function decodeAnchor(raw: unknown): Buffer | undefined | typeof INVALID_ANCHOR 
   if (buf.toString('base64') !== raw) return INVALID_ANCHOR
   if (buf.length === 0 || buf.length > MAX_ANCHOR_BYTES) return INVALID_ANCHOR
   return buf
+}
+
+/** Sentinel: a supplied disambiguation value is present but not well-formed. */
+const INVALID_DISAMBIGUATION = Symbol('invalid_disambiguation')
+
+/**
+ * Parse an optional `blockPath` disambiguation value into a child-index path.
+ *   - `undefined` / `null`      => absent
+ *   - number[] of non-neg ints  => that path
+ *   - "0,2,1" comma-separated    => parsed path (CLI passes a string flag)
+ *   - anything else             => INVALID_DISAMBIGUATION
+ * An empty path is rejected (it addresses the doc root, not a text block).
+ */
+function parseBlockPath(raw: unknown): BlockPath | undefined | typeof INVALID_DISAMBIGUATION {
+  if (raw === undefined || raw === null) return undefined
+  let parts: unknown[]
+  if (Array.isArray(raw)) {
+    parts = raw
+  } else if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (trimmed === '') return INVALID_DISAMBIGUATION
+    parts = trimmed.split(',').map((s) => s.trim())
+  } else {
+    return INVALID_DISAMBIGUATION
+  }
+  if (parts.length === 0) return INVALID_DISAMBIGUATION
+  const path: number[] = []
+  for (const part of parts) {
+    const n =
+      typeof part === 'number'
+        ? part
+        : typeof part === 'string' && /^\d+$/.test(part)
+          ? Number(part)
+          : NaN
+    if (!Number.isInteger(n) || n < 0) return INVALID_DISAMBIGUATION
+    path.push(n)
+  }
+  return path
+}
+
+/**
+ * Parse an optional 1-based `occurrence` selector.
+ *   - `undefined` / `null` => absent
+ *   - positive integer     => that occurrence
+ *   - anything else        => INVALID_DISAMBIGUATION
+ */
+function parseOccurrence(raw: unknown): number | undefined | typeof INVALID_DISAMBIGUATION {
+  if (raw === undefined || raw === null) return undefined
+  const n =
+    typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN
+  if (!Number.isSafeInteger(n) || n < 1) return INVALID_DISAMBIGUATION
+  return n
 }
 
 /** Serialize a stored comment for the wire (anchors -> base64). */
@@ -167,16 +233,56 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     return
   }
 
-  // ── Root: both anchors are required (opaque base64 -> Buffer). ──
-  const start = decodeAnchor(anchorStart)
-  const end = decodeAnchor(anchorEnd)
+  // ── Root: anchors are required. Two ways to supply them: ──
+  //   (a) legacy — explicit base64 anchorStart/anchorEnd from a live selection;
+  //   (b) bot — anchorText (+ optional blockPath/occurrence), resolved here.
+  // Legacy explicit anchors always win, so the existing front-end flow (which
+  // sends both anchors AND an anchorText snapshot) is untouched.
+  const startDec = decodeAnchor(anchorStart)
+  const endDec = decodeAnchor(anchorEnd)
   // Present-but-malformed/oversized is rejected distinctly from absent, so a
   // bad anchor is never silently stored as empty.
-  if (start === INVALID_ANCHOR || end === INVALID_ANCHOR) {
+  if (startDec === INVALID_ANCHOR || endDec === INVALID_ANCHOR) {
     res.status(400).json({ error: 'invalid_anchor' })
     return
   }
-  if (!start || !end) {
+
+  let start: Buffer
+  let end: Buffer
+  if (startDec && endDec) {
+    // (a) Legacy explicit anchors.
+    start = startDec
+    end = endDec
+  } else if (startDec === undefined && endDec === undefined && typeof anchorText === 'string' && anchorText.trim() !== '') {
+    // (b) Bot path: resolve anchorText against the live document.
+    const blockPath = parseBlockPath((req.body as Record<string, unknown>).blockPath)
+    const occurrence = parseOccurrence((req.body as Record<string, unknown>).occurrence)
+    if (blockPath === INVALID_DISAMBIGUATION) {
+      res.status(400).json({ error: 'invalid_block_path' })
+      return
+    }
+    if (occurrence === INVALID_DISAMBIGUATION) {
+      res.status(400).json({ error: 'invalid_occurrence' })
+      return
+    }
+    try {
+      const resolved = await resolveAnchorFromLiveDoc(documentName, { anchorText, blockPath, occurrence })
+      start = resolved.anchorStart
+      end = resolved.anchorEnd
+    } catch (err) {
+      // Fail-loud ambiguity/miss contract (design item 3) -> 422.
+      if (err instanceof AmbiguousAnchorError) {
+        res.status(422).json({ error: 'ambiguous_anchor', matches: err.matches })
+        return
+      }
+      if (err instanceof AnchorTextNotFoundError) {
+        res.status(422).json({ error: 'anchor_text_not_found' })
+        return
+      }
+      throw err
+    }
+  } else {
+    // Neither a full legacy anchor pair nor a usable anchorText.
     res.status(400).json({ error: 'anchorStart and anchorEnd required for a root comment' })
     return
   }
