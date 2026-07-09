@@ -28,6 +28,12 @@ import { editDocSheet } from '../services/editDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
 import { decodeSheetSnapshot, decodeSheetDimsSnapshot } from '../../collab/versionRestore.js'
 import { SheetSnapshotInvalidError, type SheetCell } from '../../agent/sheetConversion.js'
+import {
+  decodeSheetCursor,
+  encodeSheetCursor,
+  paginateSheetCells,
+  InvalidSheetCursorError,
+} from '../services/sheetPagination.js'
 import { config } from '../../config/env.js'
 
 export const docSheetRouter = Router()
@@ -55,30 +61,72 @@ function requireSheetDocType(res: Response, docType: string): boolean {
 // ── GET /:docId/sheet — read the live sheet (reader) ──────────────────────────
 docSheetRouter.get('/:docId/sheet', getDocSheetHandler)
 
+/** A single query value, taking the first when Express parsed a repeated param. */
+function firstQueryValue(v: unknown): string | undefined {
+  if (typeof v === 'string') return v
+  if (Array.isArray(v) && typeof v[0] === 'string') return v[0]
+  return undefined
+}
+
+/**
+ * Parse the caller's ?limit into a clamped positive integer, or an error to
+ * send. A blank/absent limit yields the configured default; a non-integer or
+ * non-positive value is a 400 invalid_limit (never silently coerced); a value
+ * over the cap is clamped down to config.sheetRead.maxPageLimit.
+ */
+function parsePageLimit(raw: string | undefined): { limit: number } | { error: string } {
+  if (raw === undefined || raw === '') return { limit: config.sheetRead.defaultPageLimit }
+  // Reject anything that is not a clean base-10 integer (e.g. "10.5", "1e3", "abc").
+  if (!/^[0-9]+$/.test(raw)) return { error: 'invalid_limit' }
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n <= 0) return { error: 'invalid_limit' }
+  return { limit: Math.min(n, config.sheetRead.maxPageLimit) }
+}
+
 export async function getDocSheetHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
   if (!requireSheetDocType(res, guard.meta.doc_type)) return
+
+  const limitRaw = firstQueryValue(req.query.limit)
+  const cursorRaw = firstQueryValue(req.query.cursor)
+  // Pagination is opt-in: a caller passing neither param gets the exact Stage1
+  // whole-sheet behavior (413 for an oversized grid), so existing callers and
+  // small sheets are unaffected. Either param switches on paginated mode.
+  const paginated = limitRaw !== undefined || cursorRaw !== undefined
 
   try {
     // Read the live authoritative state + its state vector, then decode with the
     // SAME validated primitives the version-restore preview uses (decodeSheet*),
     // so the read path and the preview path never drift on the {v,f,s} contract.
     const { state, baseSV } = await readLiveSheet(guard.meta.document_name)
-    const sheetCells = decodeSheetSnapshot(state)
+    const sheetCells = decodeSheetSnapshot(state) as Record<string, SheetCell>
     const sheetDims = decodeSheetDimsSnapshot(state)
+    const baseVersion = encodeBaseVersion(baseSV)
 
-    // Stage1 large-sheet guard: bound the decoded payload. The live Y.Doc is
-    // already capped at config.maxDocBytes so this decode + measure is bounded;
-    // a sheet whose cell payload exceeds the read cap returns a clear
-    // 413 sheet_too_large instead of an unbounded body. Paginated reads for
-    // oversized sheets are deferred to a later stage.
+    if (paginated) {
+      await respondPaginatedSheet(res, {
+        docId: guard.meta.doc_id,
+        sheetCells,
+        sheetDims,
+        baseVersion,
+        limitRaw,
+        cursorRaw,
+      })
+      return
+    }
+
+    // Legacy whole-sheet read (Stage1): bound the decoded payload. A sheet whose
+    // cell payload exceeds the read cap returns a clear 413 sheet_too_large
+    // instead of an unbounded body — now with a hint that a paginated read
+    // (?limit=/?cursor=) can retrieve it page by page.
     const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))
     if (payloadBytes > config.sheetRead.maxCellBytes) {
       res.status(413).json({
         error: 'sheet_too_large',
         bytes: payloadBytes,
         limit: config.sheetRead.maxCellBytes,
+        hint: 'retry with ?limit=<n> to read this sheet in pages',
       })
       return
     }
@@ -90,7 +138,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       // The live state vector, base64. Carried so a later write can guard on it
       // for optimistic concurrency (Stage2); this read does not reuse a historic
       // versions snapshot.
-      baseVersion: encodeBaseVersion(baseSV),
+      baseVersion,
     })
   } catch (err) {
     if (err instanceof SheetSnapshotInvalidError) {
@@ -101,6 +149,83 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     }
     res.status(500).json({ error: 'internal_error' })
   }
+}
+
+/**
+ * Serve one page of a paginated sheet read. The cells are sliced from the
+ * already-decoded snapshot in canonical (sheetId, row, col) order, bounded by
+ * both the caller's ?limit and the per-page byte cap (maxCellBytes) so no page
+ * exceeds the whole-sheet cap.
+ *
+ * Snapshot consistency: the cursor embeds the baseVersion the walk opened on.
+ * A cursor whose token no longer matches the live baseVersion means a write
+ * landed mid-walk — reject with 409 sheet_changed so the caller restarts from
+ * page one against a single consistent snapshot (the read-side mirror of the
+ * write path's If-Match guard). sheetDims is returned on the FIRST page only
+ * (it describes the whole grid and need not repeat per page); subsequent pages
+ * omit it.
+ */
+async function respondPaginatedSheet(
+  res: Response,
+  args: {
+    docId: string
+    sheetCells: Record<string, SheetCell>
+    sheetDims: Record<string, number>
+    baseVersion: string
+    limitRaw: string | undefined
+    cursorRaw: string | undefined
+  },
+): Promise<void> {
+  const parsedLimit = parsePageLimit(args.limitRaw)
+  if ('error' in parsedLimit) {
+    res.status(400).json({ error: parsedLimit.error })
+    return
+  }
+
+  let afterKey: string | null = null
+  let isFirstPage = true
+  if (args.cursorRaw !== undefined && args.cursorRaw !== '') {
+    let cursor
+    try {
+      cursor = decodeSheetCursor(args.cursorRaw)
+    } catch (err) {
+      if (err instanceof InvalidSheetCursorError) {
+        res.status(400).json({ error: 'invalid_cursor' })
+        return
+      }
+      throw err
+    }
+    // Drift guard: the snapshot the walk started on must still be live, or the
+    // pages would stitch together inconsistent snapshots.
+    if (cursor.v !== args.baseVersion) {
+      res.status(409).json({ error: 'sheet_changed' })
+      return
+    }
+    afterKey = cursor.k
+    isFirstPage = false
+  }
+
+  const page = paginateSheetCells(
+    args.sheetCells,
+    afterKey,
+    parsedLimit.limit,
+    config.sheetRead.maxCellBytes,
+  )
+  const nextCursor =
+    page.hasMore && page.lastKey !== null
+      ? encodeSheetCursor({ v: args.baseVersion, k: page.lastKey })
+      : null
+
+  const body: Record<string, unknown> = {
+    docId: args.docId,
+    sheetCells: page.cells,
+    baseVersion: args.baseVersion,
+    hasMore: page.hasMore,
+    nextCursor,
+  }
+  // Dims belong to the whole grid; return them once, on the first page.
+  if (isFirstPage) body.sheetDims = args.sheetDims
+  res.status(200).json(body)
 }
 
 /** Extract the base-version token from the If-Match header or the body mirror. */
