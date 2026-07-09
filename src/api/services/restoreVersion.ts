@@ -33,12 +33,13 @@ import {
   currentSchemaVersionFor,
   SchemaIncompatibleError,
   SheetSnapshotInvalidError,
+  BoardSnapshotInvalidError,
   type VersionContentKind,
 } from '../../collab/versionRestore.js'
 import { applyRestoreToLiveDoc, applyBoardRestoreToLiveDoc } from '../../collab/liveRestore.js'
+import { readLiveDocState } from '../../collab/liveDocRead.js'
 import { config } from '../../config/env.js'
 import { roleAtLeast } from '../../permission/role.js'
-import * as Y from 'yjs'
 
 export type RestoreResult =
   | { ok: true; restoredFrom: number; newDocVersionSeq: number }
@@ -89,6 +90,17 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     return { ok: false, status: gate.status, error: gate.code }
   }
 
+  // XIN-656 (restore leg): capture the pre-restore UNDO baseline from the CURRENT
+  // LIVE scene — the same live-connection read create-version and auto-snapshot
+  // use — NOT the debounced yjs_document row. The store is debounced, so a board
+  // drawn and then immediately restored still holds its scene only in the live
+  // doc; sourcing the safety snapshot from the row captured a stale/empty payload,
+  // so undoing the restore silently lost the unflushed drawing (the same class the
+  // create/auto paths already fixed). Read BEFORE the FOR UPDATE transaction:
+  // openDirectConnection's disconnect store-flush must not contend with the
+  // yjs_document row lock the transaction below then holds.
+  const liveSafetyState = await readLiveDocState(input.documentName)
+
   const txResult = await transaction(async (tx) => {
     // 1. Lock the authoritative state row FIRST (same order as
     //    persistence.store: yjs_document -> doc_meta) and read current state.
@@ -135,17 +147,26 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
         // be replayed onto the live doc or rebroadcast to clients.
         return { ok: false as const, status: 409, error: 'sheet_snapshot_invalid' }
       }
+      if (err instanceof BoardSnapshotInvalidError) {
+        // Target board snapshot is wrong-kind or corrupt — fail-closed like the
+        // sheet/document siblings, BEFORE the safety snapshot or any live write,
+        // so a degraded scene can never drive the destructive reconcile to wipe
+        // the live board.
+        return { ok: false as const, status: 409, error: 'board_snapshot_invalid' }
+      }
       throw err
     }
     if (validated.length > config.maxDocBytes) {
       return { ok: false as const, status: 413, error: 'doc_too_large' }
     }
 
-    // 6. Auto safety snapshot of the CURRENT live state (undo for the restore),
-    //    recorded only after the reconcile + size check have passed. Stamp the
-    //    schema line that matches this doc's kind (delta #3/#4) so the safety
-    //    row itself decodes correctly on a later preview/restore.
-    const safetyState = currentState ?? Y.encodeStateAsUpdate(new Y.Doc())
+    // 6. Auto safety snapshot of the CURRENT LIVE state (undo for the restore),
+    //    recorded only after the reconcile + size check have passed. Sourced from
+    //    the live scene captured above (XIN-656), NOT the stale persisted row, so
+    //    undoing the restore recovers the true pre-restore scene. Stamp the schema
+    //    line that matches this doc's kind (delta #3/#4) so the safety row itself
+    //    decodes correctly on a later preview/restore.
+    const safetyState = liveSafetyState
     const safetyVersionId = await docVersionRepo.createTx(tx, {
       docId: input.docId,
       documentName: input.documentName,

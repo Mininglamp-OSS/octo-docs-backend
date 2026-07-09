@@ -318,15 +318,78 @@ function fieldEquals(a: unknown, b: unknown): boolean {
 }
 
 /**
+ * Raised when a board version blob does not decode to a well-formed Excalidraw
+ * scene. The board mirror of SchemaIncompatibleError / SheetSnapshotInvalidError:
+ * board decode/reconcile is now fail-closed like its two siblings so a degraded
+ * or wrong-kind snapshot can never reach the destructive reconcile. The route /
+ * service maps this to 409 `board_snapshot_invalid`.
+ */
+export class BoardSnapshotInvalidError extends Error {
+  readonly code = 'board_snapshot_invalid'
+  constructor(reason: string, cause?: unknown) {
+    super(`board_snapshot_invalid: ${reason}`)
+    this.name = 'BoardSnapshotInvalidError'
+    if (cause !== undefined) this.cause = cause
+  }
+}
+
+/**
+ * Fail-closed shape check for a board snapshot Y.Doc, run BEFORE any decode or
+ * reconcile reads it — the board counterpart of decodeTargetSnapshot's `check()`
+ * and reconcileSheetMap's per-cell validation. A board version blob is always
+ * server-encoded (Y.encodeStateAsUpdate of the live board doc), so its only
+ * legitimate top-level shape is the ELEMENTS_FIELD / FILES_FIELD Y.Maps whose
+ * entries are per-entry Y.Maps.
+ *
+ * Rejects (throws BoardSnapshotInvalidError):
+ *  - a wrong-kind blob carrying a ProseMirror COLLAB_FIELD fragment or a
+ *    spreadsheet map (a document/sheet snapshot mis-routed as a board), and
+ *  - a corrupt/degraded element or file entry stored as anything other than a
+ *    Y.Map — the exact case `readEntry` (whiteboard/ydoc.ts) would otherwise
+ *    silently coerce to `{}`, yielding an empty/partial scene that drives
+ *    `reconcileEntryMap` to delete every live element (a whole-board wipe).
+ *
+ * A genuinely-empty board (no elements, no files) is VALID and passes: an empty
+ * target legitimately restores a cleared board, and a legacy ~2-byte empty
+ * snapshot still round-trips.
+ */
+function assertBoardShape(doc: Y.Doc): void {
+  // Wrong-kind blob: the shared root of a document/sheet is the COLLAB_FIELD
+  // fragment / SHEET map, never the board element/file maps. `share` is populated
+  // by Y.applyUpdate from the blob's own integrated types, so this needs no type
+  // construction and cannot false-positive on an empty board (which has neither).
+  if (doc.share.has(COLLAB_FIELD)) {
+    throw new BoardSnapshotInvalidError('prosemirror fragment present')
+  }
+  if (doc.share.has(SHEET_YMAP_FIELD) && doc.getMap(SHEET_YMAP_FIELD).size > 0) {
+    throw new BoardSnapshotInvalidError('sheet map present')
+  }
+  for (const [id, v] of getElementsMap(doc).entries()) {
+    if (!(v instanceof Y.Map)) {
+      throw new BoardSnapshotInvalidError(`element entry "${id}" is not a Y.Map`)
+    }
+  }
+  for (const [fid, v] of getFilesMap(doc).entries()) {
+    if (!(v instanceof Y.Map)) {
+      throw new BoardSnapshotInvalidError(`file entry "${fid}" is not a Y.Map`)
+    }
+  }
+}
+
+/**
  * Decode a board snapshot's binary state into an Excalidraw scene for preview
  * (the board analogue of decodeTargetSnapshot). Reads the ELEMENTS_FIELD /
  * FILES_FIELD maps into plain JS; elements are returned sorted by fractional
  * `index` (then id) so the panel renders them in a stable, Excalidraw-faithful
  * z-order. Pure: no DB write, no live connection.
+ *
+ * Fail-closed: a wrong-kind or corrupt blob throws BoardSnapshotInvalidError
+ * (→409) instead of silently returning an empty/partial scene.
  */
 export function decodeBoardSnapshot(targetState: Uint8Array): BoardScene {
   const doc = new Y.Doc()
   Y.applyUpdate(doc, targetState)
+  assertBoardShape(doc)
   const elements: Array<Record<string, unknown>> = []
   for (const [, v] of getElementsMap(doc).entries()) elements.push(readEntry(v))
   elements.sort((a, b) => {
@@ -383,6 +446,12 @@ function reconcileEntryMap(live: YElements, target: Map<string, Record<string, u
 export function reconcileBoardMaps(liveDoc: Y.Doc, targetState: Uint8Array): boolean {
   const targetDoc = new Y.Doc()
   Y.applyUpdate(targetDoc, targetState)
+  // Fail-closed BEFORE reading the target or touching the live doc: a wrong-kind
+  // or corrupt target must abort with 409 (caught in restoreVersion) rather than
+  // decode to an empty/partial scene and drive reconcileEntryMap to delete every
+  // live element. Symmetric to the sheet/document paths, which validate before
+  // any mutation. No live key is deleted if this throws.
+  assertBoardShape(targetDoc)
   const targetElements = readElements(targetDoc)
   const targetFiles = new Map<string, Record<string, unknown>>()
   for (const [fid, v] of getFilesMap(targetDoc).entries()) targetFiles.set(fid, readEntry(v))

@@ -55,6 +55,7 @@ import {
   contentKindFromDocType,
   currentSchemaVersionFor,
   SchemaIncompatibleError,
+  BoardSnapshotInvalidError,
 } from '../src/collab/versionRestore.js'
 import { computeFinalState } from '../src/collab/persistence.js'
 import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../src/schema/index.js'
@@ -1335,5 +1336,128 @@ describe('board scene decode/reconcile', () => {
     const scene = decodeBoardSnapshot(restoreReconcileBoard(stateFromBoard([]), stateFromBoard([])))
     expect(scene.elements).toEqual([])
     expect(scene.files).toEqual({})
+  })
+})
+
+// ── B1: board version decode/restore is fail-closed (symmetric to sheet/doc) ───
+describe('board version decode is fail-closed (BoardSnapshotInvalidError)', () => {
+  /** A board blob whose element entry is a primitive, not the required Y.Map. */
+  function corruptEntryBoardState(): Uint8Array {
+    const doc = new Y.Doc()
+    doc.getMap('elements').set('e1', 'not-a-ymap')
+    return Y.encodeStateAsUpdate(doc)
+  }
+
+  it('decodeBoardSnapshot throws on a ProseMirror (wrong-kind) blob', () => {
+    const pmBlob = stateFromPM({ type: 'doc', content: [para('hello')] })
+    expect(() => decodeBoardSnapshot(pmBlob)).toThrow(BoardSnapshotInvalidError)
+  })
+
+  it('decodeBoardSnapshot throws on a corrupt (non-Y.Map) element entry', () => {
+    expect(() => decodeBoardSnapshot(corruptEntryBoardState())).toThrow(BoardSnapshotInvalidError)
+  })
+
+  it('decodeBoardSnapshot accepts a genuinely empty board (no throw, empty scene)', () => {
+    const scene = decodeBoardSnapshot(stateFromBoard([]))
+    expect(scene.elements).toEqual([])
+    expect(scene.files).toEqual({})
+  })
+
+  it('restoreReconcileBoard fails closed on a wrong-kind target — no destructive reconcile', () => {
+    const live = stateFromBoard([{ id: 'e1', type: 'rectangle', index: 'a0', x: 0, y: 0 }])
+    const pmBlob = stateFromPM({ type: 'doc', content: [para('hi')] })
+    expect(() => restoreReconcileBoard(live, pmBlob)).toThrow(BoardSnapshotInvalidError)
+  })
+
+  it('restoreReconcileBoard fails closed on a corrupt target — the live board is not wiped', () => {
+    const live = stateFromBoard([{ id: 'e1', type: 'rectangle', index: 'a0', x: 0, y: 0 }])
+    expect(() => restoreReconcileBoard(live, corruptEntryBoardState())).toThrow(BoardSnapshotInvalidError)
+  })
+
+  it('board restore endpoint returns 409 board_snapshot_invalid on a corrupt target', async () => {
+    const documentName = 'octo:s1:f_default:wb:b_1'
+    const boardGuard = {
+      meta: { doc_id: 'b_1', document_name: documentName, doc_type: 'board', permission_epoch: 7 },
+      role: 'admin',
+    } as never
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    vi.mocked(readLiveDocState).mockResolvedValue(
+      stateFromBoard([{ id: 'e1', type: 'rectangle', index: 'a0', x: 0, y: 0 }]),
+    )
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: {
+        id: 5, docId: 'b_1', documentName, kind: 2, name: '', compressed: 1,
+        sizeBytes: 2, schemaVersion: WB_SCHEMA_VERSION, createdAt: new Date(0), createdBy: 'u_1',
+      },
+      state: corruptEntryBoardState(),
+    })
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(99)
+    vi.mocked(transaction).mockImplementation(async (fn: never) => {
+      const tx = {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM yjs_document')) return []
+          if (sql.includes('FROM doc_meta')) return [{ owner_id: 'u_1', permission_epoch: 7, status: 1 }]
+          return []
+        }),
+      }
+      return (fn as unknown as (t: typeof tx) => Promise<unknown>)(tx)
+    })
+
+    const res = mockRes()
+    await restoreVersionHandler(req({ docId: 'b_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('board_snapshot_invalid')
+    // Fail-closed: no safety snapshot recorded, no live write attempted.
+    expect(createSpy).not.toHaveBeenCalled()
+    expect(applyBoardRestoreToLiveDoc).not.toHaveBeenCalled()
+
+    createSpy.mockRestore()
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+})
+
+// ── B2: restore safety snapshot captures the LIVE scene, not the stale row ─────
+describe('XIN-656 restore leg — safety snapshot sources the live scene', () => {
+  it('records the live pre-restore scene as the undo snapshot, not the debounced row', async () => {
+    const documentName = 'octo:s1:f_default:d_1'
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    // The debounced yjs_document row is STALE (empty); the live doc holds an
+    // unflushed edit. The safety snapshot must capture the live scene.
+    const staleRow = new Uint8Array([0, 0])
+    const liveScene = stateFromPM({ type: 'doc', content: [para('LIVE UNFLUSHED EDIT')] })
+    vi.mocked(readLiveDocState).mockResolvedValue(liveScene)
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: {
+        id: 5, docId: 'd_1', documentName, kind: 2, name: '', compressed: 1,
+        sizeBytes: 2, schemaVersion: SCHEMA_VERSION, createdAt: new Date(0), createdBy: 'u_1',
+      },
+      state: stateFromPM({ type: 'doc', content: [para('OLD VERSION')] }),
+    })
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(99)
+    vi.mocked(transaction).mockImplementation(async (fn: never) => {
+      const tx = {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM yjs_document')) return [{ state: Buffer.from(staleRow) }]
+          if (sql.includes('FROM doc_meta')) return [{ owner_id: 'u_1', permission_epoch: 7, status: 1 }]
+          return []
+        }),
+      }
+      return (fn as unknown as (t: typeof tx) => Promise<unknown>)(tx)
+    })
+
+    const res = mockRes()
+    await restoreVersionHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const safetyArg = createSpy.mock.calls[0]![1] as { name: string; state: Uint8Array }
+    expect(safetyArg.name).toBe('Auto-safety before restore')
+    // The undo snapshot holds the LIVE scene — undo-after-restore recovers the
+    // unflushed drawing, closing the XIN-656 stale-row gap on the restore path.
+    expect(new Uint8Array(safetyArg.state)).toEqual(liveScene)
+    expect(new Uint8Array(safetyArg.state)).not.toEqual(staleRow)
+
+    createSpy.mockRestore()
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
   })
 })

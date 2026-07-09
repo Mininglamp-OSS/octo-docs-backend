@@ -39,6 +39,7 @@ import {
   decodeSheetDimsSnapshot,
   SchemaIncompatibleError,
   SheetSnapshotInvalidError,
+  BoardSnapshotInvalidError,
 } from '../../collab/versionRestore.js'
 
 export const versionsRouter = Router()
@@ -211,13 +212,23 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
   if (kind === 'board') {
     // Board preview: return the Excalidraw scene (elements sorted in render
     // order + file refs) so the BoardVersionPanel can render a read-only preview.
-    const scene = decodeBoardSnapshot(found.state)
-    res.status(200).json({
-      kind: 'board',
-      scene,
-      schemaVersion: found.version.schemaVersion,
-      docVersionSeq: versionId,
-    })
+    // Fail-closed like the document/sheet branch: a wrong-kind or corrupt board
+    // blob surfaces as 409 rather than a silently empty/partial scene.
+    try {
+      const scene = decodeBoardSnapshot(found.state)
+      res.status(200).json({
+        kind: 'board',
+        scene,
+        schemaVersion: found.version.schemaVersion,
+        docVersionSeq: versionId,
+      })
+    } catch (err) {
+      if (err instanceof BoardSnapshotInvalidError) {
+        res.status(409).json({ error: 'board_snapshot_invalid' })
+        return
+      }
+      throw err
+    }
     return
   }
 
