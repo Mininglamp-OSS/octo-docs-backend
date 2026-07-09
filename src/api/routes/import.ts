@@ -28,6 +28,7 @@ import { config } from '../../config/env.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { importDocxWithMedia } from '../../import/docx/index.js'
+import { DocxUnsafeError } from '../../import/docx/extract.js'
 import type { MediaUploadCtx } from '../../import/docx/media.js'
 
 export const importRouter = Router()
@@ -128,9 +129,26 @@ export async function importDocxHandler(req: Request, res: Response): Promise<vo
     const { doc, warnings } = await importDocxWithMedia(buffer, uploadCtx)
     res.status(200).json({ doc, warnings })
   } catch (err) {
-    // Malformed zip / unreadable OOXML land here. Log server-side without
-    // leaking any path or stack to the client; the parser treats the whole file
-    // as untrusted, so a failure is the document's fault, not ours (422).
+    // A DocxUnsafeError means the extractor hit a hard safety bound (zip bomb,
+    // oversize, too many entries, timeout, or malformed zip). It carries a
+    // machine-readable `reason`; map it to a precise status so the client can
+    // tell "this file is too big/complex" (413) from "this isn't a valid docx"
+    // (400) instead of a generic parse failure. The message/path is never
+    // leaked — only the stable error code + reason.
+    if (err instanceof DocxUnsafeError) {
+      // eslint-disable-next-line no-console
+      console.warn(`[import:docx] unsafe upload for doc ${docId}: ${err.reason}`)
+      const status =
+        err.reason === 'not-a-zip' || err.reason === 'corrupt' || err.reason === 'timeout'
+          ? 400
+          : 413 // total/entry-too-large, ratio-too-high, too-many-entries, too-many-media
+      res.status(status).json({ error: 'import_unsafe', reason: err.reason })
+      return
+    }
+    // Malformed / unreadable OOXML beyond the zip layer lands here. Log
+    // server-side without leaking any path or stack to the client; the parser
+    // treats the whole file as untrusted, so a failure is the document's fault
+    // (422), not ours.
     // eslint-disable-next-line no-console
     console.error(`[import:docx] parse failed for doc ${docId}:`, err)
     res.status(422).json({ error: 'import_failed' })

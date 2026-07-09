@@ -76,7 +76,8 @@ export type MediaResolver = (embedRelId: string) => ExtractedEntry | null
 /**
  * Walk the doc and replace every image placeholder with a real image node
  * (attachId) or a degraded fileAttachment/text node. Mutates + returns the doc,
- * collecting warnings for degraded images. Concurrency-bounded, best-effort.
+ * collecting warnings for degraded images. Sequential (one upload at a time),
+ * best-effort.
  */
 export async function resolveImages(
   doc: PmNode,
