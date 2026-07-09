@@ -44,6 +44,45 @@ describe('collab token sign/verify (§4.4)', () => {
   it('rejects a structurally invalid token', () => {
     expect(() => verifyCollabToken('not-a-jwt')).toThrow()
   })
+
+  it('signs and verifies a name claim (§4.7(b) / XIN-694) round-trip', () => {
+    const result = signCollabToken({
+      uid: 'u_12345',
+      documentName: 'octo:s_001:f_888:wb:d_board1',
+      role: 'writer',
+      permission_epoch: 2,
+      name: '大背头',
+    })
+    // The display name is also surfaced on the response so the client can seed
+    // its own presence without a separate directory round-trip.
+    expect(result.name).toBe('大背头')
+    const claims = verifyCollabToken(result.token)
+    expect(claims).toEqual({
+      uid: 'u_12345',
+      documentName: 'octo:s_001:f_888:wb:d_board1',
+      role: 'writer',
+      permission_epoch: 2,
+      name: '大背头',
+    })
+  })
+
+  it('omits the name claim entirely when none is supplied (back-compat with pre-XIN-694 tokens)', () => {
+    const result = signCollabToken({
+      uid: 'u_1',
+      documentName: 'octo:s:f:d',
+      role: 'reader',
+      permission_epoch: 0,
+    })
+    expect('name' in result).toBe(false)
+    const claims = verifyCollabToken(result.token)
+    expect('name' in claims).toBe(false)
+    expect(claims).toEqual({
+      uid: 'u_1',
+      documentName: 'octo:s:f:d',
+      role: 'reader',
+      permission_epoch: 0,
+    })
+  })
 })
 
 describe('collab-token response collabWsUrl contract (§4.4)', () => {

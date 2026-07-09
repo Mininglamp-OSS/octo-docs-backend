@@ -131,19 +131,29 @@ export function isSafeAvatar(v: unknown): v is string {
  *     `user.id` is not this connection's own uid is dropping the whole state
  *     (a client must never publish presence claiming to be someone else).
  *
- *  2. `color` and `name` are OPTIONAL, cosmetic fields. They must never cause
- *     the WHOLE presence state to be dropped — doing so silently kills the
- *     user's entire presence broadcast for that frame, and because Hocuspocus
- *     re-encodes the awareness update from only the surviving states, a dropped
- *     state is never applied to the document awareness and therefore never
- *     relayed (neither the local broadcast nor the Redis cross-node publish
- *     fires). The v1 whiteboard binding publishes `{ id, name, avatar }` with
- *     NO color at all, so the old whole-state drop on a missing/invalid color
- *     meant the receiving peer got ZERO awareness frames (presence A->B = 0)
- *     even though doc (type0) sync relayed fine. We instead SANITIZE the
- *     offending field in place (strip an invalid/unsafe color so no CSS
- *     injection value propagates; strip an oversized/non-string name) and let
- *     the rest of the presence broadcast — standard Hocuspocus relay behavior.
+ *  2. `color` and `avatar` are OPTIONAL, cosmetic fields, and `name` is
+ *     server-authoritative. None of them may cause the WHOLE presence state to
+ *     be dropped — doing so silently kills the user's entire presence broadcast
+ *     for that frame, and because Hocuspocus re-encodes the awareness update
+ *     from only the surviving states, a dropped state is never applied to the
+ *     document awareness and therefore never relayed (neither the local
+ *     broadcast nor the Redis cross-node publish fires). The v1 whiteboard
+ *     binding publishes `{ id, name, avatar }` with NO color at all, so the old
+ *     whole-state drop on a missing/invalid color meant the receiving peer got
+ *     ZERO awareness frames (presence A->B = 0) even though doc (type0) sync
+ *     relayed fine. We instead SANITIZE the offending field in place (strip an
+ *     invalid/unsafe color so no CSS injection value propagates) and let the
+ *     rest of the presence broadcast — standard Hocuspocus relay behavior.
+ *
+ *     For `name` specifically (§4.7(b) / XIN-694): the trusted display name
+ *     resolved at token issuance rides the collab token into `ctx`. When it is
+ *     present we STAMP it over whatever the client published, so every relayed
+ *     presence frame carries the real display name rather than the raw uid a
+ *     client whose own directory lookup has not yet resolved would broadcast.
+ *     `uid` always stays in `user.id`; only `user.name` is rewritten. When no
+ *     trusted name is available (an older token, or the directory supplied
+ *     none) we fall back to sanitizing the client value (strip an
+ *     oversized/non-string name), never dropping the state.
  *
  * We MUST NOT throw: a malformed or impostor awareness frame must never crash
  * the process or break other users' live collaboration (an earlier
@@ -179,8 +189,21 @@ export function validateAwarenessStates(
     if ('color' in user && !(typeof user.color === 'string' && COLOR_RE.test(user.color))) {
       delete (user as { color?: unknown }).color
     }
-    // name is optional; strip it when present and not a string <= 64 chars.
-    if ('name' in user && !(typeof user.name === 'string' && user.name.length <= 64)) {
+    // name (§4.7(b) / XIN-694): the display name is server-authoritative. When a
+    // trusted name rode the collab token into ctx, it is the source of truth for
+    // THIS connection's presence — stamp it over whatever the client published
+    // (a client whose own directory lookup has not resolved broadcasts its raw
+    // uid as name). uid stays in user.id; only user.name changes. Same tier as
+    // the id binding above: the client does not get to pick its own display name.
+    // Clamp to the 64-char frame-lightness cap the client path already enforced.
+    const trustedName = ctx.user.name
+    if (typeof trustedName === 'string' && trustedName.length > 0) {
+      ;(user as { name?: unknown }).name =
+        trustedName.length > 64 ? trustedName.slice(0, 64) : trustedName
+    } else if ('name' in user && !(typeof user.name === 'string' && user.name.length <= 64)) {
+      // No trusted name at this layer (token minted before this change, or the
+      // directory supplied none): fall back to sanitizing the client value —
+      // strip it when present and not a string <= 64 chars.
       delete (user as { name?: unknown }).name
     }
     // avatar is optional (the v1 whiteboard binding publishes { id, name,

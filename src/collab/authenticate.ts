@@ -35,7 +35,7 @@ const unauthorized = () => new AuthError(4401, 'Unauthorized')
 const forbidden = () => new AuthError(4403, 'Forbidden')
 
 export interface AuthContext {
-  user: { id: string }
+  user: { id: string; name?: string }
   role: Role
   permission_epoch: number
   /** 'document' (4-seg key) or 'whiteboard' (5-seg `:wb:` key, M2). */
@@ -105,9 +105,11 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     connectionConfig.readOnly = true
   }
 
-  // 7. inject context for downstream hooks (kind-tagged).
+  // 7. inject context for downstream hooks (kind-tagged). The trusted display
+  //    name (resolved at issuance, §4.7(b)) rides along so beforeHandleAwareness
+  //    can stamp the presence frame's user.name; uid stays the identity.
   const base = {
-    user: { id: claims.uid },
+    user: { id: claims.uid, ...(claims.name ? { name: claims.name } : {}) },
     role,
     permission_epoch: claims.permission_epoch,
     space: parsed.space,

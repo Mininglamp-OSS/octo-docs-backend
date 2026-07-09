@@ -38,6 +38,24 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
   const uid = identity.uid
 
+  // Resolve the trusted DISPLAY NAME for this uid from the octo directory
+  // (§4.7(b)), so the collab/presence layer can stamp the awareness frame's
+  // user.name with a real name instead of the raw uid a not-yet-resolved client
+  // publishes (XIN-694). The name is a separate field; uid stays the identity.
+  //
+  // verify already returns the caller's name in the common case (no extra IO).
+  // Only when it is absent do we fall back to the per-uid directory lookup,
+  // authenticated with the caller's own octo session token — the same token we
+  // already hold. Both are best-effort: an unavailable name never blocks token
+  // issuance (getUser swallows transport errors and returns null), it just
+  // means this token carries no name and the presence layer keeps its existing
+  // client-supplied-name behavior.
+  let displayName = typeof identity.name === 'string' ? identity.name.trim() : ''
+  if (displayName === '') {
+    const profile = await getOctoIdentity().getUser(uid, octoToken)
+    if (profile && typeof profile.name === 'string') displayName = profile.name.trim()
+  }
+
   // Validate / parse documentName first so a structurally malformed key is a
   // 403 (distinct from a well-formed key that resolves to no row => 404).
   let parsed
@@ -71,6 +89,7 @@ export async function issueCollabToken(octoToken: string, documentName: string):
     documentName,
     role,
     permission_epoch: meta.permission_epoch,
+    ...(displayName !== '' ? { name: displayName } : {}),
   })
   return { ok: true, result }
 }
