@@ -111,19 +111,26 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   app.use('/v1/bot/docs', botApi)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return
     // Body-parser (express.json) failures arrive here as typed errors. Map them
     // to their contract codes instead of letting them bubble to a 500 (defect ③):
     //   - malformed JSON body  -> 400 invalid_body
-    //   - body over the size limit -> 413 doc_too_large
+    //   - body over the size limit -> 413 doc_too_large (sheet_too_large on /sheet)
     const type = (err as { type?: unknown }).type
     if (type === 'entity.parse.failed') {
       res.status(400).json({ error: 'invalid_body' })
       return
     }
     if (type === 'entity.too.large') {
-      res.status(413).json({ error: 'doc_too_large' })
+      // The oversized-body 413 rejection is raised by express.json BEFORE any
+      // route handler runs, so the sheet write path never reaches its own
+      // sheet-specific bounds. Align the error code with the endpoint the client
+      // hit: the sheet content surface (GET/PATCH /:docId/sheet) reports
+      // sheet_too_large — matching its in-handler read guard and issue #69's 1MB
+      // sheet contract — while every other route keeps doc_too_large.
+      const code = req.path.endsWith('/sheet') ? 'sheet_too_large' : 'doc_too_large'
+      res.status(413).json({ error: code })
       return
     }
     // eslint-disable-next-line no-console

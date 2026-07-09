@@ -105,6 +105,14 @@ export function validateSheetCell(key: unknown, value: unknown): SheetCell {
     if (v !== null && typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
       throw new SheetSnapshotInvalidError(`cell ${key}: v has invalid type`)
     }
+    // A numeric `v` must be finite. Infinity / -Infinity / NaN pass the typeof
+    // check but JSON.stringify serializes them to `null`, so they both mis-measure
+    // at the size gate (JSON.stringify(Infinity) === 'null') and round-trip through
+    // GET as a silent `{"v":null}` — a write-surface data loss. Reject fail-closed,
+    // mirroring validateSheetDim's Number.isFinite guard.
+    if (typeof v === 'number' && !Number.isFinite(v)) {
+      throw new SheetSnapshotInvalidError(`cell ${key}: v must be a finite number`)
+    }
     out.v = v as SheetCell['v']
   }
   if ('f' in rec) {
@@ -181,6 +189,43 @@ export function yDocStateToSheetCells(state: Uint8Array): Record<string, SheetCe
 }
 
 /**
+ * The split of a `{ key: cell|null }` edit batch into deletions and validated
+ * upserts — the output of the shared, DB-free, live-infra-free validation pass.
+ */
+export interface SheetCellBatch {
+  toDelete: string[]
+  toSet: Array<[string, SheetCell]>
+}
+
+/**
+ * Validate a whole `{ key: cell|null }` edit batch WITHOUT mutating anything,
+ * fail-closed. A null value is a deletion (key-shape-checked so a malformed key
+ * cannot be smuggled in); any other value is validated against the `{v,f,s}`
+ * contract. Throws SheetSnapshotInvalidError on the first deviation.
+ *
+ * Split out from applySheetCellsToYMap so the HTTP write path can run the exact
+ * same contract check in its no-lock pre-flight (fail a bad batch with 422
+ * before opening the live write connection) that the live mutation runs — one
+ * source of truth for the cell contract, never two subtly different validators.
+ */
+export function validateSheetCellBatch(cells: Record<string, SheetCell | null>): SheetCellBatch {
+  const toDelete: string[] = []
+  const toSet: Array<[string, SheetCell]> = []
+  for (const [key, cell] of Object.entries(cells)) {
+    if (cell == null) {
+      // Deletion is always safe; a hostile key simply targets a nonexistent
+      // entry. We still key-shape-check so a malformed key can't be smuggled in.
+      if (typeof key === 'string' && CELL_KEY_RE.test(key)) toDelete.push(key)
+      else throw new SheetSnapshotInvalidError(`delete: invalid cell key ${String(key).slice(0, 64)}`)
+    } else {
+      // Fail-closed: validate the {v,f,s} contract before writing into the doc.
+      toSet.push([key, validateSheetCell(key, cell)])
+    }
+  }
+  return { toDelete, toSet }
+}
+
+/**
  * Pure mutation applied INSIDE a Yjs transaction (live doc or transient).
  * A null/undefined cell deletes the key; otherwise it is set. Caller owns the
  * transaction so the whole edit lands as one update (one broadcast).
@@ -195,19 +240,51 @@ export function applySheetCellsToYMap(
   // disconnect, so a per-iteration set()-then-throw would broadcast a partial
   // write. Validate every entry FIRST; only mutate once the whole batch is known
   // good.
-  const toDelete: string[] = []
-  const toSet: Array<[string, SheetCell]> = []
-  for (const [key, cell] of Object.entries(cells)) {
-    if (cell == null) {
-      // Deletion is always safe; a hostile key simply targets a nonexistent
-      // entry. We still key-shape-check so a malformed key can't be smuggled in.
-      if (typeof key === 'string' && CELL_KEY_RE.test(key)) toDelete.push(key)
-      else throw new SheetSnapshotInvalidError(`delete: invalid cell key ${String(key).slice(0, 64)}`)
-    } else {
-      // Fail-closed: validate the {v,f,s} contract before writing into the doc.
-      toSet.push([key, validateSheetCell(key, cell)])
-    }
-  }
+  const { toDelete, toSet } = validateSheetCellBatch(cells)
   for (const key of toDelete) ymap.delete(key)
   for (const [key, cell] of toSet) ymap.set(key, cell)
+}
+
+/**
+ * Measure the sheet AFTER applying an edit batch, the two ways its downstream
+ * caps are enforced, so the write path can reject an oversized result in its
+ * no-lock pre-flight — BEFORE commitLiveSheetEdit applies the cells to the shared
+ * live Y.Doc, broadcasts them to peers, and only then fails at persistence.store.
+ * The sheet counterpart of docBodyEdit.sizeAfterEdit's 413 gate.
+ *
+ *   - docBytes: the encoded Y.Doc update length, hydrated from the LIVE
+ *     `preEditState` (so it carries the live clientId clocks + tombstones) exactly
+ *     as persistence.store caps it at config.maxDocBytes. A from-scratch encode
+ *     would be strictly smaller (fresh clientId, no accumulated history) and could
+ *     pass this pre-check only to have the live commit broadcast-then-fail on
+ *     store — the silent-fork hole this closes.
+ *   - payloadBytes: the decoded `{sheetCells, sheetDims}` JSON size, measured the
+ *     SAME way GET /:docId/sheet caps it at config.sheetRead.maxCellBytes, so a
+ *     batch can never write a sheet that GET then rejects with 413 (a
+ *     write-but-not-readable sheet reachable via chained PATCH→PATCH).
+ *
+ * Pure (no DB, no live infra): the caller compares the returned sizes against the
+ * configured caps and maps an overflow to 413.
+ */
+export function measureSheetAfterEdit(
+  preEditState: Uint8Array,
+  cells: Record<string, SheetCell | null>,
+): { docBytes: number; payloadBytes: number } {
+  const scratch = new Y.Doc()
+  Y.applyUpdate(scratch, preEditState)
+  const ymap = scratch.getMap<SheetCell>(SHEET_YMAP_FIELD)
+  // Apply the batch exactly as the live commit will (validate-all-then-apply), so
+  // the measured post-edit doc matches what commitLiveSheetEdit would persist.
+  scratch.transact(() => applySheetCellsToYMap(ymap, cells))
+  const docBytes = Y.encodeStateAsUpdate(scratch).length
+  // Decode + validate BOTH synced maps exactly as GET does (decodeSheetSnapshot /
+  // decodeSheetDimsSnapshot) so payloadBytes is byte-identical to the read body.
+  const rawCells: Record<string, unknown> = {}
+  for (const [key, val] of scratch.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
+  const rawDims: Record<string, unknown> = {}
+  for (const [key, val] of scratch.getMap(SHEET_DIMS_FIELD).entries()) rawDims[key] = val
+  const sheetCells = validateSheetCells(rawCells)
+  const sheetDims = validateSheetDims(rawDims)
+  const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))
+  return { docBytes, payloadBytes }
 }

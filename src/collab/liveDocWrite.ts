@@ -52,8 +52,12 @@ export const EDIT_VERSION_FIELD = '__editVersion'
  * a counter integrates one new struct on the acting doc's clock, so the state
  * vector advances on insert, replace, AND delete-only alike; the old token then
  * fails the guard with 412. Clocks only grow, so the marker is GC-stable.
+ *
+ * Exported so the sheet write path (commitLiveSheetEdit) reuses the identical
+ * mechanism: a delete-only cell batch (Y.Map.delete records only a tombstone)
+ * leaves the state vector byte-identical without this bump, the same defect ②.
  */
-function advanceEditVersion(doc: Y.Doc): void {
+export function advanceEditVersion(doc: Y.Doc): void {
   const meta = doc.getMap(EDIT_VERSION_FIELD)
   const current = meta.get('n')
   meta.set('n', (typeof current === 'number' ? current : 0) + 1)
