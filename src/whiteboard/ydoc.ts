@@ -8,7 +8,7 @@
  * keyed by fileId, each value a per-file `Y.Map<field, value>`.
  */
 import * as Y from 'yjs'
-import { ELEMENTS_FIELD, FILES_FIELD } from './schema/index.js'
+import { ELEMENTS_FIELD, FILES_FIELD, normalizeFileRef, type FileRef } from './schema/index.js'
 
 export type YElement = Y.Map<unknown>
 export type YElements = Y.Map<YElement>
@@ -48,5 +48,24 @@ export function fileIdSet(doc: Y.Doc): Set<string> {
 export function readElements(doc: Y.Doc): Map<string, Record<string, unknown>> {
   const out = new Map<string, Record<string, unknown>>()
   for (const [id, v] of getElementsMap(doc).entries()) out.set(id, readEntry(v))
+  return out
+}
+
+/**
+ * Read the `files` container into canonical FileRefs keyed by fileId, keeping
+ * only entries that carry a usable `attachId` (normalizeFileRef !== null). A
+ * fileId whose stored entry has no resolvable binary — the XIN-699
+ * grey-placeholder shape — is omitted, so a caller that iterates the result only
+ * ever sees references it can actually exchange for a signed GET URL. This is a
+ * pure read: it neither mutates the doc nor participates in repair's fileset GC
+ * (that GC stays keyed on raw container membership so a split-transaction insert
+ * whose ref lands moments later is not dropped).
+ */
+export function readFileRefs(doc: Y.Doc): Map<string, FileRef> {
+  const out = new Map<string, FileRef>()
+  for (const [fileId, v] of getFilesMap(doc).entries()) {
+    const ref = normalizeFileRef(readEntry(v))
+    if (ref) out.set(fileId, ref)
+  }
   return out
 }
