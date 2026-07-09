@@ -91,7 +91,7 @@ export function attachmentBlobGateway(req: Request, res: Response, next: NextFun
     void handlePut(req, res, objectKey)
     return
   }
-  void handleGet(res, objectKey, verdict.disposition)
+  void handleGet(res, objectKey, verdict.disposition, verdict.contentType)
 }
 
 async function handlePut(req: Request, res: Response, objectKey: string): Promise<void> {
@@ -121,17 +121,30 @@ async function handleGet(
   res: Response,
   objectKey: string,
   disposition: string | undefined,
+  contentType: string | undefined,
 ): Promise<void> {
   const object = await getLocalBlobStore().get(objectKey)
   if (!object) {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  res.setHeader('Content-Type', object.contentType)
-  // §3.5 S1: the gateway MUST add nosniff on every attachment response and
-  // replay the signed Content-Disposition so a forged inline type can never
-  // render — signing alone does not emit these headers.
+  // §3.5 S1 / XIN-726: serve the trusted, presign-registered mime bound into the
+  // signed GET URL — NOT the raw Content-Type the client sent on the PUT, which
+  // is attacker-controlled (a client can presign as image/png yet PUT an HTML
+  // body with Content-Type: text/html, so echoing the stored header is a stored
+  // XSS). The registered mime was vetted by the denylist/allow-list at presign
+  // time, so it is the authoritative type to serve.
+  res.setHeader('Content-Type', contentType ?? object.contentType)
+  // The gateway MUST add nosniff on every attachment response and replay the
+  // signed Content-Disposition so a forged inline type can never render —
+  // signing alone does not emit these headers.
   res.setHeader('X-Content-Type-Options', 'nosniff')
-  if (disposition) res.setHeader('Content-Disposition', disposition)
+  if (disposition) {
+    res.setHeader('Content-Disposition', disposition)
+  } else if (!contentType) {
+    // Legacy URL with no trusted registered mime bound: never risk inline-
+    // rendering an unverified stored type — force a download instead.
+    res.setHeader('Content-Disposition', 'attachment')
+  }
   res.status(200).send(object.bytes)
 }

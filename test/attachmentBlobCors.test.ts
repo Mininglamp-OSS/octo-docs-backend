@@ -105,6 +105,36 @@ describe('attachment blob gateway CORS preflight (XIN-717)', () => {
     expect(await res.text()).toBe('PNGDATA-xin717')
   })
 
+  it('serves the trusted registered mime on GET, not the attacker PUT Content-Type (XIN-726)', async () => {
+    // Stored-XSS regression: a client presigns as image/png (passes the denylist,
+    // registered mime image/png), then PUTs an HTML body with Content-Type
+    // text/html. The GET URL is minted the way the read endpoint mints it — with
+    // the trusted registered mime bound — so the gateway MUST serve image/png,
+    // never the attacker's text/html, and the browser cannot render it as HTML.
+    const XSS_KEY = 'd_1/att_xss/evil.png'
+    const { uploadUrl } = store().presignPut(XSS_KEY, 'image/png', 300)
+    const htmlBody = Buffer.from('<script>alert(document.domain)</script>', 'utf8')
+    const put = await fetch(onLiveHost(uploadUrl), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'text/html', Origin: FE_ORIGIN },
+      body: htmlBody,
+    })
+    expect(put.status).toBeGreaterThanOrEqual(200)
+    expect(put.status).toBeLessThan(300)
+
+    // presignReadUrl binds responseContentType = attachment.mime (image/png here).
+    const signed = store().presignGet(XSS_KEY, 600, { responseContentType: 'image/png' })
+    const res = await fetch(onLiveHost(signed), { headers: { Origin: FE_ORIGIN } })
+    expect(res.status).toBe(200)
+    // The served type is the trusted registered mime, NOT the attacker header.
+    expect(res.headers.get('content-type')).toBe('image/png')
+    expect(res.headers.get('content-type')).not.toContain('text/html')
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff')
+    // The bytes are still delivered — but as an image, so the browser will not
+    // parse and execute them as an HTML document.
+    expect(await res.text()).toBe('<script>alert(document.domain)</script>')
+  })
+
   it('rejects a tampered signature with 403', async () => {
     const { uploadUrl } = store().presignPut(OBJECT_KEY, 'image/png', 300)
     const tampered = uploadUrl.replace(/X-Signature=[0-9a-f]+/, 'X-Signature=deadbeef')
