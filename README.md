@@ -157,6 +157,51 @@ Set `TYPST_EXPORT_BINARY` if the binary is not on `PATH`; tune
 `TYPST_EXPORT_COMPILE_TIMEOUT_MS` / `TYPST_EXPORT_MAX_IMAGE_BYTES` /
 `TYPST_EXPORT_MAX_IMAGE_COUNT` / `TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES` as needed.
 
+## Sheet size dimensions (read payload vs storage)
+
+A spreadsheet (`doc_type = 'sheet'`) is bounded by **two independent byte
+dimensions**. They measure different serializations of the same sheet, use
+different caps, and are NOT comparable — mixing them up is the source of the
+apparent "dead zone" myth, so they are documented together here.
+
+| Dimension | What it measures | How | Cap (env) | Where enforced |
+| --- | --- | --- | --- | --- |
+| **Read payload** | The JSON body a `GET /:docId/sheet` returns | `Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))` | `SHEET_READ_MAX_CELL_BYTES` (default **1 MB**) → `config.sheetRead.maxCellBytes` | Read gate `docSheet.ts` → **413 `sheet_too_large`**; write gate `editDocSheet.ts` measures it the SAME way and pre-rejects a write that would exceed it |
+| **Storage** | The persisted Y.Doc binary update | `Y.encodeStateAsUpdate(doc).length` | `MAX_DOC_BYTES` (default **10 MB**) → `config.maxDocBytes` | `persistence.store`; write gate `editDocSheet.ts` → **413 `doc_too_large`** |
+
+Key points:
+
+- **The write cap is aligned to the read cap.** `editDocSheet` rejects a write
+  whose post-edit *read payload* would exceed `maxCellBytes` (`sheet_too_large`)
+  *before* it touches the live Y.Doc. This guarantees **every sheet written
+  through the REST/PATCH path is whole-read-readable** — there is no
+  write-but-not-readable state reachable via normal writes.
+
+- **The two dimensions are different sizes for the same sheet.** The storage
+  binary carries CRDT metadata (client IDs, clocks, deletion tombstones from
+  edited/deleted cells) that the decoded `{sheetCells, sheetDims}` read payload
+  does not. So a sheet whose *storage* is, say, 1.05 MB can still have a *read
+  payload* well under 1 MB and therefore **whole-reads 200, not 413**. That is
+  correct behaviour, not a gap: the read 413 is governed only by the read-payload
+  dimension, never by storage bytes.
+
+- **Whole-read 413 is not a dead end.** A sheet whose read payload exceeds
+  `maxCellBytes` (only reachable by seeding the live Y.Doc *outside* the write
+  gate — e.g. a version-restore of a historic oversized snapshot, or an import)
+  returns 413 `sheet_too_large` on a whole read, but the **paginated read
+  (`?limit=`/`?cursor=`) retrieves it page by page**, each page bounded by
+  `maxCellBytes`. No cell is unreachable.
+
+- **413 observability.** Both size-413 bodies name the dimension they measured so
+  a caller sees at a glance which cap tripped and how far past it the payload sits:
+  - `sheet_too_large` (read gate and write gate) → `{ error, payloadBytes, limit }`
+    (read-payload dimension; the read gate also adds a `hint` to paginate).
+  - `doc_too_large` (write gate) → `{ error, docBytes, limit }` (storage dimension).
+
+  A caller that sees `sheet_too_large` therefore knows to switch to a paginated
+  read; one that sees `doc_too_large` knows the sheet has hit the hard storage
+  cap and must be trimmed.
+
 ## Tests
 
 ```bash

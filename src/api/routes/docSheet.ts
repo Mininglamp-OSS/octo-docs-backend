@@ -120,11 +120,20 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     // cell payload exceeds the read cap returns a clear 413 sheet_too_large
     // instead of an unbounded body — now with a hint that a paginated read
     // (?limit=/?cursor=) can retrieve it page by page.
+    //
+    // The 413 body reports `payloadBytes` (the measured READ-payload dimension:
+    // Buffer.byteLength(JSON.stringify({sheetCells, sheetDims}))) against `limit`
+    // (config.sheetRead.maxCellBytes), the SAME name the write gate emits when it
+    // pre-rejects a write that would exceed this cap (editDocSheet.ts). Naming the
+    // field for the dimension it measures — read payload, NOT the 10MB storage
+    // dimension (maxDocBytes / doc_too_large) — lets a caller see at a glance which
+    // dimension tripped and how far it sits from the cap. See README "Sheet size
+    // dimensions" for why the two dimensions differ.
     const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))
     if (payloadBytes > config.sheetRead.maxCellBytes) {
       res.status(413).json({
         error: 'sheet_too_large',
-        bytes: payloadBytes,
+        payloadBytes,
         limit: config.sheetRead.maxCellBytes,
         hint: 'retry with ?limit=<n> to read this sheet in pages',
       })
@@ -350,7 +359,14 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       })
       return
     }
-    res.status(result.status).json({ error: result.error })
+    // Forward the size-413 observability fields (payloadBytes/docBytes + limit)
+    // when editDocSheet set them, so the write gate's 413 body matches the read
+    // gate's. Non-size errors carry none and fall through to a bare { error }.
+    const errBody: Record<string, unknown> = { error: result.error }
+    if (result.payloadBytes !== undefined) errBody.payloadBytes = result.payloadBytes
+    if (result.docBytes !== undefined) errBody.docBytes = result.docBytes
+    if (result.limit !== undefined) errBody.limit = result.limit
+    res.status(result.status).json(errBody)
   } catch {
     res.status(500).json({ error: 'internal_error' })
   }
