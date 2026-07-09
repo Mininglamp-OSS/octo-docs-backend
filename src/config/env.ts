@@ -196,6 +196,20 @@ export const config = {
     // change for existing MinIO/local-hmac deployments. Leading/trailing slashes
     // are normalised; the prefix is part of the signed key (see objectStore.ts).
     keyPrefix: str('ATTACHMENT_KEY_PREFIX', ''),
+    // Public, browser-reachable base URL the 'local-hmac' driver bakes into the
+    // signed PUT/GET URL host (§3.5). The front-end issues the presigned PUT (and
+    // later GET) directly, so this host MUST resolve from the end-user browser.
+    // The historical default baked a fixed `https://<bucket>.object-store.local`
+    // origin into every signed URL — an internal placeholder alias the browser
+    // cannot resolve (ERR_NAME_NOT_RESOLVED), so the direct PUT never lands and
+    // collaborators see no image (XIN-713). Set this to a host the browser can
+    // actually reach — e.g. the docs-backend origin that fronts object storage
+    // (`http://<host>:<httpPort>`), or a real object-store endpoint — and the
+    // signed URL becomes `<publicBaseUrl>/<key>?X-...`. An optional path segment
+    // (e.g. `.../attachments`) is supported and stripped before signature
+    // verification, so the signed key stays the pure object key. Empty (default)
+    // preserves the legacy object-store.local host for back-compat.
+    publicBaseUrl: str('ATTACHMENT_PUBLIC_BASE_URL', ''),
     // S3-compatible (MinIO/S3/COS) driver settings. Used only when driver is
     // 's3'/'minio'. The endpoint is the PUBLIC, browser-reachable origin baked
     // into the signed URL host (never a docker-internal alias). Credentials come

@@ -98,25 +98,58 @@ export class LocalHmacObjectStore implements ObjectStore {
   private readonly bucket: string
   private readonly secret: string
   private readonly keyPrefix: string
+  private readonly publicBaseUrl: string
   private readonly nowSec: () => number
 
   constructor(opts?: {
     bucket?: string
     secret?: string
     keyPrefix?: string
+    publicBaseUrl?: string
     nowSec?: () => number
   }) {
     this.bucket = opts?.bucket ?? config.attachments.bucket
     this.secret = opts?.secret ?? config.attachments.signingSecret
     this.keyPrefix = opts?.keyPrefix ?? config.attachments.keyPrefix
+    // Strip any trailing slash so key joining stays canonical; empty means the
+    // legacy object-store.local host (see baseUrl()).
+    this.publicBaseUrl = (opts?.publicBaseUrl ?? config.attachments.publicBaseUrl).replace(
+      /\/+$/,
+      '',
+    )
     this.nowSec = opts?.nowSec ?? (() => Math.floor(Date.now() / 1000))
   }
 
   private baseUrl(physicalKey: string): string {
-    // Path-style URL against the bucket host. Each key segment is encoded but
-    // the '/' separators are preserved so the key round-trips cleanly.
+    // Path-style URL: each key segment is encoded but the '/' separators are
+    // preserved so the key round-trips cleanly. When a public base URL is
+    // configured the signed URL points at that browser-reachable origin
+    // (XIN-713); otherwise it falls back to the historical bucket host, which is
+    // an internal alias the end-user browser cannot resolve.
     const encodedKey = physicalKey.split('/').map(encodeURIComponent).join('/')
+    if (this.publicBaseUrl) {
+      return `${this.publicBaseUrl}/${encodedKey}`
+    }
     return `https://${this.bucket}.object-store.local/${encodedKey}`
+  }
+
+  /**
+   * The path segment carried by a configured public base URL (e.g. `/attachments`
+   * for `http://host:8092/attachments`), normalised without a trailing slash.
+   * Empty when no base URL is set or the base URL is origin-only. verify() strips
+   * this prefix before reconstructing the signed object key, so mounting the
+   * attachment host under a path does not change the signed key.
+   */
+  private basePathPrefix(): string {
+    if (!this.publicBaseUrl) return ''
+    let path: string
+    try {
+      path = new URL(this.publicBaseUrl).pathname
+    } catch {
+      return ''
+    }
+    const trimmed = path.replace(/\/+$/, '')
+    return trimmed === '' || trimmed === '/' ? '' : trimmed
   }
 
   private signedUrl(
@@ -179,8 +212,16 @@ export class LocalHmacObjectStore implements ObjectStore {
 
     // Reconstruct the physical object key from the path (decode each segment).
     // This is the prefixed key that was signed at mint time, so verification is
-    // self-consistent without needing to know the prefix here.
-    const physicalKey = url.pathname
+    // self-consistent without needing to know the prefix here. When the signed
+    // URL points at a public base URL that carries a path segment (e.g.
+    // `http://host:8092/attachments`), that segment is stripped first so the
+    // reconstructed key is the pure object key that was actually signed.
+    const basePath = this.basePathPrefix()
+    let pathname = url.pathname
+    if (basePath && (pathname === basePath || pathname.startsWith(`${basePath}/`))) {
+      pathname = pathname.slice(basePath.length)
+    }
+    const physicalKey = pathname
       .replace(/^\//, '')
       .split('/')
       .map(decodeURIComponent)
