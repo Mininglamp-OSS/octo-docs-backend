@@ -10,6 +10,14 @@ vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(async () => []),
   transaction: vi.fn(),
 }))
+// Keep the real anchor-resolution error classes (the route uses `instanceof`),
+// but stub the live-doc resolver so these offline tests never open a connection.
+vi.mock('../src/collab/anchorResolve.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/collab/anchorResolve.js')>(
+    '../src/collab/anchorResolve.js',
+  )
+  return { ...actual, resolveAnchorFromLiveDoc: vi.fn() }
+})
 
 import {
   listCommentsHandler,
@@ -20,6 +28,11 @@ import {
 import { requireDocRole } from '../src/api/guard.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { query, transaction } from '../src/db/pool.js'
+import {
+  resolveAnchorFromLiveDoc,
+  AmbiguousAnchorError,
+  AnchorTextNotFoundError,
+} from '../src/collab/anchorResolve.js'
 
 interface MockRes {
   statusCode: number
@@ -59,9 +72,9 @@ function req(opts: {
   } as never
 }
 
-const readerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1' }, role: 'reader' } as never
-const writerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1' }, role: 'writer' } as never
-const adminGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1' }, role: 'admin' } as never
+const readerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'reader' } as never
+const writerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'writer' } as never
+const adminGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'admin' } as never
 
 /** Make requireDocRole emulate a 403 the way the real guard does (write + null). */
 function forbidGuard() {
@@ -114,6 +127,7 @@ beforeEach(() => {
   vi.mocked(query).mockReset()
   vi.mocked(query).mockResolvedValue([] as never)
   vi.mocked(transaction).mockReset()
+  vi.mocked(resolveAnchorFromLiveDoc).mockReset()
 })
 
 describe('POST create (reader can comment)', () => {
@@ -215,6 +229,142 @@ describe('POST create (reader can comment)', () => {
     expect((res.body as { id: number }).id).toBe(321)
   })
 
+  // ── bot path: anchorText resolution (feature #70) ──────────────────────────
+  it('resolves anchorText via the live doc and stores the returned anchors', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(resolveAnchorFromLiveDoc).mockResolvedValue({
+      anchorStart: Buffer.from('RS'),
+      anchorEnd: Buffer.from('RE'),
+      blockPath: [0],
+      from: 1,
+      to: 5,
+    })
+    mockInsertId(777)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'hello' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(201)
+    expect((res.body as { id: number }).id).toBe(777)
+    // Resolver was called with the doc name from the guard + no disambiguation.
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).toHaveBeenCalledWith('octo:s:f:d_1', {
+      anchorText: 'hello',
+      blockPath: undefined,
+      occurrence: undefined,
+    })
+    // The resolver's anchor bytes are what got persisted.
+    const insert = txQuery.mock.calls.find((c) => String(c[0]).includes('INSERT INTO doc_comment'))!
+    const args = insert[1] as unknown[]
+    expect((args[5] as Buffer).equals(Buffer.from('RS'))).toBe(true) // anchor_start
+    expect((args[6] as Buffer).equals(Buffer.from('RE'))).toBe(true) // anchor_end
+  })
+
+  it('threads blockPath + occurrence disambiguation through to the resolver', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(resolveAnchorFromLiveDoc).mockResolvedValue({
+      anchorStart: Buffer.from('a'),
+      anchorEnd: Buffer.from('b'),
+      blockPath: [1],
+      from: 3,
+      to: 4,
+    })
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({
+        params: { docId: 'd_1' },
+        body: { body: 'note', anchorText: 'x', blockPath: '1,0', occurrence: 2 },
+      }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(201)
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).toHaveBeenCalledWith('octo:s:f:d_1', {
+      anchorText: 'x',
+      blockPath: [1, 0],
+      occurrence: 2,
+    })
+  })
+
+  it('maps an ambiguous anchorText to 422 ambiguous_anchor (fail-loud, no INSERT)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(resolveAnchorFromLiveDoc).mockRejectedValue(new AmbiguousAnchorError([[0], [1]]))
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'dup' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(422)
+    expect((res.body as { error: string }).error).toBe('ambiguous_anchor')
+    expect((res.body as { matches: number[][] }).matches).toEqual([[0], [1]])
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('maps a missing anchorText to 422 anchor_text_not_found (no INSERT)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(resolveAnchorFromLiveDoc).mockRejectedValue(new AnchorTextNotFoundError())
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'ghost' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(422)
+    expect((res.body as { error: string }).error).toBe('anchor_text_not_found')
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('rejects a malformed blockPath with 400 invalid_block_path (never calls resolver)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'x', blockPath: 'a,b' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_block_path')
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).not.toHaveBeenCalled()
+  })
+
+  it('rejects a non-positive occurrence with 400 invalid_occurrence', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'x', occurrence: 0 } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_occurrence')
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).not.toHaveBeenCalled()
+  })
+
+  it('legacy explicit anchors take precedence over anchorText (front-end path unchanged)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    mockInsertId(55)
+    const res = mockRes()
+    // Old front-end sends BOTH the encoded anchors and a text snapshot.
+    await createCommentHandler(
+      req({
+        params: { docId: 'd_1' },
+        body: {
+          body: 'note',
+          anchorStart: Buffer.from('s').toString('base64'),
+          anchorEnd: Buffer.from('e').toString('base64'),
+          anchorText: 'snapshot text',
+        },
+      }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(201)
+    // The resolver is NOT invoked when explicit anchors are present.
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).not.toHaveBeenCalled()
+    const insert = txQuery.mock.calls.find((c) => String(c[0]).includes('INSERT INTO doc_comment'))!
+    const args = insert[1] as unknown[]
+    expect((args[5] as Buffer).equals(Buffer.from('s'))).toBe(true)
+    expect((args[6] as Buffer).equals(Buffer.from('e'))).toBe(true)
+  })
+
   it('creates a reply and stores NULL anchors (reply anchor invariant)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     // getById(parent) -> an existing root in this doc.
@@ -255,6 +405,72 @@ describe('POST create (reader can comment)', () => {
       res as never,
     )
     expect(res.statusCode).toBe(404)
+  })
+})
+
+// ── bot anchorText path: doc_type gate + unexpected-error handling (P1-2) ─────────
+describe('POST create — anchorText resolution guards (P1-2)', () => {
+  const whiteboardGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'whiteboard' },
+    role: 'reader',
+  } as never
+
+  it('rejects anchorText on a non-doc doc_type with 409 unsupported_doc_type (never resolves)', async () => {
+    // A sheet/board/whiteboard stores a non-ProseMirror Y.Doc shape, so resolving
+    // anchorText against it would throw inside initProseMirrorDoc. The gate must
+    // fire BEFORE the live-doc resolver is ever touched (mirrors docContent.ts).
+    vi.mocked(requireDocRole).mockResolvedValue(whiteboardGuard)
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'hello' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('unsupported_doc_type')
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).not.toHaveBeenCalled()
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('maps an unexpected resolver failure to 500 internal_error (no hung request, no INSERT)', async () => {
+    // A non-contract error (e.g. initProseMirrorDoc throwing on a bad fragment)
+    // must become a 500 through the handler, not a re-thrown rejection: this
+    // handler is a bare async Express handler, so an escaping rejection would
+    // become an unhandled rejection and hang the client request until timeout.
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(resolveAnchorFromLiveDoc).mockRejectedValue(new Error('live doc read failed'))
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'note', anchorText: 'hello' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(500)
+    expect((res.body as { error: string }).error).toBe('internal_error')
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('a partial explicit anchor (start only) + anchorText does NOT fall through to resolution → 400', async () => {
+    // Precedence guard: a half-supplied legacy pair must be rejected outright,
+    // never silently resolved via the anchorText path. Documents the current
+    // (correct) precedence so a future reorder cannot regress it silently.
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({
+        params: { docId: 'd_1' },
+        body: {
+          body: 'note',
+          anchorStart: Buffer.from('s').toString('base64'),
+          anchorText: 'fallback text',
+        },
+      }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect(vi.mocked(resolveAnchorFromLiveDoc)).not.toHaveBeenCalled()
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
   })
 })
 
