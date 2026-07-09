@@ -319,6 +319,15 @@ export const config = {
     maxPathDepth: num('DOC_BODY_EDIT_MAX_PATH_DEPTH', 32),
   },
 
+  // Bot/human sheet content read (GET /:docId/sheet). Stage1 read-guard: the
+  // decoded cell + dims payload is bounded to this size and a larger sheet gets
+  // a clear 413 sheet_too_large instead of an unbounded response body. The live
+  // Y.Doc is already capped at maxDocBytes, so the decode + measure is bounded;
+  // paginated reads for oversized sheets are deferred to a later stage.
+  sheetRead: {
+    maxCellBytes: num('SHEET_READ_MAX_CELL_BYTES', 1024 * 1024),
+  },
+
   // Typst-based PDF export. The document's persisted state is rendered to Typst
   // source (renderTypst.ts) and compiled to PDF by spawning the standalone
   // `typst` binary (typstService.ts). No resident process; each compile is a

@@ -13,8 +13,40 @@
  * which bot may write which sheet), exactly as the restore service does.
  */
 import type { Document } from '@hocuspocus/server'
+import * as Y from 'yjs'
 import { getCollabServer } from './server.js'
 import { applySheetCellsToYMap, SHEET_YMAP_FIELD, type SheetCell } from '../agent/sheetConversion.js'
+
+/**
+ * Read the live sheet document for a content read (mirrors readLiveForEdit).
+ *
+ * Returns the current authoritative Y.Doc binary state and its state vector,
+ * read inside a single transact for a consistent view. Read-only: opens a
+ * direct connection, snapshots, and disconnects without mutating. The caller
+ * decodes the state with the shared sheetConversion primitives (so the HTTP read
+ * and the version-restore preview share one validated decoder) and returns the
+ * state vector as the baseVersion for a later optimistic-concurrency write.
+ *
+ * @param documentName canonical persistence/connection key for the sheet
+ * @returns state — Y.Doc binary update; baseSV — its state vector
+ */
+export async function readLiveSheet(
+  documentName: string,
+): Promise<{ state: Uint8Array; baseSV: Uint8Array }> {
+  const server = getCollabServer()
+  const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: 'system' } })
+  let state!: Uint8Array
+  let baseSV!: Uint8Array
+  try {
+    await connection.transact((doc: Document) => {
+      state = Y.encodeStateAsUpdate(doc)
+      baseSV = Y.encodeStateVector(doc)
+    })
+  } finally {
+    await connection.disconnect()
+  }
+  return { state, baseSV }
+}
 
 /**
  * Apply a bot's cell edit onto the live sheet document and broadcast it.
