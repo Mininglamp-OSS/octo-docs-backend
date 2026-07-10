@@ -13,6 +13,10 @@ function ctxFor(id: string): AuthContext {
   }
 }
 
+function ctxForNamed(id: string, name: string): AuthContext {
+  return { ...ctxFor(id), user: { id, name } }
+}
+
 function presence(id: string, name = 'Ada', color = '#aabbcc') {
   return { user: { id, name, color }, cursor: { anchor: 1, head: 1 } }
 }
@@ -115,6 +119,105 @@ describe('awareness identity validation (§8.3.1, source-scoped & non-fatal)', (
     ])
     expect(() => validateAwarenessStates(states, ctxFor('user-1'))).not.toThrow()
     expect(states.has(3)).toBe(true)
+  })
+})
+
+describe('awareness display-name stamping (§4.7(b) / XIN-694, server-authoritative)', () => {
+  const nameOf = (states: Map<number, Record<string, unknown>>, clientId: number) =>
+    (states.get(clientId) as { user: Record<string, unknown> }).user
+
+  it('stamps the trusted display name over a client that broadcasts its raw uid as name', () => {
+    // The client whose own directory lookup has not resolved publishes its uid
+    // in both id and name. The server rewrites name with the trusted display
+    // name from ctx while keeping the uid in id.
+    const uid = '3d59d1ba1eb7a1831297e2a25856fb6e'
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: uid, name: uid }, pointer: { x: 1, y: 2 } }],
+    ])
+
+    validateAwarenessStates(states, ctxForNamed(uid, '大背头'))
+
+    const u = nameOf(states, 1)
+    expect(u.name).toBe('大背头') // display name, not the hex uid
+    expect(u.id).toBe(uid) // uid preserved as the separate id field
+    expect((states.get(1) as { pointer: unknown }).pointer).toEqual({ x: 1, y: 2 })
+  })
+
+  it('overrides even a client-supplied cosmetic name (client cannot pick its own display name)', () => {
+    const uid = 'user-1'
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: uid, name: 'totally-made-up' } }],
+    ])
+    validateAwarenessStates(states, ctxForNamed(uid, 'Ada Lovelace'))
+    expect(nameOf(states, 1).name).toBe('Ada Lovelace')
+  })
+
+  it('adds the trusted name when the client omitted name entirely', () => {
+    const uid = 'user-1'
+    const states = new Map<number, Record<string, unknown>>([[1, { user: { id: uid } }]])
+    validateAwarenessStates(states, ctxForNamed(uid, 'Grace'))
+    expect(nameOf(states, 1).name).toBe('Grace')
+  })
+
+  it('clamps a trusted name to the 64-char frame-lightness cap', () => {
+    const uid = 'user-1'
+    const states = new Map<number, Record<string, unknown>>([[1, { user: { id: uid, name: uid } }]])
+    validateAwarenessStates(states, ctxForNamed(uid, 'n'.repeat(80)))
+    expect(nameOf(states, 1).name).toBe('n'.repeat(64))
+  })
+
+  it('does not stamp a name onto a dropped impostor frame', () => {
+    // A frame claiming another uid is dropped by the identity check before any
+    // name stamping — the trusted name must not leak onto someone else's entry.
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: 'user-1', name: 'user-1' } }],
+      [2, { user: { id: 'user-victim', name: 'user-victim' } }],
+    ])
+    validateAwarenessStates(states, ctxForNamed('user-1', 'Ada'))
+    expect(nameOf(states, 1).name).toBe('Ada')
+    expect(states.has(2)).toBe(false)
+  })
+
+  it('falls back to sanitizing the client name when ctx carries no trusted name', () => {
+    // No trusted name (older token / directory supplied none): existing behavior
+    // — a valid client name is preserved, an invalid one is stripped, state kept.
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: 'user-1', name: 'ClientName' } }],
+      [2, { user: { id: 'user-1', name: 'x'.repeat(65) } }],
+    ])
+    validateAwarenessStates(states, ctxFor('user-1'))
+    expect(nameOf(states, 1).name).toBe('ClientName') // preserved
+    expect('name' in nameOf(states, 2)).toBe(false) // oversized stripped
+    expect(states.has(2)).toBe(true) // state kept
+  })
+
+  it('strips a script-vector client name on the fallback path but KEEPS presence (XSS guard)', () => {
+    // No trusted name → the client value is relayed, and it is attacker-chosen
+    // (the impersonation guard checks user.id, not user.name). This frame is
+    // rendered on every peer, so a name carrying a markup/script vector must be
+    // stripped fail-closed exactly as the sibling avatar field is. Reject the
+    // whole name, do not HTML-escape (escaping would corrupt the JSON contract).
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: 'user-1', name: '<img src=x onerror=alert(1)>' } }],
+      [2, { user: { id: 'user-1', name: '<script>alert(1)</script>' } }],
+      [3, { user: { id: 'user-1', name: 'plain">bad' } }],
+      [4, { user: { id: 'user-1', name: `ctrl${String.fromCharCode(7)}char` } }],
+    ])
+    validateAwarenessStates(states, ctxFor('user-1'))
+    for (const id of [1, 2, 3, 4]) {
+      expect('name' in nameOf(states, id)).toBe(false) // script-vector name stripped
+      expect(states.has(id)).toBe(true) // state kept (non-fatal)
+    }
+  })
+
+  it('preserves a legitimate unicode / punctuation client name on the fallback path', () => {
+    // The guard is reject-a-script-vector, not a restrictive charset: ordinary
+    // names with unicode, spaces, and safe punctuation must survive untouched.
+    const states = new Map<number, Record<string, unknown>>([
+      [1, { user: { id: 'user-1', name: '大背头 (Ada) & co.' } }],
+    ])
+    validateAwarenessStates(states, ctxFor('user-1'))
+    expect(nameOf(states, 1).name).toBe('大背头 (Ada) & co.')
   })
 })
 

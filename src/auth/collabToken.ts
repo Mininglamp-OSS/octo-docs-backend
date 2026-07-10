@@ -20,6 +20,14 @@ export interface CollabClaims {
   documentName: string
   role: Role
   permission_epoch: number
+  /**
+   * Trusted display name for `uid`, resolved from the octo user directory at
+   * issuance (§4.7(b)). Optional: absent when the directory could not supply a
+   * name. Carried so the collab/presence layer can stamp the awareness frame's
+   * `user.name` with a real name instead of the raw uid a not-yet-resolved
+   * client publishes (XIN-694). Never the identity itself — `uid` stays the id.
+   */
+  name?: string
 }
 
 export interface CollabTokenResult {
@@ -34,17 +42,25 @@ export interface CollabTokenResult {
   // the backend has COLLAB_TOKEN_PUBLIC_WS_URL configured; omitted otherwise so
   // the client falls back to its build-time env during the compat phase.
   collabWsUrl?: string
+  // Trusted display name resolved at issuance (§4.7(b)). Surfaced so the client
+  // can seed its own presence name without a separate directory round-trip;
+  // omitted when the directory supplied none (XIN-694).
+  name?: string
 }
 
 /** Sign a short-lived collab token (§4.4). */
 export function signCollabToken(claims: CollabClaims): CollabTokenResult {
   const ttl = config.collabToken.ttlSeconds
+  // Only sign a name claim when the directory actually supplied one; an empty
+  // string carries no information and would just bloat every frame.
+  const name = typeof claims.name === 'string' && claims.name !== '' ? claims.name : undefined
   const token = jwt.sign(
     {
       uid: claims.uid,
       documentName: claims.documentName,
       role: claims.role,
       permission_epoch: claims.permission_epoch,
+      ...(name !== undefined ? { name } : {}),
     },
     config.collabToken.secret,
     { algorithm: 'HS256', expiresIn: ttl },
@@ -60,6 +76,9 @@ export function signCollabToken(claims: CollabClaims): CollabTokenResult {
   // one (resolveCollabPublicWsUrl already normalised unset/malformed to '').
   if (config.collabToken.publicWsUrl !== '') {
     result.collabWsUrl = config.collabToken.publicWsUrl
+  }
+  if (name !== undefined) {
+    result.name = name
   }
   return result
 }
@@ -86,5 +105,15 @@ export function verifyCollabToken(token: string): CollabClaims {
   ) {
     throw new Error('invalid collab token claims')
   }
-  return { uid, documentName, role, permission_epoch }
+  // name is optional and cosmetic — a non-string or empty claim is simply
+  // dropped (never a rejection reason), so an old token minted before the
+  // name claim existed verifies exactly as before.
+  const name = d.name
+  return {
+    uid,
+    documentName,
+    role,
+    permission_epoch,
+    ...(typeof name === 'string' && name !== '' ? { name } : {}),
+  }
 }

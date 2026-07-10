@@ -44,6 +44,34 @@ export function setEpochWatermark(documentName: string, epoch: number): void {
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/
 
 /**
+ * Frame-lightness cap for a relayed presence display name. Longer values are
+ * treated as unsafe (the client path already enforced this bound).
+ */
+const NAME_MAX_LEN = 64
+
+/**
+ * True if `v` is a presence display name safe to RELAY to peers (§4.7(b) / P2).
+ *
+ * Like `avatar`, `name` is echoed to every other peer and rendered there
+ * (see the header on `validateAwarenessStates`), so a client-controlled value
+ * must never carry a script vector. A display name is free text, so — unlike a
+ * URL-shaped avatar — we do NOT restrict it to a narrow charset: unicode,
+ * spaces and ordinary punctuation are legitimate. We reject FAIL-CLOSED only a
+ * value that carries a markup/script vector: an angle bracket (`<` / `>`, the
+ * `<img src=x onerror=…>` / `<script>` injection vector) or a C0/C1 control
+ * character. Reject-not-escape is deliberate: HTML-escaping here would corrupt
+ * the JSON/Yjs awareness contract (a name legitimately containing `<` or `&`
+ * would be double-encoded at every consumer); the render sink still owns final
+ * escaping, this is the defense-in-depth the sibling `avatar` field already has.
+ * Never throws.
+ */
+export function isSafeName(v: unknown): v is string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > NAME_MAX_LEN) return false
+  // eslint-disable-next-line no-control-regex
+  return !/[<>\u0000-\u001F\u007F-\u009F]/.test(v)
+}
+
+/**
  * Reasonable cap for a relayed avatar reference — enough for a small raster
  * data: thumbnail, short enough to keep awareness frames light. Longer values
  * are treated as unsafe and stripped.
@@ -131,19 +159,30 @@ export function isSafeAvatar(v: unknown): v is string {
  *     `user.id` is not this connection's own uid is dropping the whole state
  *     (a client must never publish presence claiming to be someone else).
  *
- *  2. `color` and `name` are OPTIONAL, cosmetic fields. They must never cause
- *     the WHOLE presence state to be dropped — doing so silently kills the
- *     user's entire presence broadcast for that frame, and because Hocuspocus
- *     re-encodes the awareness update from only the surviving states, a dropped
- *     state is never applied to the document awareness and therefore never
- *     relayed (neither the local broadcast nor the Redis cross-node publish
- *     fires). The v1 whiteboard binding publishes `{ id, name, avatar }` with
- *     NO color at all, so the old whole-state drop on a missing/invalid color
- *     meant the receiving peer got ZERO awareness frames (presence A->B = 0)
- *     even though doc (type0) sync relayed fine. We instead SANITIZE the
- *     offending field in place (strip an invalid/unsafe color so no CSS
- *     injection value propagates; strip an oversized/non-string name) and let
- *     the rest of the presence broadcast — standard Hocuspocus relay behavior.
+ *  2. `color` and `avatar` are OPTIONAL, cosmetic fields, and `name` is
+ *     server-authoritative. None of them may cause the WHOLE presence state to
+ *     be dropped — doing so silently kills the user's entire presence broadcast
+ *     for that frame, and because Hocuspocus re-encodes the awareness update
+ *     from only the surviving states, a dropped state is never applied to the
+ *     document awareness and therefore never relayed (neither the local
+ *     broadcast nor the Redis cross-node publish fires). The v1 whiteboard
+ *     binding publishes `{ id, name, avatar }` with NO color at all, so the old
+ *     whole-state drop on a missing/invalid color meant the receiving peer got
+ *     ZERO awareness frames (presence A->B = 0) even though doc (type0) sync
+ *     relayed fine. We instead SANITIZE the offending field in place (strip an
+ *     invalid/unsafe color so no CSS injection value propagates) and let the
+ *     rest of the presence broadcast — standard Hocuspocus relay behavior.
+ *
+ *     For `name` specifically (§4.7(b) / XIN-694): the trusted display name
+ *     resolved at token issuance rides the collab token into `ctx`. When it is
+ *     present we STAMP it over whatever the client published, so every relayed
+ *     presence frame carries the real display name rather than the raw uid a
+ *     client whose own directory lookup has not yet resolved would broadcast.
+ *     `uid` always stays in `user.id`; only `user.name` is rewritten. When no
+ *     trusted name is available (an older token, or the directory supplied
+ *     none) we fall back to relaying the client value only when it is
+ *     script-safe (`isSafeName`): a name carrying a markup/script vector, or a
+ *     non-string/oversized one, is stripped fail-closed, never dropping the state.
  *
  * We MUST NOT throw: a malformed or impostor awareness frame must never crash
  * the process or break other users' live collaboration (an earlier
@@ -179,8 +218,26 @@ export function validateAwarenessStates(
     if ('color' in user && !(typeof user.color === 'string' && COLOR_RE.test(user.color))) {
       delete (user as { color?: unknown }).color
     }
-    // name is optional; strip it when present and not a string <= 64 chars.
-    if ('name' in user && !(typeof user.name === 'string' && user.name.length <= 64)) {
+    // name (§4.7(b) / XIN-694): the display name is server-authoritative. When a
+    // trusted name rode the collab token into ctx, it is the source of truth for
+    // THIS connection's presence — stamp it over whatever the client published
+    // (a client whose own directory lookup has not resolved broadcasts its raw
+    // uid as name). uid stays in user.id; only user.name changes. Same tier as
+    // the id binding above: the client does not get to pick its own display name.
+    // Clamp to the 64-char frame-lightness cap the client path already enforced.
+    const trustedName = ctx.user.name
+    if (typeof trustedName === 'string' && trustedName.length > 0) {
+      ;(user as { name?: unknown }).name =
+        trustedName.length > NAME_MAX_LEN ? trustedName.slice(0, NAME_MAX_LEN) : trustedName
+    } else if ('name' in user && !isSafeName(user.name)) {
+      // No trusted name at this layer (token minted before this change, or the
+      // directory supplied none): fall back to the client value, but relay it
+      // only when it is script-safe. A client-published name is attacker-chosen
+      // (the impersonation guard above checks user.id, not user.name), and this
+      // frame is rendered on every peer, so strip a name carrying a markup/script
+      // vector (e.g. `<img src=x onerror=…>`) or that is non-string/oversized —
+      // fail-closed, exactly as the sibling `avatar` field is hardened below.
+      // Reject-not-escape: HTML-escaping would corrupt the JSON awareness contract.
       delete (user as { name?: unknown }).name
     }
     // avatar is optional (the v1 whiteboard binding publishes { id, name,
@@ -309,7 +366,11 @@ export function createServer() {
     // module owns the idle timer / min-interval fallback / Redis dedup. Gated
     // behind AUTO_SNAPSHOT_ENABLED (default off) inside the module.
     async afterStoreDocument(data) {
-      await handleAfterStore(data.documentName, data.lastContext as AuthContext | undefined)
+      await handleAfterStore(
+        data.documentName,
+        data.lastContext as AuthContext | undefined,
+        data.document,
+      )
     },
 
     // A4 (§5.2): flush the last editing burst + clear the per-doc idle timer
@@ -320,7 +381,7 @@ export function createServer() {
         dispose()
         repairDisposers.delete(data.documentName)
       }
-      await handleBeforeUnload(data.documentName)
+      await handleBeforeUnload(data.documentName, data.document)
     },
   })
 

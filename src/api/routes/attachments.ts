@@ -112,14 +112,21 @@ function dispositionFileName(fileName: string): string {
  * cannot render in the browser; the disposition is baked into the signed URL so
  * object storage replays it as the response header (§3.5). dispositionFileName
  * strips quote/backslash/control chars first, so the file name cannot break out
- * of the quoted-string or inject a CR-LF header. The single read and batch
- * resolve endpoints share this one path so they never drift.
+ * of the quoted-string or inject a CR-LF header. The served Content-Type is also
+ * pinned to the registered `attachment.mime` — the value already vetted by the
+ * denylist/allow-list at presign time — so the GET response can never echo the
+ * attacker-controlled raw PUT header (stored XSS — XIN-726). The inline-vs-
+ * download decision is likewise taken from that trusted registered mime. The
+ * single read and batch resolve endpoints share this one path so they never drift.
  */
 function presignReadUrl(attachment: DocAttachment, ttl: number): string {
   const contentDisposition = isInlineType(attachment.mime)
     ? undefined
     : `attachment; filename="${dispositionFileName(attachment.fileName)}"`
-  return getObjectStore().presignGet(attachment.objectKey, ttl, { contentDisposition })
+  return getObjectStore().presignGet(attachment.objectKey, ttl, {
+    contentDisposition,
+    responseContentType: attachment.mime,
+  })
 }
 
 attachmentsRouter.post('/:docId/attachments/presign', presignHandler)

@@ -32,7 +32,10 @@ export interface ObjectStore {
    * `opts.contentDisposition` is set the value is bound into the signature and
    * carried as `response-content-disposition` so object storage replays it as
    * the response `Content-Disposition` header — used to force a download for
-   * non-inline attachment types (§3.5).
+   * non-inline attachment types (§3.5). When `opts.responseContentType` is set
+   * it is bound the same way and carried as `response-content-type`, so the
+   * response is served with the trusted, denylist-checked registered mime rather
+   * than the raw Content-Type the client sent on the PUT (stored XSS — XIN-726).
    */
   presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string
 }
@@ -40,6 +43,14 @@ export interface ObjectStore {
 export interface PresignGetOptions {
   /** Full Content-Disposition value, e.g. `attachment; filename="report.pdf"`. */
   contentDisposition?: string
+  /**
+   * Content-Type the GET response MUST be served with, bound into the signature
+   * and carried as `response-content-type` so the gateway (and S3/MinIO, which
+   * replays it natively) serves this trusted, denylist-checked mime instead of
+   * the raw Content-Type header the client happened to send on the PUT — which
+   * is attacker-controlled and otherwise enables stored XSS (XIN-726).
+   */
+  responseContentType?: string
 }
 
 export interface VerifyResult {
@@ -65,6 +76,21 @@ function sign(
   return createHmac('sha256', secret)
     .update(extra ? `${base}\n${extra}` : base)
     .digest('hex')
+}
+
+/**
+ * Compose the optional signed "extra" material appended to the canonical HMAC
+ * input from the response overrides carried on a GET URL. Ordering and labels
+ * are fixed so signing and verification agree, and a disposition-only URL keeps
+ * its historical single-line form (byte-identical signature) — the content-type
+ * line is only added when a trusted registered mime is bound (XIN-726). The
+ * `content-type=` label disambiguates it from the disposition value.
+ */
+function responseExtra(contentDisposition?: string, contentType?: string): string {
+  const parts: string[] = []
+  if (contentDisposition) parts.push(contentDisposition)
+  if (contentType) parts.push(`content-type=${contentType}`)
+  return parts.join('\n')
 }
 
 /**
@@ -98,25 +124,58 @@ export class LocalHmacObjectStore implements ObjectStore {
   private readonly bucket: string
   private readonly secret: string
   private readonly keyPrefix: string
+  private readonly publicBaseUrl: string
   private readonly nowSec: () => number
 
   constructor(opts?: {
     bucket?: string
     secret?: string
     keyPrefix?: string
+    publicBaseUrl?: string
     nowSec?: () => number
   }) {
     this.bucket = opts?.bucket ?? config.attachments.bucket
     this.secret = opts?.secret ?? config.attachments.signingSecret
     this.keyPrefix = opts?.keyPrefix ?? config.attachments.keyPrefix
+    // Strip any trailing slash so key joining stays canonical; empty means the
+    // legacy object-store.local host (see baseUrl()).
+    this.publicBaseUrl = (opts?.publicBaseUrl ?? config.attachments.publicBaseUrl).replace(
+      /\/+$/,
+      '',
+    )
     this.nowSec = opts?.nowSec ?? (() => Math.floor(Date.now() / 1000))
   }
 
   private baseUrl(physicalKey: string): string {
-    // Path-style URL against the bucket host. Each key segment is encoded but
-    // the '/' separators are preserved so the key round-trips cleanly.
+    // Path-style URL: each key segment is encoded but the '/' separators are
+    // preserved so the key round-trips cleanly. When a public base URL is
+    // configured the signed URL points at that browser-reachable origin
+    // (XIN-713); otherwise it falls back to the historical bucket host, which is
+    // an internal alias the end-user browser cannot resolve.
     const encodedKey = physicalKey.split('/').map(encodeURIComponent).join('/')
+    if (this.publicBaseUrl) {
+      return `${this.publicBaseUrl}/${encodedKey}`
+    }
     return `https://${this.bucket}.object-store.local/${encodedKey}`
+  }
+
+  /**
+   * The path segment carried by a configured public base URL (e.g. `/attachments`
+   * for `http://host:8092/attachments`), normalised without a trailing slash.
+   * Empty when no base URL is set or the base URL is origin-only. verify() strips
+   * this prefix before reconstructing the signed object key, so mounting the
+   * attachment host under a path does not change the signed key.
+   */
+  private basePathPrefix(): string {
+    if (!this.publicBaseUrl) return ''
+    let path: string
+    try {
+      path = new URL(this.publicBaseUrl).pathname
+    } catch {
+      return ''
+    }
+    const trimmed = path.replace(/\/+$/, '')
+    return trimmed === '' || trimmed === '/' ? '' : trimmed
   }
 
   private signedUrl(
@@ -124,12 +183,19 @@ export class LocalHmacObjectStore implements ObjectStore {
     objectKey: string,
     expiresSec: number,
     contentDisposition?: string,
+    contentType?: string,
   ): string {
     // The prefix is bound into both the URL path and the signature so a key
     // signed with one prefix can't be replayed under another.
     const physicalKey = applyKeyPrefix(this.keyPrefix, objectKey)
     const expiry = this.nowSec() + expiresSec
-    const signature = sign(method, physicalKey, expiry, this.secret, contentDisposition ?? '')
+    const signature = sign(
+      method,
+      physicalKey,
+      expiry,
+      this.secret,
+      responseExtra(contentDisposition, contentType),
+    )
     const url = new URL(this.baseUrl(physicalKey))
     url.searchParams.set('X-Method', method)
     url.searchParams.set('X-Expiry', String(expiry))
@@ -140,6 +206,12 @@ export class LocalHmacObjectStore implements ObjectStore {
     // S1). Without that gateway work the local-hmac path has no XSS defence.
     if (contentDisposition) {
       url.searchParams.set('response-content-disposition', contentDisposition)
+    }
+    // The trusted, denylist-checked mime the GET response must be served with,
+    // bound into the signature so the gateway serves it instead of the raw
+    // Content-Type the client sent on the PUT (stored XSS — XIN-726).
+    if (contentType) {
+      url.searchParams.set('response-content-type', contentType)
     }
     url.searchParams.set('X-Signature', signature)
     return url.toString()
@@ -153,7 +225,13 @@ export class LocalHmacObjectStore implements ObjectStore {
   }
 
   presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string {
-    return this.signedUrl('GET', objectKey, expiresSec, opts?.contentDisposition)
+    return this.signedUrl(
+      'GET',
+      objectKey,
+      expiresSec,
+      opts?.contentDisposition,
+      opts?.responseContentType,
+    )
   }
 
   /**
@@ -162,37 +240,97 @@ export class LocalHmacObjectStore implements ObjectStore {
    * future read-proxy that validates inbound signed URLs.
    */
   verify(signedUrl: string): VerifyResult {
+    return this.parseAndVerify(signedUrl).result
+  }
+
+  /**
+   * Verify a signed URL for a concrete HTTP request (XIN-717): in addition to
+   * the signature + expiry checks, the URL's bound `X-Method` must match the
+   * actual HTTP method, so a GET-signed URL can never be replayed as a PUT. On
+   * success returns the physical object key (prefix-applied, the same key the
+   * signature covers) so the blob gateway knows where to store / read the bytes.
+   */
+  verifyRequest(
+    httpMethod: string,
+    signedUrl: string,
+  ): VerifyResult & { objectKey?: string; disposition?: string; contentType?: string } {
+    const { result, method, physicalKey, disposition, contentType } =
+      this.parseAndVerify(signedUrl)
+    if (!result.valid) return result
+    if (method !== httpMethod.toUpperCase()) {
+      return { valid: false, reason: 'bad_signature' }
+    }
+    return { valid: true, objectKey: physicalKey, disposition, contentType }
+  }
+
+  /**
+   * Shared parse + signature/expiry verification for both verify() and
+   * verifyRequest(). Reconstructs the physical object key from the URL path
+   * (stripping any configured base-path segment), recomputes the HMAC over
+   * (method + key + expiry [+ disposition]) and compares in constant time.
+   */
+  private parseAndVerify(signedUrl: string): {
+    result: VerifyResult
+    method?: 'PUT' | 'GET'
+    physicalKey?: string
+    disposition?: string
+    contentType?: string
+  } {
     let url: URL
     try {
       url = new URL(signedUrl)
     } catch {
-      return { valid: false, reason: 'missing' }
+      return { result: { valid: false, reason: 'missing' } }
     }
     const method = url.searchParams.get('X-Method')
     const expiryStr = url.searchParams.get('X-Expiry')
     const signature = url.searchParams.get('X-Signature')
     if (!method || !expiryStr || !signature || (method !== 'PUT' && method !== 'GET')) {
-      return { valid: false, reason: 'missing' }
+      return { result: { valid: false, reason: 'missing' } }
     }
     const expiry = Number(expiryStr)
-    if (!Number.isFinite(expiry)) return { valid: false, reason: 'missing' }
+    if (!Number.isFinite(expiry)) return { result: { valid: false, reason: 'missing' } }
 
     // Reconstruct the physical object key from the path (decode each segment).
     // This is the prefixed key that was signed at mint time, so verification is
-    // self-consistent without needing to know the prefix here.
-    const physicalKey = url.pathname
+    // self-consistent without needing to know the prefix here. When the signed
+    // URL points at a public base URL that carries a path segment (e.g.
+    // `http://host:8092/attachments`), that segment is stripped first so the
+    // reconstructed key is the pure object key that was actually signed.
+    const basePath = this.basePathPrefix()
+    let pathname = url.pathname
+    if (basePath && (pathname === basePath || pathname.startsWith(`${basePath}/`))) {
+      pathname = pathname.slice(basePath.length)
+    }
+    const physicalKey = pathname
       .replace(/^\//, '')
       .split('/')
       .map(decodeURIComponent)
       .join('/')
 
     // Disposition (when present) is part of the signed material; '' otherwise so
-    // legacy URLs without it verify against the original signature form.
+    // legacy URLs without it verify against the original signature form. The
+    // response content-type override is bound the same way (XIN-726).
     const disposition = url.searchParams.get('response-content-disposition') ?? ''
-    const expected = sign(method, physicalKey, expiry, this.secret, disposition)
-    if (!safeEqualHex(expected, signature)) return { valid: false, reason: 'bad_signature' }
-    if (this.nowSec() >= expiry) return { valid: false, reason: 'expired' }
-    return { valid: true }
+    const contentType = url.searchParams.get('response-content-type') ?? ''
+    const expected = sign(
+      method,
+      physicalKey,
+      expiry,
+      this.secret,
+      responseExtra(disposition || undefined, contentType || undefined),
+    )
+    if (!safeEqualHex(expected, signature)) {
+      return { result: { valid: false, reason: 'bad_signature' } }
+    }
+    if (this.nowSec() >= expiry) return { result: { valid: false, reason: 'expired' } }
+    return {
+      result: { valid: true },
+      method,
+      physicalKey,
+      disposition: disposition === '' ? undefined : disposition,
+      contentType: contentType === '' ? undefined : contentType,
+    }
   }
 }
 
@@ -293,6 +431,7 @@ export class S3ObjectStore implements ObjectStore {
     objectKey: string,
     expiresSec: number,
     contentDisposition?: string,
+    contentType?: string,
   ): string {
     const url = new URL(this.endpoint)
     // Host header carries the port when non-default; it must match the URL host
@@ -325,6 +464,12 @@ export class S3ObjectStore implements ObjectStore {
     // below) is sufficient to force a download for non-inline types (§3.5).
     if (contentDisposition) {
       params['response-content-disposition'] = contentDisposition
+    }
+    // Likewise `response-content-type` is replayed as the response Content-Type,
+    // so the trusted registered mime is served instead of the raw PUT header
+    // (stored XSS — XIN-726).
+    if (contentType) {
+      params['response-content-type'] = contentType
     }
 
     const canonicalQuery = Object.entries(params)
@@ -370,7 +515,13 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string {
-    return this.presign('GET', objectKey, expiresSec, opts?.contentDisposition)
+    return this.presign(
+      'GET',
+      objectKey,
+      expiresSec,
+      opts?.contentDisposition,
+      opts?.responseContentType,
+    )
   }
 }
 

@@ -172,3 +172,66 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
     expect(claims.permission_epoch).toBe(2)
   })
 })
+
+describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () => {
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(docMetaRepo.getByDocumentName).mockReset()
+    vi.mocked(docMemberRepo.getRole).mockReset()
+  })
+
+  it('threads the display name from verifyToken into the signed token + response', async () => {
+    // verify already returns the caller's name in the common case, so no extra
+    // directory round-trip is needed.
+    const getUser = vi.fn(async () => null)
+    setOctoIdentity({
+      verifyToken: async () => ({ uid: 'wbtest_a', name: '大背头' }),
+      getUser,
+      getUsers: async () => [],
+    })
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
+
+    const out = await issueCollabToken('octo_session_a', BOARD_KEY)
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(out.result.name).toBe('大背头')
+    expect(verifyCollabToken(out.result.token).name).toBe('大背头')
+    // verify already carried the name — the per-uid directory lookup is skipped.
+    expect(getUser).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the directory (getUser) when verify carries no name', async () => {
+    const getUser = vi.fn(async () => ({ uid: 'wbtest_a', name: '哈哈', avatar: undefined }))
+    setOctoIdentity({
+      verifyToken: async () => ({ uid: 'wbtest_a' }), // no name
+      getUser,
+      getUsers: async () => [],
+    })
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
+
+    const out = await issueCollabToken('octo_session_a', BOARD_KEY)
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(getUser).toHaveBeenCalledWith('wbtest_a', 'octo_session_a')
+    expect(out.result.name).toBe('哈哈')
+    expect(verifyCollabToken(out.result.token).name).toBe('哈哈')
+  })
+
+  it('omits the name when neither verify nor the directory can supply one', async () => {
+    setOctoIdentity({
+      verifyToken: async () => ({ uid: 'wbtest_a' }),
+      getUser: async () => null, // directory has no profile
+      getUsers: async () => [],
+    })
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
+
+    const out = await issueCollabToken('octo_session_a', BOARD_KEY)
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect('name' in out.result).toBe(false)
+    expect('name' in verifyCollabToken(out.result.token)).toBe(false)
+  })
+})
