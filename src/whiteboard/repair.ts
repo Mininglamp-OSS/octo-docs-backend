@@ -24,6 +24,7 @@
  * `encodeStateAsUpdate`. See test/whiteboardRepairDeterminism.test.ts.
  */
 import * as Y from 'yjs'
+import { generateNKeysBetween } from 'fractional-indexing'
 import {
   normalizeElement,
   REPAIR_ORIGIN,
@@ -32,12 +33,6 @@ import {
 } from './schema/index.js'
 import type { WhiteboardElement } from './schema/index.js'
 import { getElementsMap, getFilesMap, readEntry, readElements, type YElements } from './ydoc.js'
-
-/** Deterministic fractional-index key for an element that lacks a valid one. */
-function fillIndexKey(seq: number): string {
-  // base36, zero-padded — valid INDEX_RE charset, stable sort order, no clock.
-  return `r${seq.toString(36).padStart(8, '0')}`
-}
 
 /** Deep-ish equality good enough for element field values (primitives + JSON). */
 function fieldEquals(a: unknown, b: unknown): boolean {
@@ -153,15 +148,35 @@ function planRepair(
     }
   }
 
-  // Deterministic index fill: indexless survivors (sorted by id) get a stable
-  // synthetic key. Computed over ALL survivors so the assignment is identical
-  // regardless of scope.
+  // Deterministic index fill: indexless survivors (sorted by id) get freshly
+  // generated, structurally LEGAL fractional-index (jitterbug) keys from the
+  // `fractional-indexing` library — never a hand-rolled `r`+base36 key, which is
+  // structurally invalid and crashed the FE binding (XIN-786/792). The batch is
+  // generated AFTER the largest already-valid index among survivors, so the
+  // filled keys (a) never collide with an existing key and (b) preserve z-order
+  // by appending the indexless elements at the end — the same semantics as
+  // Excalidraw's syncInvalidIndices. When no survivor has a valid index this
+  // reduces to generateNKeysBetween(null, null, n) => ['a0','a1',...].
+  //
+  // generateNKeysBetween is a pure function (no clock, no randomness) and the
+  // inputs (maxValidIndex, the sorted id list) are pure functions of the loaded
+  // state, so the assignment is byte-identical across instances (BE-M11) and
+  // idempotent: a second pass finds every index valid and fills nothing.
   const indexFill = new Map<string, string>()
-  let seq = 0
+  const indexless: string[] = []
+  let maxValidIndex: string | null = null
   for (const id of [...survivors].sort()) {
     const el = current.get(id)!
     const n = normalizeElement(el, {})!
-    if (n.index === undefined) indexFill.set(id, fillIndexKey(seq++))
+    if (n.index === undefined) {
+      indexless.push(id)
+    } else if (maxValidIndex === null || (n.index as string) > maxValidIndex) {
+      maxValidIndex = n.index as string
+    }
+  }
+  if (indexless.length > 0) {
+    const keys = generateNKeysBetween(maxValidIndex, null, indexless.length)
+    indexless.forEach((id, i) => indexFill.set(id, keys[i]!))
   }
 
   const writes = new Map<string, Record<string, unknown>>()

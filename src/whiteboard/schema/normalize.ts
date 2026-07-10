@@ -17,11 +17,16 @@
  * the whole element set and is therefore completed by repair (repairElements),
  * not here — normalize only strips an invalid index to a clean absent state.
  */
+import { generateKeyBetween, BASE_62_DIGITS } from 'fractional-indexing'
 import { WB_ELEMENT_TYPES, FILE_BEARING_TYPES, hasReservedEntryKey } from './constants.js'
 import type { WhiteboardElement, NormalizeContext } from './types.js'
 
-/** Fractional-index keys are non-empty base62 strings (Excalidraw `index`). */
-const INDEX_RE = /^[A-Za-z0-9]+$/
+/**
+ * Base-62 alphabet an Excalidraw fractional-index (jitterbug) key is built from:
+ * `0-9A-Za-z`. Every character of a valid key must come from this set — the same
+ * charset the previous `INDEX_RE=/^[A-Za-z0-9]+$/` enforced.
+ */
+const BASE62_CHARS: ReadonlySet<string> = new Set(BASE_62_DIGITS.split(''))
 
 /** Known numeric fields clamped to finite values; opacity additionally [0,100]. */
 const FINITE_FIELDS = ['x', 'y', 'width', 'height', 'angle', 'strokeWidth', 'fontSize'] as const
@@ -42,9 +47,38 @@ export function deterministicNonce(seed: string): number {
   return h & 0x7fffffff
 }
 
-/** True if `v` is a valid fractional-index key. */
+/**
+ * True if `v` is a valid Excalidraw fractional-index (jitterbug) key.
+ *
+ * Two gates, and BOTH must pass. This is the FE/BE-shared validity rule (XIN-16
+ * §3) — the front-end `packages/whiteboard-schema/src/normalize.ts` must apply
+ * the byte-identical rule so the two sides never disagree on what to strip:
+ *
+ *   1. charset — every character is in the base-62 alphabet `0-9A-Za-z`
+ *      (`BASE_62_DIGITS`). This is the same charset the old `INDEX_RE` checked;
+ *      it is kept as an explicit gate because `fractional-indexing`'s structural
+ *      parse does NOT reject out-of-alphabet digits (e.g. it would accept
+ *      `'a!b'`), so the charset gate must run first.
+ *   2. structure — the string parses as a legal jitterbug order key. `fractional-
+ *      indexing@4` does not export `validateOrderKey`, so we probe it through
+ *      `generateKeyBetween(v, null)`, which validates its `a` argument and throws
+ *      on a structurally illegal key. The head character fixes the integer-part
+ *      length (A->27,...,Z->2 for the negative band; a->2,...,z->27 for the
+ *      positive band) and the key must be at least that long — so the legacy
+ *      synthetic key `r00000003` (head 'r' demands a 19-char integer part, got 9)
+ *      is rejected here, where the old charset-only check let it through.
+ */
 export function isValidIndex(v: unknown): v is string {
-  return typeof v === 'string' && v.length > 0 && INDEX_RE.test(v)
+  if (typeof v !== 'string' || v.length === 0) return false
+  for (const ch of v) {
+    if (!BASE62_CHARS.has(ch)) return false // gate 1: charset
+  }
+  try {
+    generateKeyBetween(v, null) // gate 2: jitterbug structure (throws if illegal)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function coerceVersion(v: unknown): number {
