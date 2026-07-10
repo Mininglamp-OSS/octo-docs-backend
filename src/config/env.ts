@@ -399,6 +399,23 @@ export const config = {
     maxCellContentBytes: num('SHEET_WRITE_MAX_CELL_CONTENT_BYTES', 64 * 1024),
   },
 
+  // Bot board-scene write (PATCH /:docId/scene). Request-shape bounds that fail
+  // fast at the route gate, BEFORE the no-lock batch validation and the live
+  // write, so an oversized element batch is rejected without spending that work.
+  // Mirrors docBodyEdit / sheetWrite for the whiteboard element surface; the
+  // global express.json 1mb cap and the post-write maxDocBytes gate remain.
+  boardSceneWrite: {
+    // Upper bound on the number of scene ops per PATCH batch — upsert elements +
+    // deleted ids + file entries combined. Well above a realistic single edit,
+    // low enough that a scripted client cannot fan out unbounded validate/apply
+    // work under the 1mb body cap.
+    maxElements: num('BOARD_SCENE_WRITE_MAX_ELEMENTS', 5000),
+    // Upper bound on a single element's / file ref's serialized payload — keeps
+    // one element (chiefly a freedraw `points` array) from carrying most of the
+    // 1mb body as a single object that must be normalized.
+    maxElementContentBytes: num('BOARD_SCENE_WRITE_MAX_ELEMENT_CONTENT_BYTES', 128 * 1024),
+  },
+
   // Typst-based PDF export. The document's persisted state is rendered to Typst
   // source (renderTypst.ts) and compiled to PDF by spawning the standalone
   // `typst` binary (typstService.ts). No resident process; each compile is a
