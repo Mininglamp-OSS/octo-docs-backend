@@ -36,6 +36,11 @@ import {
   rasterizeSvgToPng,
   type ResolvedSceneImage,
 } from '../../whiteboard/exportScene.js'
+import {
+  acquirePngSlot,
+  releasePngSlot,
+  BoardExportBusyError,
+} from '../../whiteboard/boardExportQueue.js'
 import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { config } from '../../config/env.js'
@@ -229,11 +234,29 @@ export async function exportBoardHandler(req: Request, res: Response): Promise<v
   // resolved image bytes + the shared layout so the PNG path composites them
   // onto the canvas directly (best-effort). The SVG output above keeps the
   // data-URI embed unchanged.
-  const layout = computeSceneLayout(scene, { maxDimension: config.boardExport.maxSvgDimension })
-  const png = await rasterizeSvgToPng(svg, {
-    fitWidth: config.boardExport.pngWidth,
-    maxPixels: config.boardExport.maxPngPixels,
-    composite: { elements: scene.elements, imagesByFileId: images, layout },
-  })
-  res.status(200).type(MIME.png).send(png)
+  //
+  // Gate the raster behind the concurrency queue: it is synchronous, CPU/memory
+  // -heavy Skia work, so a burst of concurrent `?format=png` GETs must shed load
+  // (503) rather than pile up and OOM. Acquire before the raster, always release.
+  try {
+    await acquirePngSlot()
+  } catch (err) {
+    if (err instanceof BoardExportBusyError) {
+      res.status(503).json({ error: 'export_busy' })
+      return
+    }
+    throw err
+  }
+  try {
+    const layout = computeSceneLayout(scene, { maxDimension: config.boardExport.maxSvgDimension })
+    const png = await rasterizeSvgToPng(svg, {
+      fitWidth: config.boardExport.pngWidth,
+      maxPixels: config.boardExport.maxPngPixels,
+      maxSourceImagePixels: config.boardExport.maxSourceImagePixels,
+      composite: { elements: scene.elements, imagesByFileId: images, layout },
+    })
+    res.status(200).type(MIME.png).send(png)
+  } finally {
+    releasePngSlot()
+  }
 }

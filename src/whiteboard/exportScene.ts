@@ -113,11 +113,88 @@ interface Bounds {
  */
 export const DEFAULT_MAX_SVG_DIMENSION = 12_000
 export const DEFAULT_MAX_PNG_PIXELS = 40_000_000
+/**
+ * Max DECODED pixel area (width*height) of a *source* image element before it is
+ * composited onto the PNG. Distinct from DEFAULT_MAX_PNG_PIXELS: that one caps
+ * the OUTPUT canvas, this one caps each SOURCE bitmap the compositor decodes.
+ * The source is bounded only by compressed bytes (maxImageBytes, 10MB) upstream,
+ * and a highly compressed image (e.g. a 30000x30000 PNG that zips to <10MB)
+ * decodes to a multi-GB RGBA bitmap — so `loadImage` on it OOMs the process, and
+ * any reader can trigger it through `?format=png` (a decompression bomb). We read
+ * the intrinsic dimensions from the file header (see readImagePixelArea) BEFORE
+ * decoding, and fall back to a placeholder when they exceed this cap, so the
+ * multi-GB allocation never happens. ~40M px ≈ 160MB RGBA peak per image (images
+ * are decoded one at a time in the composite loop, so this is the peak, not the
+ * sum). Best-effort: an oversize image degrades to a placeholder, never aborts.
+ */
+export const DEFAULT_MAX_SOURCE_IMAGE_PIXELS = 40_000_000
 
 /** Clamp a raw canvas extent to [1, maxDim]; a non-finite extent collapses to maxDim. */
 function clampDim(raw: number, maxDim: number): number {
   if (!Number.isFinite(raw)) return maxDim
   return Math.min(Math.max(1, raw), maxDim)
+}
+
+/**
+ * Read the intrinsic pixel area (width*height) of an encoded raster from its
+ * header bytes, WITHOUT decoding the pixels — so an attacker-supplied bomb never
+ * forces the full bitmap allocation just to learn how big it is. Covers the
+ * three formats sniffImageMime admits (PNG / JPEG / GIF); the declared header
+ * dimensions are exactly what a decoder would allocate (width*height*4 for RGBA).
+ * Returns null when the format/marker is unrecognized or the header is truncated,
+ * in which case the caller proceeds to decode (best-effort, matching the rest of
+ * this path). `mime` narrows the parser; it is the value sniffed from the same
+ * bytes, so it is trusted here.
+ */
+export function readImagePixelArea(bytes: Buffer, mime: string): number | null {
+  if (mime === 'image/png') {
+    // 8-byte signature, then the first chunk MUST be IHDR: 4-byte length,
+    // "IHDR", then width/height as big-endian uint32 at offsets 16 and 20.
+    if (bytes.length < 24) return null
+    if (bytes.toString('ascii', 12, 16) !== 'IHDR') return null
+    return bytes.readUInt32BE(16) * bytes.readUInt32BE(20)
+  }
+  if (mime === 'image/gif') {
+    // Logical Screen Descriptor: width/height as little-endian uint16 at
+    // offsets 6 and 8 (right after the 6-byte "GIF87a"/"GIF89a" header).
+    if (bytes.length < 10) return null
+    return bytes.readUInt16LE(6) * bytes.readUInt16LE(8)
+  }
+  if (mime === 'image/jpeg') {
+    // Walk the marker segments to the first Start-Of-Frame (SOF0..SOF15, minus
+    // the non-SOF markers DHT/JPG/DAC at C4/C8/CC): height/width are big-endian
+    // uint16 at marker payload offsets 3 and 5. Skip other segments by length.
+    let off = 2 // past the SOI (FF D8)
+    while (off + 8 < bytes.length) {
+      if (bytes[off] !== 0xff) return null // desynced — bail rather than scan blindly
+      const marker = bytes[off + 1]!
+      const isSof =
+        marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+      const segLen = bytes.readUInt16BE(off + 2)
+      if (isSof) return bytes.readUInt16BE(off + 5) * bytes.readUInt16BE(off + 7)
+      if (segLen < 2) return null
+      off += 2 + segLen
+    }
+    return null
+  }
+  return null
+}
+
+/** Draw the light dashed placeholder used for an image that can't be composited. */
+function drawImagePlaceholder(
+  ctx: import('@napi-rs/canvas').SKRSContext2D,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+): void {
+  // Mirrors renderImage's SVG placeholder so PNG and SVG exports look identical.
+  ctx.fillStyle = '#f1f3f5'
+  ctx.fillRect(dx, dy, dw, dh)
+  ctx.strokeStyle = '#ced4da'
+  ctx.lineWidth = 1
+  ctx.setLineDash([4, 4])
+  ctx.strokeRect(dx, dy, dw, dh)
 }
 
 function isDeleted(el: Record<string, unknown>): boolean {
@@ -488,6 +565,7 @@ export async function rasterizeSvgToPng(
   opts: {
     fitWidth?: number
     maxPixels?: number
+    maxSourceImagePixels?: number
     composite?: {
       elements: Array<Record<string, unknown>>
       imagesByFileId: Map<string, ResolvedSceneImage>
@@ -498,6 +576,10 @@ export async function rasterizeSvgToPng(
   const { createCanvas, loadImage, GlobalFonts } = await import('@napi-rs/canvas')
   registerSystemFonts(GlobalFonts)
   const maxPixels = opts.maxPixels && opts.maxPixels > 0 ? opts.maxPixels : DEFAULT_MAX_PNG_PIXELS
+  const maxSourcePixels =
+    opts.maxSourceImagePixels && opts.maxSourceImagePixels > 0
+      ? opts.maxSourceImagePixels
+      : DEFAULT_MAX_SOURCE_IMAGE_PIXELS
 
   // Decode the serialized SVG once to read its intrinsic pixel size (the
   // document width/height, which the serializer already clamped to a finite
@@ -565,17 +647,24 @@ export async function rasterizeSvgToPng(
         ctx.rotate(angle)
         ctx.translate(-cx, -cy)
       }
+      // Decompression-bomb guard: read the source's intrinsic pixel area from
+      // its header and skip the decode entirely when it exceeds the cap. This
+      // MUST happen before loadImage — that call allocates the full RGBA bitmap,
+      // so a 30000x30000 (≈3.6GB) source would OOM the process on decode, not
+      // after. An unparseable header (area === null) falls through to decode,
+      // still bounded by the compressed-byte budget upstream.
+      const area = readImagePixelArea(image.bytes, image.mime)
+      if (area !== null && area > maxSourcePixels) {
+        drawImagePlaceholder(ctx, dx, dy, dw, dh)
+        ctx.restore()
+        continue
+      }
       try {
         const bmp = await loadImage(image.bytes)
         ctx.drawImage(bmp, dx, dy, dw, dh)
       } catch {
         // Decode failed → light dashed placeholder (mirrors renderImage's SVG one).
-        ctx.fillStyle = '#f1f3f5'
-        ctx.fillRect(dx, dy, dw, dh)
-        ctx.strokeStyle = '#ced4da'
-        ctx.lineWidth = 1
-        ctx.setLineDash([4, 4])
-        ctx.strokeRect(dx, dy, dw, dh)
+        drawImagePlaceholder(ctx, dx, dy, dw, dh)
       }
       ctx.restore()
     }

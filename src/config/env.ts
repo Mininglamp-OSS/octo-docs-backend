@@ -464,6 +464,19 @@ export const config = {
     // single reader GET cannot force a multi-GB allocation (OOM); oversize scenes
     // are downscaled uniformly to fit. ~40M px ≈ 160MB RGBA peak.
     maxPngPixels: num('BOARD_EXPORT_MAX_PNG_PIXELS', 40_000_000),
+    // Max DECODED pixel area (width*height) of a source image element before the
+    // PNG compositor decodes it. maxImageBytes caps only the *compressed* source,
+    // so a highly compressed bomb (e.g. 30000x30000 PNG < 10MB) would decode to a
+    // multi-GB bitmap and OOM the process on loadImage. The intrinsic size is read
+    // from the header before decoding; an oversize source degrades to a
+    // placeholder (best-effort). ~40M px ≈ 160MB RGBA peak per image.
+    maxSourceImagePixels: num('BOARD_EXPORT_MAX_SOURCE_IMAGE_PIXELS', 40_000_000),
+    // Concurrency gate for the PNG raster path (CPU/memory-heavy, synchronous
+    // Skia compositing). At most maxConcurrent PNG rasters run at once; up to
+    // maxQueue more wait, and further requests get 503 export_busy — so a burst
+    // of `?format=png` GETs can't saturate CPU/RAM and cascade into an OOM.
+    maxConcurrentPngExports: num('BOARD_EXPORT_MAX_CONCURRENT_PNG', 4),
+    maxQueuedPngExports: num('BOARD_EXPORT_MAX_QUEUED_PNG', 16),
   },
 
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots

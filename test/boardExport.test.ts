@@ -21,7 +21,12 @@ vi.mock('../src/db/repos/docAttachmentRepo.js', () => ({
   docAttachmentRepo: { listByDoc: vi.fn(async () => []), getById: vi.fn(async () => null) },
 }))
 
-import { serializeSceneToSvg, computeSceneLayout, rasterizeSvgToPng } from '../src/whiteboard/exportScene.js'
+import {
+  serializeSceneToSvg,
+  computeSceneLayout,
+  rasterizeSvgToPng,
+  readImagePixelArea,
+} from '../src/whiteboard/exportScene.js'
 import { exportBoardHandler } from '../src/api/routes/boardExport.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { COLLAB_FIELD } from '../src/schema/index.js'
@@ -239,6 +244,129 @@ describe('rasterizeSvgToPng — image compositing', () => {
       composite: { elements: scene.elements, imagesByFileId: images, layout },
     })
     expect(await countRedPixels(composed)).toBeGreaterThan(0)
+  })
+})
+
+// Decompression-bomb regression (yujiawei P1 CR). The compositor decodes source
+// image bytes at their NATIVE size, but upstream only caps the *compressed* bytes
+// (maxImageBytes, 10MB). A highly compressed image (e.g. a 30000x30000 PNG that
+// zips under 10MB) decodes to a multi-GB RGBA bitmap, so `loadImage` on it OOMs
+// the process — reachable by any reader via `?format=png` (a DoS). The fix reads
+// the intrinsic pixel area from the header BEFORE decoding and degrades an
+// oversize source to a placeholder instead of allocating the bomb.
+describe('rasterizeSvgToPng — source image decompression-bomb guard', () => {
+  // Count pixels close to a given RGB (source images below are solid-colored).
+  async function countColorPixels(buf: Buffer, r: number, g: number, b: number): Promise<number> {
+    const { createCanvas, loadImage } = await import('@napi-rs/canvas')
+    const img = await loadImage(buf)
+    const c = createCanvas(img.width, img.height)
+    const cx = c.getContext('2d')
+    cx.drawImage(img, 0, 0)
+    const d = cx.getImageData(0, 0, img.width, img.height).data
+    let n = 0
+    for (let i = 0; i < d.length; i += 4) {
+      if (Math.abs(d[i]! - r) < 60 && Math.abs(d[i + 1]! - g) < 60 && Math.abs(d[i + 2]! - b) < 60) n++
+    }
+    return n
+  }
+
+  // A minimal well-formed PNG header (8-byte signature + IHDR) declaring an
+  // arbitrary width/height, with no image data. readImagePixelArea only inspects
+  // the IHDR, so this is enough to exercise the pre-decode size check without ever
+  // materializing (or being able to materialize) the bomb bitmap.
+  function pngHeader(width: number, height: number): Buffer {
+    const buf = Buffer.alloc(24)
+    buf.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0) // signature
+    buf.writeUInt32BE(13, 8) // IHDR length
+    buf.write('IHDR', 12, 'ascii')
+    buf.writeUInt32BE(width, 16)
+    buf.writeUInt32BE(height, 20)
+    return buf
+  }
+
+  it('reads intrinsic pixel area from a PNG/GIF/JPEG header without decoding', () => {
+    expect(readImagePixelArea(pngHeader(30000, 30000), 'image/png')).toBe(900_000_000)
+
+    // GIF: little-endian uint16 width/height at offsets 6/8 after "GIF89a".
+    const gif = Buffer.alloc(10)
+    gif.write('GIF89a', 0, 'ascii')
+    gif.writeUInt16LE(20000, 6)
+    gif.writeUInt16LE(20000, 8)
+    expect(readImagePixelArea(gif, 'image/gif')).toBe(400_000_000)
+
+    // JPEG: SOI, an APP0 segment, then SOF0 carrying height/width (BE uint16).
+    const jpeg = Buffer.from([
+      0xff, 0xd8, // SOI
+      0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, // APP0, length 4, 2 bytes payload
+      0xff, 0xc0, 0x00, 0x11, 0x08, // SOF0, length 17, precision 8
+      0x27, 0x10, // height 10000
+      0x27, 0x10, // width 10000
+    ])
+    expect(readImagePixelArea(jpeg, 'image/jpeg')).toBe(100_000_000)
+
+    // Unparseable / truncated header → null (caller falls through to decode).
+    expect(readImagePixelArea(Buffer.from([0x89, 0x50]), 'image/png')).toBeNull()
+    expect(readImagePixelArea(Buffer.alloc(24), 'image/webp')).toBeNull()
+  })
+
+  it('degrades an over-cap source image to a placeholder instead of compositing it', async () => {
+    const { createCanvas } = await import('@napi-rs/canvas')
+    // A real, fully decodable 80x80 green source image (6400 px).
+    const src = createCanvas(80, 80)
+    const sctx = src.getContext('2d')
+    sctx.fillStyle = '#00cc00'
+    sctx.fillRect(0, 0, 80, 80)
+    const greenPng = src.toBuffer('image/png')
+
+    const scene = {
+      elements: [el('i1', 'image', { fileId: 'f1', x: 40, y: 40, width: 60, height: 60 })],
+      files: { f1: { attachId: 'att1' } },
+    }
+    const images = new Map([['f1', { mime: 'image/png', bytes: greenPng }]])
+    const svg = serializeSceneToSvg(scene, images)
+    const layout = computeSceneLayout(scene)
+
+    // Cap ABOVE the source area → composited normally (control).
+    const ok = await rasterizeSvgToPng(svg, {
+      fitWidth: 300,
+      maxSourceImagePixels: 1_000_000,
+      composite: { elements: scene.elements, imagesByFileId: images, layout },
+    })
+    expect(await countColorPixels(ok, 0, 204, 0)).toBeGreaterThan(0)
+
+    // Cap BELOW the source area → the compositor must NOT decode/paint the image;
+    // the region degrades to the light placeholder, so no green survives. Without
+    // the pre-decode clamp (the vulnerable HEAD) the image is decoded and painted,
+    // and this assertion fails — the OOM path for a real bomb.
+    const clamped = await rasterizeSvgToPng(svg, {
+      fitWidth: 300,
+      maxSourceImagePixels: 1_000,
+      composite: { elements: scene.elements, imagesByFileId: images, layout },
+    })
+    expect(await countColorPixels(clamped, 0, 204, 0)).toBe(0)
+    // Still a valid, non-empty PNG (best-effort: export never aborts).
+    expect(clamped.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  })
+
+  it('never decodes a bomb-sized source (huge header dims) — degrades and stays bounded', async () => {
+    // 40000x40000 = 1.6e9 px ≈ 6.4GB RGBA if decoded: far over the default cap.
+    // The header alone drives the guard, so no bitmap is ever allocated.
+    const bomb = pngHeader(40_000, 40_000)
+    const scene = {
+      elements: [el('i1', 'image', { fileId: 'f1', x: 40, y: 40, width: 60, height: 60 })],
+      files: { f1: { attachId: 'att1' } },
+    }
+    const images = new Map([['f1', { mime: 'image/png', bytes: bomb }]])
+    const svg = serializeSceneToSvg(scene, images)
+    const layout = computeSceneLayout(scene)
+
+    // Completes quickly with a valid PNG and does not throw or OOM.
+    const png = await rasterizeSvgToPng(svg, {
+      fitWidth: 300,
+      composite: { elements: scene.elements, imagesByFileId: images, layout },
+    })
+    expect(png.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+    expect(png.length).toBeGreaterThan(0)
   })
 })
 
