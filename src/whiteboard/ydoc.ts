@@ -21,12 +21,55 @@ export function getFilesMap(doc: Y.Doc): YElements {
   return doc.getMap(FILES_FIELD) as YElements
 }
 
+/**
+ * Field-value equality good enough for element/file maps (primitives + JSON),
+ * NaN-tolerant so a passed-through NaN never forces a spurious rewrite. Mirrors
+ * the identical local helper in versionRestore.ts / repair.ts — shared here so
+ * the board-scene write path (boardEdit.ts) converges on one definition rather
+ * than adding a fourth copy.
+ */
+export function fieldEquals(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (a !== a && b !== b) return true // NaN/NaN (Object.is semantics)
+  if (typeof a !== typeof b) return false
+  if (a && b && typeof a === 'object') return JSON.stringify(a) === JSON.stringify(b)
+  return false
+}
+
+/**
+ * Write `obj` field-level into a per-entry Y.Map, making the entry EQUAL `obj`:
+ * only changed fields are set and fields absent from `obj` are removed, so a
+ * concurrent edit to an unrelated field of another entry survives and the stale
+ * removals land as causal tombstones. MUST be called inside a Yjs transaction.
+ *
+ * This is the same field-level reconcile reconcileEntryMap (versionRestore.ts)
+ * and repair's applyPlan already perform per entry; factored out so the live
+ * board-scene write reuses one definition. Fields are written in sorted order so
+ * struct-creation order stays stable (encoding-significant).
+ */
+export function writeEntryFields(yEntry: Y.Map<unknown>, obj: Record<string, unknown>): void {
+  const cur = readEntry(yEntry)
+  for (const f of Object.keys(obj).sort()) {
+    if (!fieldEquals(cur[f], obj[f])) yEntry.set(f, obj[f])
+  }
+  for (const f of Object.keys(cur).sort()) {
+    if (!(f in obj)) yEntry.delete(f)
+  }
+}
+
 /** Read a per-element/-file Y.Map (or a plainly-stored object) into a JS object. */
 export function readEntry(value: unknown): Record<string, unknown> {
   if (value instanceof Y.Map) {
     const obj: Record<string, unknown> = {}
     for (const [k, v] of value.entries()) {
-      obj[k] = v instanceof Y.AbstractType ? (v as Y.AbstractType<unknown>).toJSON() : v
+      const jv = v instanceof Y.AbstractType ? (v as Y.AbstractType<unknown>).toJSON() : v
+      // Define an OWN data property rather than `obj[k] = v`: a stored '__proto__'
+      // key would otherwise hit the Object.prototype accessor and reparent obj
+      // (dropping the key on read-back and leaking inherited props). normalize*
+      // reject such keys on write, so this is the read-side backstop for any
+      // already-stored / repaired entry; it is equivalent to plain assignment for
+      // every other key.
+      Object.defineProperty(obj, k, { value: jv, enumerable: true, writable: true, configurable: true })
     }
     return obj
   }

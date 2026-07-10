@@ -17,7 +17,7 @@
  * the whole element set and is therefore completed by repair (repairElements),
  * not here — normalize only strips an invalid index to a clean absent state.
  */
-import { WB_ELEMENT_TYPES, FILE_BEARING_TYPES } from './constants.js'
+import { WB_ELEMENT_TYPES, FILE_BEARING_TYPES, hasReservedEntryKey } from './constants.js'
 import type { WhiteboardElement, NormalizeContext } from './types.js'
 
 /** Fractional-index keys are non-empty base62 strings (Excalidraw `index`). */
@@ -67,6 +67,9 @@ export function normalizeElement(
   const src = el as Record<string, unknown>
   if (typeof src.id !== 'string' || src.id.length === 0) return null
   if (typeof src.type !== 'string' || !WB_ELEMENT_TYPES.has(src.type)) return null
+  // Reject reserved prototype keys before the clone: they are never a legitimate
+  // element field and corrupt the plain-object read-back (ydoc.ts readEntry).
+  if (hasReservedEntryKey(src)) return null
 
   // Clone (preserve unknown fields, §6); then correct known fields in place.
   const out: Record<string, unknown> = { ...src }

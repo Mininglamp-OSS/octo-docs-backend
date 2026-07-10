@@ -26,6 +26,19 @@ export interface StoreContext {
 }
 
 /**
+ * Sentinel uid the read-only openDirectConnection paths pass as `user.id`
+ * (readLiveBoard / readLiveSheet / readLiveDocState / readLiveForEdit /
+ * resolveAnchorFromLiveDoc). @hocuspocus/server's disconnect() flushes
+ * onStoreDocument UNCONDITIONALLY (before the clientsCount gate), so a pure read
+ * that opens a direct connection and disconnects would otherwise re-stamp
+ * doc_meta.updated_by/updated_at from this sentinel — a read silently rewriting
+ * the document's authoritative "last editor". store() therefore skips the
+ * doc_meta metadata write for this uid (the Y.Doc row is still upserted, which is
+ * idempotent for a read), so ONLY a real editor ever moves updated_by/updated_at.
+ */
+export const SYSTEM_STORE_UID = 'system'
+
+/**
  * Pure merge-on-write computation (§3.2). Returns the bytes to persist and
  * whether the union fallback path ran (for diagnostics/tests).
  *
@@ -89,10 +102,16 @@ export const persistence = {
       await yjsDocumentRepo.upsertStateTx(tx, documentName, finalState)
 
       // doc_meta.updated_at + updated_by (updated_by from context.user.id, §4.1).
-      await tx.query('UPDATE doc_meta SET updated_at = NOW(3), updated_by = ? WHERE document_name = ?', [
-        context?.user?.id ?? null,
-        documentName,
-      ])
+      // A read-only direct connection (SYSTEM_STORE_UID) flushes a store on
+      // disconnect but must NEVER be recorded as the last editor: skip the
+      // metadata stamp so a GET /scene or a PATCH pre-flight read cannot pollute
+      // updated_by/updated_at. Only a real editor's write updates it.
+      if (context?.user?.id !== SYSTEM_STORE_UID) {
+        await tx.query('UPDATE doc_meta SET updated_at = NOW(3), updated_by = ? WHERE document_name = ?', [
+          context?.user?.id ?? null,
+          documentName,
+        ])
+      }
     })
   },
 }

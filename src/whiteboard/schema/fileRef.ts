@@ -25,6 +25,7 @@
  * cross-instance repair. The input is never mutated.
  */
 import type { FileRef } from './types.js'
+import { hasReservedEntryKey } from './constants.js'
 
 /**
  * Canonical `status` values for a file reference. `pending` is the transient
@@ -82,6 +83,9 @@ export function normalizeFileRef(entry: unknown): FileRef | null {
   if (!entry || typeof entry !== 'object') return null
   const src = entry as Record<string, unknown>
   if (!isNonEmptyString(src.attachId)) return null
+  // Reserved prototype keys corrupt the plain-object read-back (ydoc.ts
+  // readEntry) exactly as they do for elements — reject fail-closed.
+  if (hasReservedEntryKey(src)) return null
 
   const out: FileRef = { ...(src as Record<string, unknown>), attachId: src.attachId } as FileRef
 

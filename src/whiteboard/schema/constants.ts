@@ -58,6 +58,32 @@ export const WB_ELEMENT_TYPES: ReadonlySet<string> = new Set([
 /** Element types whose `fileId` must resolve to a `files` container entry (§2). */
 export const FILE_BEARING_TYPES: ReadonlySet<string> = new Set(['image'])
 
+/**
+ * Object keys that must never be stored as an element or file-reference field,
+ * NOR used as a `files` map key (fileId): they collide with JavaScript object
+ * internals. Rebuilding a stored entry into a plain object (ydoc.ts readEntry,
+ * `obj[k] = v`) routes a `__proto__` key through the Object.prototype accessor —
+ * reparenting the object, dropping the key on read-back, and leaking inherited
+ * properties — while `constructor` / `prototype` shadow structural members. The
+ * same hazard applies when one of these names is the KEY under which a file ref
+ * is stored (`files[fid] = …` in decodeBoardSnapshot). A scene element, file ref
+ * field, or fileId has no legitimate use for any of them, so they are rejected
+ * fail-closed on write (normalizeElement / normalizeFileRef → 422, validateBoardOps
+ * reserved-fid → 422) rather than being stored and silently corrupting every
+ * later read.
+ */
+export const RESERVED_ENTRY_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype']
+
+/** True iff `src` carries any RESERVED_ENTRY_KEYS as an OWN property. */
+export function hasReservedEntryKey(src: object): boolean {
+  return RESERVED_ENTRY_KEYS.some((k) => Object.prototype.hasOwnProperty.call(src, k))
+}
+
+/** True iff `key` is itself a reserved prototype name (e.g. a `files` map fileId). */
+export function isReservedEntryKey(key: string): boolean {
+  return RESERVED_ENTRY_KEYS.includes(key)
+}
+
 /** Canonical field set stored per file reference in the `files` Y.Map (§2.2). */
 export const FILE_REF_FIELDS = ['attachId', 'mimeType', 'status', 'createdAt'] as const
 
