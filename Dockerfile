@@ -1,13 +1,18 @@
 FROM node:22-alpine
 WORKDIR /app
 
-# CJK + emoji fonts for server-side PDF export (Typst).
+# CJK + emoji fonts for server-side rendering (Typst PDF export + whiteboard
+# image export).
 #
 # The PDF export renders the document to Typst source and compiles it with the
 # standalone `typst` binary (see below). Typst resolves fonts from the system
 # font book, so the image must carry real CJK and emoji faces:
 #   - font-noto-cjk  → Chinese/Japanese/Korean glyphs
 #   - font-noto-emoji → colour emoji (matches what the editor shows)
+# The whiteboard PNG export (@napi-rs/canvas / Skia, whiteboard/exportScene.ts)
+# draws text with these same faces: it loads this directory explicitly at
+# runtime (GlobalFonts.loadFontsFromDir('/usr/share/fonts')), so no fontconfig
+# or extra system library is required.
 RUN apk add --no-cache \
       font-noto=2026.06.01-r0 \
       font-noto-cjk=0_git20220127-r1 \

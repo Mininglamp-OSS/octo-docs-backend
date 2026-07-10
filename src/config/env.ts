@@ -440,6 +440,45 @@ export const config = {
     maxImageTotalBytes: num('TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
   },
 
+  // W3 server-side whiteboard image export. The decoded Excalidraw scene is
+  // serialized to SVG in-process (whiteboard/exportScene.ts) and, for PNG,
+  // rasterized with @napi-rs/canvas (Skia; prebuilt musl binary, no browser, no
+  // resident process). Embedded image elements have their bytes pre-downloaded
+  // (size-bounded, best-effort) like the Typst path and composited onto the PNG
+  // canvas directly. These bounds cap the work one export can force.
+  boardExport: {
+    // Max image bytes downloaded per image element for embedding (DoS bound).
+    maxImageBytes: num('BOARD_EXPORT_MAX_IMAGE_BYTES', 10 * 1024 * 1024),
+    // Max number of image elements whose bytes are embedded in one export.
+    maxImageCount: num('BOARD_EXPORT_MAX_IMAGE_COUNT', 50),
+    // Aggregate byte budget across all embedded images in one export.
+    maxImageTotalBytes: num('BOARD_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
+    // Target raster width (px) for PNG output; the SVG is scaled to fit this.
+    // 0 => render at the scene's natural pixel size.
+    pngWidth: num('BOARD_EXPORT_PNG_WIDTH', 2000),
+    // Max SVG canvas dimension (px, each axis). The scene bounding box is
+    // attacker-controlled, so clamp the emitted width/height to keep a
+    // pathological/overflowing scene from producing a giant (or Infinity) canvas.
+    maxSvgDimension: num('BOARD_EXPORT_MAX_SVG_DIMENSION', 12_000),
+    // Max PNG output pixel area (width*height). Bounds the rasterized bitmap so a
+    // single reader GET cannot force a multi-GB allocation (OOM); oversize scenes
+    // are downscaled uniformly to fit. ~40M px ≈ 160MB RGBA peak.
+    maxPngPixels: num('BOARD_EXPORT_MAX_PNG_PIXELS', 40_000_000),
+    // Max DECODED pixel area (width*height) of a source image element before the
+    // PNG compositor decodes it. maxImageBytes caps only the *compressed* source,
+    // so a highly compressed bomb (e.g. 30000x30000 PNG < 10MB) would decode to a
+    // multi-GB bitmap and OOM the process on loadImage. The intrinsic size is read
+    // from the header before decoding; an oversize source degrades to a
+    // placeholder (best-effort). ~40M px ≈ 160MB RGBA peak per image.
+    maxSourceImagePixels: num('BOARD_EXPORT_MAX_SOURCE_IMAGE_PIXELS', 40_000_000),
+    // Concurrency gate for the PNG raster path (CPU/memory-heavy, synchronous
+    // Skia compositing). At most maxConcurrent PNG rasters run at once; up to
+    // maxQueue more wait, and further requests get 503 export_busy — so a burst
+    // of `?format=png` GETs can't saturate CPU/RAM and cascade into an OOM.
+    maxConcurrentPngExports: num('BOARD_EXPORT_MAX_CONCURRENT_PNG', 4),
+    maxQueuedPngExports: num('BOARD_EXPORT_MAX_QUEUED_PNG', 16),
+  },
+
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
   // + unload flush). Shipped behind a default-OFF gate (gray release); when

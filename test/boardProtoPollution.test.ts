@@ -9,17 +9,19 @@ import { normalizeElement, normalizeFileRef } from '../src/whiteboard/schema/ind
 import { getElementsMap, readEntry, readElements } from '../src/whiteboard/ydoc.js'
 
 /**
- * Regression: reserved prototype keys in a scene element / file ref (OctoBoooot
- * major finding). A JSON request body carrying `__proto__` (or `constructor` /
- * `prototype`) produces a REAL own property — JSON.parse uses define-semantics,
- * not the `__proto__` setter — so it passed the type whitelist, was stored as a
- * Y.Map key, and then corrupted the plain-object read-back (readEntry's
- * `obj[k] = v` reparented the object, dropped the key, and leaked inherited
- * props). The fix rejects such keys fail-closed on write and isolates them safely
- * on read.
+ * Regression: reserved prototype keys in a scene element / file ref (XIN-743
+ * defect 2, OctoBoooot major finding). A JSON request body carrying `__proto__`
+ * (or `constructor` / `prototype`) produces a REAL own property — JSON.parse
+ * uses define-semantics, not the `__proto__` setter — so it passed the type
+ * whitelist, was stored as a Y.Map key, then corrupted the plain-object
+ * read-back (readEntry's `obj[k] = v` reparented the object, dropped the key and
+ * leaked inherited props). The fix rejects such keys fail-closed on write (both
+ * the shared normalize layer and the `validateBoardOps` 422 surface) and
+ * isolates them safely in readEntry on read. This also underpins the board
+ * image-export decode path, which reuses readEntry.
  */
 
-/** The exact PATCH failure input shape, parsed from JSON so the key is OWN. */
+/** The exact failure input shape, parsed from JSON so the key is OWN. */
 function elementWithReservedKey(reserved: string): Record<string, unknown> {
   return JSON.parse(
     `{"id":"x","type":"rectangle","version":2,"versionNonce":1,"${reserved}":{"evil":1}}`,
@@ -57,6 +59,10 @@ describe('validateBoardOps surfaces reserved keys as 422 (defect 2)', () => {
   it('normalizeFileRef rejects a reserved key even with a usable attachId', () => {
     const ref = JSON.parse('{"attachId":"a1","constructor":{"evil":1}}') as Record<string, unknown>
     expect(normalizeFileRef(ref)).toBeNull()
+  })
+
+  it('normalizeFileRef accepts a clean file ref (no false positive)', () => {
+    expect(normalizeFileRef({ attachId: 'a1' })).not.toBeNull()
   })
 })
 
