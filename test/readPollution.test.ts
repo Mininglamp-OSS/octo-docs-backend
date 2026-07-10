@@ -59,6 +59,7 @@ vi.mock('../src/collab/server.js', () => ({
 import { persistence, SYSTEM_STORE_UID } from '../src/collab/persistence.js'
 import { readLiveBoard } from '../src/collab/liveBoardWrite.js'
 import { readLiveSheet } from '../src/collab/liveSheetWrite.js'
+import { readLiveDocState } from '../src/collab/liveDocRead.js'
 
 function smallUpdate(): Uint8Array {
   const doc = new Y.Doc()
@@ -99,7 +100,7 @@ describe('persistence.store — read-only sentinel does not touch doc_meta (defe
   })
 })
 
-describe('read paths connect as the system sentinel (defect 1 — board + sheet coverage)', () => {
+describe('read paths connect as the system sentinel (defect 1 — board + sheet + doc coverage)', () => {
   it('readLiveBoard opens the direct connection as the system sentinel', async () => {
     await readLiveBoard('octo:s1:f_default:wb:b_1')
     expect(srv.opts.at(-1)).toEqual({ user: { id: SYSTEM_STORE_UID } })
@@ -107,6 +108,13 @@ describe('read paths connect as the system sentinel (defect 1 — board + sheet 
 
   it('readLiveSheet opens the direct connection as the system sentinel', async () => {
     await readLiveSheet(DOC)
+    expect(srv.opts.at(-1)).toEqual({ user: { id: SYSTEM_STORE_UID } })
+  })
+
+  it('readLiveDocState opens the direct connection as the system sentinel (export read path)', async () => {
+    // The W3 board image export (GET /:docId/export) reads the live scene via
+    // readLiveDocState, so it is protected by the same shared chokepoint guard.
+    await readLiveDocState(DOC)
     expect(srv.opts.at(-1)).toEqual({ user: { id: SYSTEM_STORE_UID } })
   })
 })
