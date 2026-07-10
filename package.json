@@ -17,14 +17,14 @@
     "lint:fix": "eslint . --fix",
     "test": "vitest run",
     "test:watch": "vitest",
-    "license:check": "license-checker --onlyAllow 'MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0;MPL-2.0' --production"
+    "license:check": "license-checker --onlyAllow 'MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0' --production"
   },
   "dependencies": {
     "@hocuspocus/extension-database": "^4.3.0",
     "@hocuspocus/extension-logger": "^4.3.0",
     "@hocuspocus/extension-redis": "^4.3.0",
     "@hocuspocus/server": "^4.1.2",
-    "@resvg/resvg-js": "^2.6.2",
+    "@napi-rs/canvas": "^1.0.2",
     "@tiptap/extension-emoji": "^3.22.2",
     "express": "^4.19.2",
     "express-rate-limit": "^7.5.1",

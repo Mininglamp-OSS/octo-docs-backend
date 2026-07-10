@@ -21,7 +21,7 @@ vi.mock('../src/db/repos/docAttachmentRepo.js', () => ({
   docAttachmentRepo: { listByDoc: vi.fn(async () => []), getById: vi.fn(async () => null) },
 }))
 
-import { serializeSceneToSvg, rasterizeSvgToPng } from '../src/whiteboard/exportScene.js'
+import { serializeSceneToSvg, computeSceneLayout, rasterizeSvgToPng } from '../src/whiteboard/exportScene.js'
 import { exportBoardHandler } from '../src/api/routes/boardExport.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { COLLAB_FIELD } from '../src/schema/index.js'
@@ -177,6 +177,68 @@ describe('rasterizeSvgToPng', () => {
     expect(png.length).toBeGreaterThan(8)
     // PNG magic number.
     expect([png[0], png[1], png[2], png[3]]).toEqual([0x89, 0x50, 0x4e, 0x47])
+  })
+
+  it('renders at the target fitWidth (vector, not an upscaled intrinsic bitmap)', async () => {
+    // A small scene (natural width ~148px) asked to render at 800px must come
+    // out 800px wide — the vector is re-rendered at the target size rather than
+    // the intrinsic SVG being bitmap-upscaled (which would blur shapes/text).
+    const svg = serializeSceneToSvg({ elements: [el('r1', 'rectangle')], files: {} })
+    const png = await rasterizeSvgToPng(svg, { fitWidth: 800 })
+    // PNG width is a big-endian uint32 at byte offset 16 (IHDR).
+    const width = png.readUInt32BE(16)
+    expect(width).toBe(800)
+  })
+})
+
+// Skia's SVG engine does not rasterize <image> elements whose href is a
+// data-URI, so the board's embedded images are blank when the SVG is decoded.
+// The PNG path composites their decoded bytes onto the canvas instead. This
+// pins BOTH halves: the Skia gap (baseline) and the compositing that fills it.
+describe('rasterizeSvgToPng — image compositing', () => {
+  // Decode a PNG and count its roughly-red pixels.
+  async function countRedPixels(buf: Buffer): Promise<number> {
+    const { createCanvas, loadImage } = await import('@napi-rs/canvas')
+    const img = await loadImage(buf)
+    const c = createCanvas(img.width, img.height)
+    const cx = c.getContext('2d')
+    cx.drawImage(img, 0, 0)
+    const d = cx.getImageData(0, 0, img.width, img.height).data
+    let n = 0
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i]! > 200 && d[i + 1]! < 80 && d[i + 2]! < 80) n++
+    }
+    return n
+  }
+
+  it('composites resolved image bytes onto the PNG that the SVG data-URI would leave blank', async () => {
+    const { createCanvas } = await import('@napi-rs/canvas')
+    // A solid-red 20x20 source image (a real, decodable PNG).
+    const src = createCanvas(20, 20)
+    const sctx = src.getContext('2d')
+    sctx.fillStyle = '#ff0000'
+    sctx.fillRect(0, 0, 20, 20)
+    const redPng = src.toBuffer('image/png')
+
+    const scene = {
+      elements: [el('i1', 'image', { fileId: 'f1', x: 40, y: 40, width: 60, height: 60 })],
+      files: { f1: { attachId: 'att1' } },
+    }
+    const images = new Map([['f1', { mime: 'image/png', bytes: redPng }]])
+    const svg = serializeSceneToSvg(scene, images)
+    const layout = computeSceneLayout(scene)
+
+    // Baseline: Skia does not render the SVG's data-URI <image>, so the region
+    // is blank — no red — without compositing.
+    const plain = await rasterizeSvgToPng(svg, { fitWidth: 300 })
+    expect(await countRedPixels(plain)).toBe(0)
+
+    // With the resolved bytes composited, the image is painted onto the canvas.
+    const composed = await rasterizeSvgToPng(svg, {
+      fitWidth: 300,
+      composite: { elements: scene.elements, imagesByFileId: images, layout },
+    })
+    expect(await countRedPixels(composed)).toBeGreaterThan(0)
   })
 })
 

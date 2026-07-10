@@ -5,10 +5,17 @@
  * the browser with Excalidraw's own canvas renderer. To offer a bot/API export
  * without shipping a headless browser (see the W3 renderer-selection spike), we
  * serialize the decoded `{elements, files}` scene to SVG directly here, and
- * rasterize that SVG to PNG with `@resvg/resvg-js` — a Rust/napi library that
- * ships prebuilt musl binaries (no system libraries, no resident process, no
- * network), matching the node:22-alpine deploy image and the same short-lived,
- * sandboxed philosophy as the Typst PDF path.
+ * rasterize that SVG to PNG with `@napi-rs/canvas` — a napi library backed by
+ * Skia that ships prebuilt musl binaries (no system libraries, no resident
+ * process, no network), matching the node:22-alpine deploy image and the same
+ * short-lived, sandboxed philosophy as the Typst PDF path.
+ *
+ * One Skia quirk shapes the PNG path: its SVG engine does not rasterize <image>
+ * elements whose href is a data-URI, so the board's embedded images (attachId →
+ * data-URI, see renderImage) come out blank when the SVG is decoded. The PNG
+ * path therefore composites those image bytes directly onto the canvas with
+ * ctx.drawImage after the SVG is drawn (rasterizeSvgToPng), while the SVG output
+ * keeps the data-URI embed (browsers render it fine).
  *
  * The element set mirrors `WB_ELEMENT_TYPES` (the Excalidraw v1 subset the
  * front-end binding emits). This is a faithful STRUCTURAL export — shapes,
@@ -99,7 +106,7 @@ interface Bounds {
  * DoS bounds for the rendered OUTPUT. This endpoint is reader-accessible and the
  * scene geometry is fully attacker-controlled: a single element placed far from
  * the origin (e.g. y = 5e7) makes the scene bounding box — and therefore the
- * raster — arbitrarily large, so a pure GET could otherwise drive resvg to
+ * raster — arbitrarily large, so a pure GET could otherwise drive the canvas to
  * allocate a multi-GB bitmap and OOM the process. Both the SVG canvas
  * dimensions and the PNG output pixel area are bounded. Defaults here are the
  * standalone fallback; the route overrides them from config.boardExport.
@@ -280,7 +287,7 @@ function renderFreedraw(el: Record<string, unknown>): string {
   return `<polyline points="${d}" fill="none" stroke="${stroke}" stroke-width="${r2(sw)}" stroke-linecap="round" stroke-linejoin="round" />`
 }
 
-/** Map Excalidraw fontFamily codes to a generic family resvg/fontdb can match. */
+/** Map Excalidraw fontFamily codes to a generic family Skia/fontconfig can match. */
 function fontFamily(code: unknown): string {
   const c = numOf(code, 1)
   if (c === 3) return 'monospace'
@@ -382,6 +389,41 @@ function renderElement(
 }
 
 /**
+ * Geometry of the serialized SVG canvas: the viewBox origin and the clamped
+ * width/height. The SVG serializer and the PNG rasterizer share it so canvas
+ * image compositing maps scene coordinates onto the raster identically.
+ */
+export interface SceneLayout {
+  minX: number
+  minY: number
+  width: number
+  height: number
+}
+
+/**
+ * Compute the SVG canvas layout (viewBox origin + clamped dimensions) for a
+ * scene. Each dimension is clamped to a finite ceiling: without this a scene
+ * whose bounding box is, say, 100 x 5e7 (any editor can move one element far
+ * down) would emit width/height in the tens of millions — or "Infinity" for a
+ * coordinate that overflows — and the raster step would try to allocate a
+ * multi-GB bitmap. Beyond the cap the far edge is cropped rather than fatal.
+ */
+export function computeSceneLayout(
+  scene: SceneInput,
+  opts: { maxDimension?: number } = {},
+): SceneLayout {
+  const elements = scene.elements.filter((el) => !isDeleted(el) && renderableType(el))
+  const bounds = sceneBounds(elements)
+  const pad = 24
+  const maxDim = opts.maxDimension && opts.maxDimension > 0 ? opts.maxDimension : DEFAULT_MAX_SVG_DIMENSION
+  const minX = bounds ? bounds.minX - pad : 0
+  const minY = bounds ? bounds.minY - pad : 0
+  const width = clampDim(bounds ? bounds.maxX - bounds.minX + pad * 2 : 100, maxDim)
+  const height = clampDim(bounds ? bounds.maxY - bounds.minY + pad * 2 : 100, maxDim)
+  return { minX, minY, width, height }
+}
+
+/**
  * Serialize a decoded board scene to a standalone SVG document string.
  * `imagesByFileId` carries the resolved bytes for image elements (best-effort;
  * a missing entry renders a light placeholder). A scene with no renderable
@@ -393,18 +435,7 @@ export function serializeSceneToSvg(
   opts: { maxDimension?: number } = {},
 ): string {
   const elements = scene.elements.filter((el) => !isDeleted(el) && renderableType(el))
-  const bounds = sceneBounds(elements)
-  const pad = 24
-  const maxDim = opts.maxDimension && opts.maxDimension > 0 ? opts.maxDimension : DEFAULT_MAX_SVG_DIMENSION
-  const minX = bounds ? bounds.minX - pad : 0
-  const minY = bounds ? bounds.minY - pad : 0
-  // Clamp each canvas dimension to a finite ceiling. Without this a scene whose
-  // bounding box is, say, 100 x 5e7 (any editor can move one element far down)
-  // would emit width/height in the tens of millions — or "Infinity" for a
-  // coordinate that overflows — and the raster step would try to allocate a
-  // multi-GB bitmap. Beyond the cap the far edge is cropped rather than fatal.
-  const width = clampDim(bounds ? bounds.maxX - bounds.minX + pad * 2 : 100, maxDim)
-  const height = clampDim(bounds ? bounds.maxY - bounds.minY + pad * 2 : 100, maxDim)
+  const { minX, minY, width, height } = computeSceneLayout(scene, opts)
 
   const body = elements.map((el) => wrap(el, renderElement(el, imagesByFileId))).join('')
 
@@ -418,33 +449,137 @@ export function serializeSceneToSvg(
   )
 }
 
+/** Register the system font directory once so the alpine deploy image resolves
+ * CJK / emoji glyphs (font-noto-cjk / font-noto-emoji, installed in the
+ * Dockerfile). On Linux @napi-rs/canvas also reads fontconfig, but loading the
+ * directory explicitly makes glyph coverage independent of fontconfig state.
+ * Best-effort and memoized: a missing directory (e.g. a dev host) is ignored. */
+let systemFontsRegistered = false
+function registerSystemFonts(globalFonts: { loadFontsFromDir(dir: string): number }): void {
+  if (systemFontsRegistered) return
+  systemFontsRegistered = true
+  for (const dir of ['/usr/share/fonts']) {
+    try {
+      globalFonts.loadFontsFromDir(dir)
+    } catch {
+      // ignore — fall back to whatever fonts the platform resolves
+    }
+  }
+}
+
 /**
- * Rasterize an SVG document to PNG bytes with `@resvg/resvg-js`. Lazy-loaded so
- * the SVG path never depends on the native binary being resolvable, and so a
- * platform without a prebuilt binary fails only on PNG (not on module import).
+ * Rasterize an SVG document to PNG bytes with `@napi-rs/canvas` (Skia). Lazy-
+ * loaded so the SVG path never depends on the native binary being resolvable,
+ * and so a platform without a prebuilt binary fails only on PNG (not on module
+ * import).
+ *
+ * Skia's SVG engine does not render <image> elements whose href is a data-URI,
+ * so the board's embedded images (renderImage → data-URI) come out blank when
+ * the SVG is decoded. When `composite` is supplied, their decoded bytes are
+ * drawn directly onto the raster at the same scene position (scaled/offset by
+ * the shared layout, honoring angle/opacity) after the SVG is painted. This is
+ * best-effort: an image that fails to decode falls back to the same light
+ * placeholder the SVG uses for an unresolved image and never aborts the PNG.
+ * Composited images are drawn on top of the full SVG raster, so a shape that
+ * overlaps an image renders behind it here (an accepted fidelity trade-off).
  */
 export async function rasterizeSvgToPng(
   svg: string,
-  opts: { fitWidth?: number; maxPixels?: number } = {},
+  opts: {
+    fitWidth?: number
+    maxPixels?: number
+    composite?: {
+      elements: Array<Record<string, unknown>>
+      imagesByFileId: Map<string, ResolvedSceneImage>
+      layout: SceneLayout
+    }
+  } = {},
 ): Promise<Buffer> {
-  const { Resvg } = await import('@resvg/resvg-js')
+  const { createCanvas, loadImage, GlobalFonts } = await import('@napi-rs/canvas')
+  registerSystemFonts(GlobalFonts)
   const maxPixels = opts.maxPixels && opts.maxPixels > 0 ? opts.maxPixels : DEFAULT_MAX_PNG_PIXELS
-  // fitTo:'width' pins the output width but scales height by the SVG's intrinsic
-  // aspect ratio, so an extreme-aspect scene — or the natural-size path
-  // (fitWidth=0) on a large board — can still explode the raster even after the
-  // SVG canvas is clamped. Probe the intrinsic size and cap the target width so
-  // width * height <= maxPixels, downscaling uniformly when it would exceed it.
-  const probe = new Resvg(svg)
+
+  // Decode the serialized SVG once to read its intrinsic pixel size (the
+  // document width/height, which the serializer already clamped to a finite
+  // ceiling). We do not raster this copy — bitmap-upscaling it to the target
+  // width would blur shapes and text; instead we re-render the vector at the
+  // target size below so the output stays crisp (matching the old resvg path).
+  const probe = await loadImage(Buffer.from(svg))
   const natW = Math.max(1, probe.width)
   const natH = Math.max(1, probe.height)
+  // fitWidth pins the output width; height follows the intrinsic aspect ratio.
+  // Even after the SVG canvas is clamped, an extreme-aspect scene — or the
+  // natural-size path (fitWidth=0) on a large board — can still exceed the pixel
+  // budget, so cap the target width so width * height <= maxPixels, downscaling
+  // uniformly when it would exceed it.
   const desiredW = opts.fitWidth && opts.fitWidth > 0 ? Math.round(opts.fitWidth) : natW
   const areaCapW = Math.floor(Math.sqrt((maxPixels * natW) / natH))
   const outW = Math.max(1, Math.min(desiredW, areaCapW))
-  const resvg = new Resvg(svg, {
-    background: 'white',
-    fitTo: { mode: 'width', value: outW },
-    font: { loadSystemFonts: true },
-  })
-  const rendered = resvg.render()
-  return Buffer.from(rendered.asPng())
+  const outH = Math.max(1, Math.round((natH * outW) / natW))
+
+  // Render the vector at the target size: rewrite only the <svg> tag's width/
+  // height (viewBox is untouched, so Skia scales the geometry to fill), then
+  // decode that. Reuse the probe when the target already equals the intrinsic
+  // size to avoid a second decode.
+  const svgImg =
+    outW === natW && outH === natH
+      ? probe
+      : await loadImage(
+          Buffer.from(
+            svg.replace(
+              /(<svg\b[^>]*?)width="[^"]*"\s+height="[^"]*"/,
+              `$1width="${outW}" height="${outH}"`,
+            ),
+          ),
+        )
+
+  const canvas = createCanvas(outW, outH)
+  const ctx = canvas.getContext('2d')
+  // White backdrop, matching the previous rasterizer's `background: 'white'`.
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, outW, outH)
+  ctx.drawImage(svgImg, 0, 0, outW, outH)
+
+  const composite = opts.composite
+  if (composite) {
+    const { minX, minY, width, height } = composite.layout
+    const scaleX = width > 0 ? outW / width : 1
+    const scaleY = height > 0 ? outH / height : 1
+    for (const el of composite.elements) {
+      if (isDeleted(el) || renderableType(el) !== 'image') continue
+      const fileId = strOf(el.fileId)
+      const image = fileId ? composite.imagesByFileId.get(fileId) : undefined
+      if (!image) continue // unresolved → the SVG already drew a dashed placeholder
+      const dx = (numOf(el.x) - minX) * scaleX
+      const dy = (numOf(el.y) - minY) * scaleY
+      const dw = numOf(el.width) * scaleX
+      const dh = numOf(el.height) * scaleY
+      const opacity = Math.max(0, Math.min(1, numOf(el.opacity, 100) / 100))
+      const angle = numOf(el.angle, 0)
+      ctx.save()
+      ctx.globalAlpha = opacity
+      if (angle) {
+        const cx = dx + dw / 2
+        const cy = dy + dh / 2
+        ctx.translate(cx, cy)
+        ctx.rotate(angle)
+        ctx.translate(-cx, -cy)
+      }
+      try {
+        const bmp = await loadImage(image.bytes)
+        ctx.drawImage(bmp, dx, dy, dw, dh)
+      } catch {
+        // Decode failed → light dashed placeholder (mirrors renderImage's SVG one).
+        ctx.fillStyle = '#f1f3f5'
+        ctx.fillRect(dx, dy, dw, dh)
+        ctx.strokeStyle = '#ced4da'
+        ctx.lineWidth = 1
+        ctx.setLineDash([4, 4])
+        ctx.strokeRect(dx, dy, dw, dh)
+      }
+      ctx.restore()
+    }
+  }
+
+  return canvas.toBuffer('image/png')
 }

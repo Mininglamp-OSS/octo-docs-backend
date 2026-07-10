@@ -11,7 +11,9 @@
  * `{elements, files}` scene with the SAME validated primitive the version
  * preview uses (decodeBoardSnapshot — fail-closed on a wrong-kind/corrupt blob),
  * pre-downloads referenced image bytes (size-bounded, best-effort), then
- * serializes to SVG and — for PNG — rasterizes with @resvg/resvg-js.
+ * serializes to SVG and — for PNG — rasterizes with @napi-rs/canvas (Skia),
+ * compositing the downloaded image bytes onto the canvas (Skia's SVG engine
+ * does not render data-URI <image> elements).
  *
  * There is no headless browser: the renderer is a pure in-process serializer
  * plus a prebuilt native rasterizer, mirroring the short-lived/network-less
@@ -30,6 +32,7 @@ import {
 } from '../../collab/versionRestore.js'
 import {
   serializeSceneToSvg,
+  computeSceneLayout,
   rasterizeSvgToPng,
   type ResolvedSceneImage,
 } from '../../whiteboard/exportScene.js'
@@ -222,9 +225,15 @@ export async function exportBoardHandler(req: Request, res: Response): Promise<v
   }
 
   res.setHeader('Content-Disposition', `inline; filename="${fileName}"`)
+  // Skia does not rasterize the SVG's data-URI <image> elements, so pass the
+  // resolved image bytes + the shared layout so the PNG path composites them
+  // onto the canvas directly (best-effort). The SVG output above keeps the
+  // data-URI embed unchanged.
+  const layout = computeSceneLayout(scene, { maxDimension: config.boardExport.maxSvgDimension })
   const png = await rasterizeSvgToPng(svg, {
     fitWidth: config.boardExport.pngWidth,
     maxPixels: config.boardExport.maxPngPixels,
+    composite: { elements: scene.elements, imagesByFileId: images, layout },
   })
   res.status(200).type(MIME.png).send(png)
 }

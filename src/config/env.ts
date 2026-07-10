@@ -442,10 +442,10 @@ export const config = {
 
   // W3 server-side whiteboard image export. The decoded Excalidraw scene is
   // serialized to SVG in-process (whiteboard/exportScene.ts) and, for PNG,
-  // rasterized with @resvg/resvg-js (prebuilt musl binary, no browser, no
+  // rasterized with @napi-rs/canvas (Skia; prebuilt musl binary, no browser, no
   // resident process). Embedded image elements have their bytes pre-downloaded
-  // (size-bounded, best-effort) like the Typst path. These bounds cap the work
-  // one export can force.
+  // (size-bounded, best-effort) like the Typst path and composited onto the PNG
+  // canvas directly. These bounds cap the work one export can force.
   boardExport: {
     // Max image bytes downloaded per image element for embedding (DoS bound).
     maxImageBytes: num('BOARD_EXPORT_MAX_IMAGE_BYTES', 10 * 1024 * 1024),
