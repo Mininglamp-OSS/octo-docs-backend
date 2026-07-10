@@ -400,7 +400,13 @@ export function decodeBoardSnapshot(targetState: Uint8Array): BoardScene {
     const bid = typeof b.id === 'string' ? b.id : ''
     return aid < bid ? -1 : aid > bid ? 1 : 0
   })
-  const files: Record<string, Record<string, unknown>> = {}
+  // Null-prototype container: a fid is a Y.Map key we do not control, and a
+  // legacy/pre-fix doc may already carry a reserved name (`__proto__` etc.).
+  // Assigning `files[fid] = …` onto a plain `{}` would route such a key through
+  // the Object.prototype setter and reparent the container; Object.create(null)
+  // makes every fid a plain own data property, symmetric with readEntry's
+  // read-side backstop for reserved element/ref field keys (XIN-743).
+  const files: Record<string, Record<string, unknown>> = Object.create(null)
   for (const [fid, v] of getFilesMap(doc).entries()) files[fid] = readEntry(v)
   return { elements, files }
 }

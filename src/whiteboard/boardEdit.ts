@@ -18,6 +18,7 @@ import {
   elementSupersedes,
   normalizeFileRef,
   deterministicNonce,
+  isReservedEntryKey,
   type WhiteboardElement,
   type FileRef,
 } from './schema/index.js'
@@ -122,6 +123,15 @@ export function validateBoardOps(ops: BoardOps): ValidatedBoardOps {
     }
     for (const [fid, raw] of Object.entries(ops.files as Record<string, unknown>)) {
       if (fid.length === 0) throw new BoardFileInvalidError('empty fileId')
+      // The fid is the KEY under which the ref is stored in the `files` map and
+      // later rebuilt into a plain object (decodeBoardSnapshot `files[fid] = …`).
+      // A reserved prototype name as the key corrupts that read-back exactly as a
+      // reserved FIELD key does inside an element / ref (XIN-743) — reject it
+      // fail-closed here so it never reaches the live Y.Map, symmetric with
+      // normalizeElement / normalizeFileRef.
+      if (isReservedEntryKey(fid)) {
+        throw new BoardFileInvalidError(`file ${fid}: reserved fileId`)
+      }
       const ref = normalizeFileRef(raw)
       if (!ref) throw new BoardFileInvalidError(`file ${fid}: no usable attachId`)
       fileUpserts.push([fid, ref])
