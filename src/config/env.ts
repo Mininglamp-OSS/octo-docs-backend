@@ -440,6 +440,24 @@ export const config = {
     maxImageTotalBytes: num('TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
   },
 
+  // W3 server-side whiteboard image export. The decoded Excalidraw scene is
+  // serialized to SVG in-process (whiteboard/exportScene.ts) and, for PNG,
+  // rasterized with @resvg/resvg-js (prebuilt musl binary, no browser, no
+  // resident process). Embedded image elements have their bytes pre-downloaded
+  // (size-bounded, best-effort) like the Typst path. These bounds cap the work
+  // one export can force.
+  boardExport: {
+    // Max image bytes downloaded per image element for embedding (DoS bound).
+    maxImageBytes: num('BOARD_EXPORT_MAX_IMAGE_BYTES', 10 * 1024 * 1024),
+    // Max number of image elements whose bytes are embedded in one export.
+    maxImageCount: num('BOARD_EXPORT_MAX_IMAGE_COUNT', 50),
+    // Aggregate byte budget across all embedded images in one export.
+    maxImageTotalBytes: num('BOARD_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
+    // Target raster width (px) for PNG output; the SVG is scaled to fit this.
+    // 0 => render at the scene's natural pixel size.
+    pngWidth: num('BOARD_EXPORT_PNG_WIDTH', 2000),
+  },
+
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
   // + unload flush). Shipped behind a default-OFF gate (gray release); when
