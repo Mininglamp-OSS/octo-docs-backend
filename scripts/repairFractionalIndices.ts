@@ -24,8 +24,13 @@
  *     is idempotent — re-running finds nothing to do.
  *   - a live doc will also self-heal on its next load (fix ①+②); this script is
  *     for docs that are not reopened.
+ *   - fault-isolated: each victim is migrated in its own transaction inside a
+ *     try/catch, so one bad doc (corrupt bytes, deadlock, dropped connection)
+ *     is logged and skipped instead of aborting the whole batch. Any failure is
+ *     summarized at the end and forces a non-zero exit code.
  */
 /* eslint-disable no-console -- this is a stdout-driven ops CLI, not a request path */
+import { pathToFileURL } from 'node:url'
 import { query, transaction, closePool } from '../src/db/pool.js'
 import { yjsDocumentRepo } from '../src/db/repos/yjsDocumentRepo.js'
 import { parseDocumentName } from '../src/permission/documentName.js'
@@ -70,9 +75,72 @@ async function scanVictims(): Promise<Victim[]> {
   return victims.sort((a, b) => a.documentName.localeCompare(b.documentName))
 }
 
-async function main(): Promise<void> {
-  const apply = process.argv.includes('--apply')
-  const mode = apply ? 'APPLY' : 'DRY RUN'
+export interface MigrationFailure {
+  documentName: string
+  error: string
+}
+
+export interface MigrationResult {
+  mode: 'DRY RUN' | 'APPLY'
+  total: number
+  migrated: number
+  unchanged: number
+  failed: MigrationFailure[]
+}
+
+/**
+ * Re-repair a single victim inside its own transaction. Re-reads under FOR
+ * UPDATE so a concurrent editor's write is not clobbered, then upserts the
+ * migrated bytes. Returns whether the row was rewritten. Throws on DB/decode
+ * failure — the caller isolates that so one bad doc cannot abort the batch.
+ */
+async function migrateVictim(v: Victim): Promise<{ changed: boolean }> {
+  return transaction(async (tx) => {
+    const current = await yjsDocumentRepo.selectForUpdateTx(tx, v.documentName)
+    const { state, changed } = migrateState(current)
+    if (!changed) {
+      console.log(`  = ${v.documentName}  (already legal on re-read, skipped)`)
+      return { changed: false }
+    }
+    await yjsDocumentRepo.upsertStateTx(tx, v.documentName, Buffer.from(state))
+    console.log(`  ✓ ${v.documentName}  (repaired -> legal keys, ${state.length} bytes)`)
+    return { changed: true }
+  })
+}
+
+/**
+ * Apply the migration to every victim, isolating failures. A single doc's
+ * transaction erroring (bad bytes, deadlock, lost connection) is recorded and
+ * the run continues with the remaining victims — a fast-fail here would leave
+ * the batch half-migrated on the first flaky row. Failures are surfaced (never
+ * swallowed): each is logged, collected in the summary, and drives a non-zero
+ * exit code in {@link main}.
+ */
+export async function applyMigration(victims: Victim[]): Promise<MigrationResult> {
+  let migrated = 0
+  let unchanged = 0
+  const failed: MigrationFailure[] = []
+  for (const v of victims) {
+    try {
+      const { changed } = await migrateVictim(v)
+      if (changed) migrated++
+      else unchanged++
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      failed.push({ documentName: v.documentName, error: message })
+      console.error(`  ✗ ${v.documentName}  (FAILED, skipped: ${message})`)
+    }
+  }
+  return { mode: 'APPLY', total: victims.length, migrated, unchanged, failed }
+}
+
+/**
+ * Scan for victims and, when `apply` is set, re-repair each. Dry-run (the
+ * default) writes NOTHING — it never enters {@link applyMigration}, so no
+ * transaction or upsert is issued. Returns the run summary.
+ */
+export async function runMigration(apply: boolean): Promise<MigrationResult> {
+  const mode: MigrationResult['mode'] = apply ? 'APPLY' : 'DRY RUN'
   console.log(`[migrate:fractional-index] mode=${mode}`)
 
   const victims = await scanVictims()
@@ -83,40 +151,49 @@ async function main(): Promise<void> {
 
   if (victims.length === 0) {
     console.log('[migrate:fractional-index] nothing to do.')
-    return
+    return { mode, total: 0, migrated: 0, unchanged: 0, failed: [] }
   }
   if (!apply) {
     console.log('[migrate:fractional-index] dry run only — re-run with --apply to write.')
-    return
+    return { mode, total: victims.length, migrated: 0, unchanged: 0, failed: [] }
   }
 
-  let migrated = 0
-  let unchanged = 0
-  for (const v of victims) {
-    await transaction(async (tx) => {
-      // Re-read under FOR UPDATE so a concurrent editor's write is not clobbered.
-      const current = await yjsDocumentRepo.selectForUpdateTx(tx, v.documentName)
-      const { state, changed } = migrateState(current)
-      if (!changed) {
-        unchanged++
-        console.log(`  = ${v.documentName}  (already legal on re-read, skipped)`)
-        return
-      }
-      await yjsDocumentRepo.upsertStateTx(tx, v.documentName, Buffer.from(state))
-      migrated++
-      console.log(`  ✓ ${v.documentName}  (repaired -> legal keys, ${state.length} bytes)`)
-    })
-  }
+  const result = await applyMigration(victims)
   console.log(
-    `[migrate:fractional-index] done. migrated=${migrated} unchanged=${unchanged} total=${victims.length}`,
+    `[migrate:fractional-index] done. migrated=${result.migrated} unchanged=${result.unchanged} failed=${result.failed.length} total=${result.total}`,
   )
+  if (result.failed.length > 0) {
+    console.error(
+      `[migrate:fractional-index] ${result.failed.length} document(s) FAILED and were skipped:`,
+    )
+    for (const f of result.failed) {
+      console.error(`    - ${f.documentName}: ${f.error}`)
+    }
+  }
+  return result
 }
 
-main()
-  .catch((err) => {
-    console.error('[migrate:fractional-index] FAILED:', err)
-    process.exitCode = 1
-  })
-  .finally(() => {
-    void closePool()
-  })
+async function main(): Promise<void> {
+  const apply = process.argv.includes('--apply')
+  const result = await runMigration(apply)
+  // A partial failure must be visible to the operator / CI, not hidden behind a
+  // 0 exit code just because the batch was not aborted.
+  if (result.failed.length > 0) process.exitCode = 1
+}
+
+// Only auto-run when invoked as the CLI entrypoint (tsx scripts/...). Importing
+// this module (e.g. from tests) exercises the exported functions without
+// touching a real MySQL pool.
+const invokedDirectly =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href
+
+if (invokedDirectly) {
+  main()
+    .catch((err) => {
+      console.error('[migrate:fractional-index] FAILED:', err)
+      process.exitCode = 1
+    })
+    .finally(() => {
+      void closePool()
+    })
+}
