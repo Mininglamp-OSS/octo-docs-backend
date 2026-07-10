@@ -62,7 +62,14 @@ export function readEntry(value: unknown): Record<string, unknown> {
   if (value instanceof Y.Map) {
     const obj: Record<string, unknown> = {}
     for (const [k, v] of value.entries()) {
-      obj[k] = v instanceof Y.AbstractType ? (v as Y.AbstractType<unknown>).toJSON() : v
+      const jv = v instanceof Y.AbstractType ? (v as Y.AbstractType<unknown>).toJSON() : v
+      // Define an OWN data property rather than `obj[k] = v`: a stored '__proto__'
+      // key would otherwise hit the Object.prototype accessor and reparent obj
+      // (dropping the key on read-back and leaking inherited props). normalize*
+      // reject such keys on write, so this is the read-side backstop for any
+      // already-stored / repaired entry; it is equivalent to plain assignment for
+      // every other key.
+      Object.defineProperty(obj, k, { value: jv, enumerable: true, writable: true, configurable: true })
     }
     return obj
   }
