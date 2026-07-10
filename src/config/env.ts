@@ -456,6 +456,14 @@ export const config = {
     // Target raster width (px) for PNG output; the SVG is scaled to fit this.
     // 0 => render at the scene's natural pixel size.
     pngWidth: num('BOARD_EXPORT_PNG_WIDTH', 2000),
+    // Max SVG canvas dimension (px, each axis). The scene bounding box is
+    // attacker-controlled, so clamp the emitted width/height to keep a
+    // pathological/overflowing scene from producing a giant (or Infinity) canvas.
+    maxSvgDimension: num('BOARD_EXPORT_MAX_SVG_DIMENSION', 12_000),
+    // Max PNG output pixel area (width*height). Bounds the rasterized bitmap so a
+    // single reader GET cannot force a multi-GB allocation (OOM); oversize scenes
+    // are downscaled uniformly to fit. ~40M px ≈ 160MB RGBA peak.
+    maxPngPixels: num('BOARD_EXPORT_MAX_PNG_PIXELS', 40_000_000),
   },
 
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots

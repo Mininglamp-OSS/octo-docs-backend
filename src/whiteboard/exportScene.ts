@@ -51,9 +51,12 @@ function esc(s: string): string {
     .replace(/'/g, '&#39;')
 }
 
-/** Round to 2dp so the SVG stays compact and deterministic. */
+/** Round to 2dp so the SVG stays compact and deterministic. A coordinate large
+ * enough to overflow to a non-finite value under the *100 scaling collapses to
+ * 0, so the serializer can never emit width="Infinity" / a malformed attribute. */
 function r2(n: number): number {
-  return Math.round(n * 100) / 100
+  const r = Math.round(n * 100) / 100
+  return Number.isFinite(r) ? r : 0
 }
 
 /** A CSS/SVG color is safe to inline only if it is a simple color token. */
@@ -90,6 +93,24 @@ interface Bounds {
   minY: number
   maxX: number
   maxY: number
+}
+
+/**
+ * DoS bounds for the rendered OUTPUT. This endpoint is reader-accessible and the
+ * scene geometry is fully attacker-controlled: a single element placed far from
+ * the origin (e.g. y = 5e7) makes the scene bounding box — and therefore the
+ * raster — arbitrarily large, so a pure GET could otherwise drive resvg to
+ * allocate a multi-GB bitmap and OOM the process. Both the SVG canvas
+ * dimensions and the PNG output pixel area are bounded. Defaults here are the
+ * standalone fallback; the route overrides them from config.boardExport.
+ */
+export const DEFAULT_MAX_SVG_DIMENSION = 12_000
+export const DEFAULT_MAX_PNG_PIXELS = 40_000_000
+
+/** Clamp a raw canvas extent to [1, maxDim]; a non-finite extent collapses to maxDim. */
+function clampDim(raw: number, maxDim: number): number {
+  if (!Number.isFinite(raw)) return maxDim
+  return Math.min(Math.max(1, raw), maxDim)
 }
 
 function isDeleted(el: Record<string, unknown>): boolean {
@@ -301,7 +322,10 @@ function renderImage(el: Record<string, unknown>, image: ResolvedSceneImage | un
     return `<rect x="${r2(x)}" y="${r2(y)}" width="${r2(w)}" height="${r2(h)}" fill="#f1f3f5" stroke="#ced4da" stroke-width="1" stroke-dasharray="4 4" />`
   }
   const b64 = image.bytes.toString('base64')
-  const href = `data:${image.mime};base64,${b64}`
+  // `mime` is a hardcoded literal from sniffImageMime today, but escape it at
+  // the attribute sink anyway so a future change that sources the mime from
+  // attachment/DB metadata can never break out of the data-URI attribute.
+  const href = `data:${esc(image.mime)};base64,${b64}`
   return `<image x="${r2(x)}" y="${r2(y)}" width="${r2(w)}" height="${r2(h)}" preserveAspectRatio="none" href="${href}" />`
 }
 
@@ -366,14 +390,21 @@ function renderElement(
 export function serializeSceneToSvg(
   scene: SceneInput,
   imagesByFileId: Map<string, ResolvedSceneImage> = new Map(),
+  opts: { maxDimension?: number } = {},
 ): string {
   const elements = scene.elements.filter((el) => !isDeleted(el) && renderableType(el))
   const bounds = sceneBounds(elements)
   const pad = 24
+  const maxDim = opts.maxDimension && opts.maxDimension > 0 ? opts.maxDimension : DEFAULT_MAX_SVG_DIMENSION
   const minX = bounds ? bounds.minX - pad : 0
   const minY = bounds ? bounds.minY - pad : 0
-  const width = bounds ? Math.max(1, bounds.maxX - bounds.minX + pad * 2) : 100
-  const height = bounds ? Math.max(1, bounds.maxY - bounds.minY + pad * 2) : 100
+  // Clamp each canvas dimension to a finite ceiling. Without this a scene whose
+  // bounding box is, say, 100 x 5e7 (any editor can move one element far down)
+  // would emit width/height in the tens of millions — or "Infinity" for a
+  // coordinate that overflows — and the raster step would try to allocate a
+  // multi-GB bitmap. Beyond the cap the far edge is cropped rather than fatal.
+  const width = clampDim(bounds ? bounds.maxX - bounds.minX + pad * 2 : 100, maxDim)
+  const height = clampDim(bounds ? bounds.maxY - bounds.minY + pad * 2 : 100, maxDim)
 
   const body = elements.map((el) => wrap(el, renderElement(el, imagesByFileId))).join('')
 
@@ -394,16 +425,24 @@ export function serializeSceneToSvg(
  */
 export async function rasterizeSvgToPng(
   svg: string,
-  opts: { fitWidth?: number } = {},
+  opts: { fitWidth?: number; maxPixels?: number } = {},
 ): Promise<Buffer> {
   const { Resvg } = await import('@resvg/resvg-js')
-  const fitTo =
-    opts.fitWidth && opts.fitWidth > 0
-      ? ({ mode: 'width', value: Math.round(opts.fitWidth) } as const)
-      : ({ mode: 'original' } as const)
+  const maxPixels = opts.maxPixels && opts.maxPixels > 0 ? opts.maxPixels : DEFAULT_MAX_PNG_PIXELS
+  // fitTo:'width' pins the output width but scales height by the SVG's intrinsic
+  // aspect ratio, so an extreme-aspect scene — or the natural-size path
+  // (fitWidth=0) on a large board — can still explode the raster even after the
+  // SVG canvas is clamped. Probe the intrinsic size and cap the target width so
+  // width * height <= maxPixels, downscaling uniformly when it would exceed it.
+  const probe = new Resvg(svg)
+  const natW = Math.max(1, probe.width)
+  const natH = Math.max(1, probe.height)
+  const desiredW = opts.fitWidth && opts.fitWidth > 0 ? Math.round(opts.fitWidth) : natW
+  const areaCapW = Math.floor(Math.sqrt((maxPixels * natW) / natH))
+  const outW = Math.max(1, Math.min(desiredW, areaCapW))
   const resvg = new Resvg(svg, {
     background: 'white',
-    fitTo,
+    fitTo: { mode: 'width', value: outW },
     font: { loadSystemFonts: true },
   })
   const rendered = resvg.render()

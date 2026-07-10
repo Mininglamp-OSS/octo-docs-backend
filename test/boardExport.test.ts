@@ -236,4 +236,85 @@ describe('exportBoardHandler', () => {
     expect(res.statusCode).toBe(409)
     expect(res.body).toEqual({ error: 'board_snapshot_invalid' })
   })
+
+  it('serves SVG as an attachment with nosniff (defense-in-depth)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    live.state = liveBoard([el('r1', 'rectangle')])
+    const res = mockRes()
+    await exportBoardHandler(req({ docId: 'b_1' }, { format: 'svg' }), res as never)
+    expect(res.headers['X-Content-Type-Options']).toBe('nosniff')
+    expect(res.headers['Content-Disposition']).toContain('attachment')
+  })
+
+  it('serves PNG inline with nosniff', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    live.state = liveBoard([el('r1', 'rectangle')])
+    const res = mockRes()
+    await exportBoardHandler(req({ docId: 'b_1' }), res as never)
+    expect(res.headers['X-Content-Type-Options']).toBe('nosniff')
+    expect(res.headers['Content-Disposition']).toContain('inline')
+  })
+})
+
+// ── output DoS bounds (raster memory-bomb guard) ─────────────────────────────
+// The scene geometry is fully attacker-controlled on a reader endpoint, so an
+// oversize/extreme-aspect scene must never produce an unbounded (or Infinity)
+// canvas or a multi-GB raster. These pin the clamps in serializeSceneToSvg /
+// rasterizeSvgToPng.
+describe('serializeSceneToSvg — output dimension clamp', () => {
+  const svgDim = (svg: string, attr: 'width' | 'height'): number =>
+    Number(new RegExp(`<svg[^>]*\\b${attr}="([\\d.]+)"`).exec(svg)?.[1])
+
+  it('clamps a far-flung scene to a bounded finite canvas', () => {
+    const svg = serializeSceneToSvg({ elements: [el('r1', 'rectangle', { height: 50_000_000 })], files: {} })
+    const h = svgDim(svg, 'height')
+    expect(Number.isFinite(h)).toBe(true)
+    expect(h).toBeLessThanOrEqual(12_000)
+  })
+
+  it('collapses a non-finite (overflowing) extent to the max dimension — never emits Infinity', () => {
+    const svg = serializeSceneToSvg({
+      elements: [el('a', 'rectangle', { x: -1e308, width: 1 }), el('b', 'rectangle', { x: 1e308, width: 1 })],
+      files: {},
+    })
+    expect(svg).not.toContain('Infinity')
+    expect(svgDim(svg, 'width')).toBeLessThanOrEqual(12_000)
+  })
+
+  it('respects an explicit maxDimension override', () => {
+    const svg = serializeSceneToSvg({ elements: [el('r1', 'rectangle', { width: 999_999 })], files: {} }, new Map(), {
+      maxDimension: 500,
+    })
+    expect(svgDim(svg, 'width')).toBeLessThanOrEqual(500)
+  })
+})
+
+describe('rasterizeSvgToPng — output pixel-area cap', () => {
+  it('bounds the raster for an extreme-aspect scene and still emits a valid PNG', async () => {
+    // A tall clamped canvas at a large fit width would be a giant bitmap; the
+    // area cap downscales it uniformly instead of letting resvg allocate it.
+    const svg = serializeSceneToSvg({ elements: [el('r1', 'rectangle', { height: 50_000_000 })], files: {} })
+    const png = await rasterizeSvgToPng(svg, { fitWidth: 2000, maxPixels: 4_000_000 })
+    expect([png[0], png[1], png[2], png[3]]).toEqual([0x89, 0x50, 0x4e, 0x47])
+  })
+})
+
+// ── injection regression guards (attribute-context + closing-tag payloads) ───
+describe('serializeSceneToSvg — injection guards', () => {
+  it('escapes a closing-tag/script payload in text so it cannot break out', () => {
+    const svg = serializeSceneToSvg({
+      elements: [el('t1', 'text', { text: '</text><script>alert(1)</script>' })],
+      files: {},
+    })
+    expect(svg).not.toContain('<script>')
+    expect(svg).toContain('&lt;/text&gt;&lt;script&gt;')
+  })
+
+  it('drops a non-whitelisted strokeColor (no attribute-context breakout)', () => {
+    const svg = serializeSceneToSvg({
+      elements: [el('r1', 'rectangle', { strokeColor: 'red" onload="alert(1)' })],
+      files: {},
+    })
+    expect(svg).not.toContain('onload')
+  })
 })

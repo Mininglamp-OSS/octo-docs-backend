@@ -200,17 +200,31 @@ export async function exportBoardHandler(req: Request, res: Response): Promise<v
   }
 
   const images = await resolveSceneImages(guard.meta.doc_id, scene)
-  const svg = serializeSceneToSvg(scene, images)
+  const svg = serializeSceneToSvg(scene, images, { maxDimension: config.boardExport.maxSvgDimension })
 
   const fileName = `${guard.meta.doc_id}.${format}`
-  res.setHeader('Content-Disposition', `inline; filename="${fileName}"`)
+  // nosniff on every export: the browser must honor the declared type and never
+  // MIME-sniff the body into something executable.
+  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Cache-Control', 'no-store')
 
   if (format === 'svg') {
+    // Serve SVG as an attachment, never inline. The body is fully escaped /
+    // token-validated (no <script>/<style>/<foreignObject>, no scene-controlled
+    // href), so it is not an active XSS today — but SVG-from-our-origin is
+    // script-capable when rendered as a top-level document, and this codebase
+    // already blocks image/svg+xml from inline attachment serving (env.ts
+    // blockedMimes). Downloading rather than rendering keeps that posture and
+    // means a future serializer regression can't become a stored-XSS vector.
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
     res.status(200).type(MIME.svg).send(svg)
     return
   }
 
-  const png = await rasterizeSvgToPng(svg, { fitWidth: config.boardExport.pngWidth })
+  res.setHeader('Content-Disposition', `inline; filename="${fileName}"`)
+  const png = await rasterizeSvgToPng(svg, {
+    fitWidth: config.boardExport.pngWidth,
+    maxPixels: config.boardExport.maxPngPixels,
+  })
   res.status(200).type(MIME.png).send(png)
 }
