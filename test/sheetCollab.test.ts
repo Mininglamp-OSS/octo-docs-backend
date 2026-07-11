@@ -129,6 +129,21 @@ describe('versionRestore — decodeSheetSnapshot (preview extraction)', () => {
     })
     expect(decodeSheetSnapshot(textState)).toEqual({})
   })
+
+  it('previews a CLI/bot-authored sheet carrying `t` without throwing (regression: sheet_snapshot_invalid)', () => {
+    // Reproduces the shapes from doc d_16324df10007c66051dbf90c version 1241:
+    // every cell carries a `t` (cell type) written by s_tmos_bot. Before the
+    // schema alignment this threw SheetSnapshotInvalidError -> HTTP 409. Now the
+    // preview must succeed AND round-trip `t` (and `f`) verbatim, matching live.
+    const cells: Record<string, SheetCell> = {
+      [sheetCellKey('default', 0, 0)]: { v: '名称', t: 1 },
+      [sheetCellKey('default', 0, 1)]: { v: '数量', t: 1 },
+      [sheetCellKey('default', 1, 1)]: { v: 10, t: 2 },
+      [sheetCellKey('default', 3, 1)]: { v: 30, f: '=B2+B3', t: 2 },
+    }
+    const out = decodeSheetSnapshot(sheetState(cells))
+    expect(out).toEqual(cells)
+  })
 })
 
 /**
@@ -161,8 +176,28 @@ describe('sheetConversion — validateSheetCell (fail-closed {v,f,s} boundary)',
     expect(validateSheetCell(key, { v: null })).toEqual({ v: null })
   })
 
-  it('rejects an unexpected field (not v/f/s)', () => {
+  it('rejects an unexpected field (not v/f/s/p/t)', () => {
     expect(() => validateSheetCell(key, { v: 1, evil: true })).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('accepts and round-trips the live rich-cell fields p and t', () => {
+    // Aligns with octo-web SyncCell: `t` (cell type) + `p` (rich-text/inline-image
+    // body) are part of the live sync schema and must round-trip verbatim so a
+    // version preview of a bot/CLI-authored sheet no longer fails closed.
+    expect(validateSheetCell(key, { v: '名称', t: 1 })).toEqual({ v: '名称', t: 1 })
+    expect(validateSheetCell(key, { v: 30, f: '=B2+B3', t: 2 })).toEqual({ v: 30, f: '=B2+B3', t: 2 })
+    const p = { drawings: { d1: { source: 'data:image/png;base64,AAAA' } } }
+    expect(validateSheetCell(key, { p, t: 1 })).toEqual({ p, t: 1 })
+    // A cell carrying only a type still round-trips (mirrors SyncCell, which keeps it).
+    expect(validateSheetCell(key, { t: 1 })).toEqual({ t: 1 })
+  })
+
+  it('rejects a wrong-typed p / t (p non-object, t non-number or non-finite)', () => {
+    expect(() => validateSheetCell(key, { p: 'x' })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, { p: [1] })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, { t: '1' })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, { t: Infinity })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetCell(key, { t: NaN })).toThrow(SheetSnapshotInvalidError)
   })
 
   it('rejects a wrong-typed value (v object / f non-string / s non-object)', () => {
@@ -178,7 +213,7 @@ describe('sheetConversion — validateSheetCell (fail-closed {v,f,s} boundary)',
     expect(() => validateSheetCell(key, null)).toThrow(SheetSnapshotInvalidError)
   })
 
-  it('rejects an empty cell (none of v/f/s present)', () => {
+  it('rejects an empty cell (none of v/f/s/p/t present)', () => {
     expect(() => validateSheetCell(key, {})).toThrow(SheetSnapshotInvalidError)
   })
 
