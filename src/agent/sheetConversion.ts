@@ -8,7 +8,8 @@
  * CROSS-REPO CONTRACT — these MUST match octo-web/packages/docs/src/sheet/binding.ts:
  *   - Y.Map field name on the Y.Doc: 'sheet'
  *   - cell key: `${sheetId}!${row}:${col}`
- *   - cell value: { v?: string|number|boolean|null, f?: string, s?: object }
+ *   - cell value: { v?: string|number|boolean|null, f?: string, s?: object,
+ *                   p?: object, t?: number }
  * (Same discipline as COLLAB_FIELD, which is shared between this backend and the
  * frontend.) If the frontend changes the field name or key shape, change it here
  * in lockstep or bot edits land in a Y.Map the clients never read.
@@ -30,18 +31,30 @@ export const SHEET_YMAP_FIELD = 'sheet'
 export const SHEET_DIMS_FIELD = 'sheetDims'
 
 /**
- * Cell shape synced in V1: value, optional formula, and optional resolved style.
+ * Cell shape synced in V1: value, optional formula, optional resolved style, and
+ * the two rich-cell fields the live editor also syncs.
  *
  * `s` mirrors the frontend's `SyncCell.s` (binding.ts): the RESOLVED IStyleData
  * object (font / color / size / bg / align), NOT a style id — a bot writing this
  * back must round-trip it verbatim so client-authored styling is preserved.
  * Kept as an opaque object here because the backend never interprets style; it
  * only stores and forwards it on the shared Y.Map.
+ *
+ * `p` and `t` mirror the frontend's `SyncCell.p` / `SyncCell.t`: `p` is the
+ * rich-text document snapshot (Univer stores an INLINE CELL IMAGE as
+ * `p.drawings[id].source`), and `t` is the cell type (1 = rich text). Both are
+ * part of the live sync schema — the editor writes them and expects them back —
+ * so this backend must round-trip them verbatim. They are opaque here (the
+ * backend never interprets a cell's rich body or type); dropping either would
+ * reload a rich/image cell blank. CLI/bot writers also emit `t`, so accepting it
+ * here is what keeps version preview/restore aligned with the live doc.
  */
 export interface SheetCell {
   v?: string | number | boolean | null
   f?: string
   s?: Record<string, unknown>
+  p?: Record<string, unknown>
+  t?: number
 }
 
 /** Build the canonical cell key used by both ends of the binding. */
@@ -50,11 +63,12 @@ export function sheetCellKey(sheetId: string, row: number, col: number): string 
 }
 
 /**
- * Raised when a sheet snapshot contains values that violate the `{v,f,s}` cell
- * contract (unexpected keys, wrong value types, non-object entries, hostile keys).
- * Mirrors the ProseMirror path's SchemaIncompatibleError so both the HTTP-return
- * and the live-replay paths can fail-closed instead of serializing / rebroadcasting
- * arbitrary writer-controlled data. Routes map this to 409.
+ * Raised when a sheet snapshot contains values that violate the
+ * `{v,f,s,p,t}` cell contract (unexpected keys, wrong value types, non-object
+ * entries, hostile keys). Mirrors the ProseMirror path's SchemaIncompatibleError
+ * so both the HTTP-return and the live-replay paths can fail-closed instead of
+ * serializing / rebroadcasting arbitrary writer-controlled data. Routes map this
+ * to 409.
  */
 export class SheetSnapshotInvalidError extends Error {
   readonly code = 'sheet_snapshot_invalid'
@@ -70,18 +84,24 @@ const MAX_CELL_KEY_LEN = 256
 const CELL_KEY_RE = /^[^!]{1,64}![0-9]{1,7}:[0-9]{1,7}$/
 
 /**
- * Validate a single raw cell key + value against the `{v,f,s}` contract.
+ * Validate a single raw cell key + value against the `{v,f,s,p,t}` contract.
  * Fail-closed: throws SheetSnapshotInvalidError on any deviation. Returns a
  * NEW object containing only the contract fields (drops nothing valid, strips
  * nothing — a well-formed cell round-trips byte-for-byte in content).
  *
+ * The field set mirrors the live sync schema (octo-web SyncCell): `v/f/s` plus
+ * the rich-cell fields `p` (rich-text/inline-image body) and `t` (cell type)
+ * that the editor and CLI/bot writers both emit. All are round-tripped verbatim.
+ *
  * Rules:
  *  - key: canonical `${sheetId}!${row}:${col}` shape, length-bounded.
- *  - value: a plain object; only keys v/f/s permitted.
+ *  - value: a plain object; only keys v/f/s/p/t permitted.
  *  - v: string | number | boolean | null (if present).
  *  - f: string (if present).
  *  - s: plain object (resolved IStyleData; opaque here) (if present).
- *  - at least one of v/f/s present (no empty cell).
+ *  - p: plain object (rich-text snapshot; opaque here) (if present).
+ *  - t: finite number (cell type; opaque here) (if present).
+ *  - at least one of v/f/s/p/t present (no empty cell).
  */
 export function validateSheetCell(key: unknown, value: unknown): SheetCell {
   if (typeof key !== 'string' || key.length === 0 || key.length > MAX_CELL_KEY_LEN) {
@@ -95,7 +115,7 @@ export function validateSheetCell(key: unknown, value: unknown): SheetCell {
   }
   const rec = value as Record<string, unknown>
   for (const k of Object.keys(rec)) {
-    if (k !== 'v' && k !== 'f' && k !== 's') {
+    if (k !== 'v' && k !== 'f' && k !== 's' && k !== 'p' && k !== 't') {
       throw new SheetSnapshotInvalidError(`cell ${key}: unexpected field '${k}'`)
     }
   }
@@ -126,8 +146,31 @@ export function validateSheetCell(key: unknown, value: unknown): SheetCell {
     }
     out.s = s as Record<string, unknown>
   }
-  if (out.v === undefined && out.f === undefined && out.s === undefined) {
-    throw new SheetSnapshotInvalidError(`cell ${key}: empty cell (none of v/f/s present)`)
+  if ('p' in rec) {
+    const p = rec.p
+    if (p === null || typeof p !== 'object' || Array.isArray(p)) {
+      throw new SheetSnapshotInvalidError(`cell ${key}: p is not a plain object`)
+    }
+    out.p = p as Record<string, unknown>
+  }
+  if ('t' in rec) {
+    const t = rec.t
+    // Cell type is a small enum in the live schema; validate it as a finite
+    // number (rejecting NaN / Infinity, which JSON.stringify would silently turn
+    // into `null`, matching the `v` guard) and round-trip it verbatim.
+    if (typeof t !== 'number' || !Number.isFinite(t)) {
+      throw new SheetSnapshotInvalidError(`cell ${key}: t must be a finite number`)
+    }
+    out.t = t
+  }
+  if (
+    out.v === undefined &&
+    out.f === undefined &&
+    out.s === undefined &&
+    out.p === undefined &&
+    out.t === undefined
+  ) {
+    throw new SheetSnapshotInvalidError(`cell ${key}: empty cell (none of v/f/s/p/t present)`)
   }
   return out
 }
@@ -200,7 +243,7 @@ export interface SheetCellBatch {
 /**
  * Validate a whole `{ key: cell|null }` edit batch WITHOUT mutating anything,
  * fail-closed. A null value is a deletion (key-shape-checked so a malformed key
- * cannot be smuggled in); any other value is validated against the `{v,f,s}`
+ * cannot be smuggled in); any other value is validated against the `{v,f,s,p,t}`
  * contract. Throws SheetSnapshotInvalidError on the first deviation.
  *
  * Split out from applySheetCellsToYMap so the HTTP write path can run the exact
@@ -218,7 +261,7 @@ export function validateSheetCellBatch(cells: Record<string, SheetCell | null>):
       if (typeof key === 'string' && CELL_KEY_RE.test(key)) toDelete.push(key)
       else throw new SheetSnapshotInvalidError(`delete: invalid cell key ${String(key).slice(0, 64)}`)
     } else {
-      // Fail-closed: validate the {v,f,s} contract before writing into the doc.
+      // Fail-closed: validate the {v,f,s,p,t} contract before writing into the doc.
       toSet.push([key, validateSheetCell(key, cell)])
     }
   }
