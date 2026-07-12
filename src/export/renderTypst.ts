@@ -51,6 +51,13 @@ export interface RenderTypstOptions {
    *  compile, so one malformed formula degrades to visible source text rather
    *  than 500-ing the entire export. */
   mathMode?: 'convert' | 'verbatim'
+  /** Per-formula verbatim set (raw LaTeX strings). When present, a formula whose
+   *  `latex` is in this set renders verbatim (quoted source) while every other
+   *  formula still converts normally. The route builds this set by probing each
+   *  unique formula after a whole-document compile failure, so ONE malformed
+   *  formula degrades to source text and the REST of the document still renders
+   *  as real math (instead of the whole doc dropping to verbatim). */
+  verbatimFormulas?: Set<string>
 }
 
 // ── ProseMirror JSON shapes (structural; the schema is the source of truth) ────
@@ -107,6 +114,47 @@ function escContent(s: string): string {
   return escaped
     .replace(/^ +/gm, (m) => '\u00A0'.repeat(m.length))
     .replace(/ {2,}/g, (m) => '\u00A0'.repeat(m.length))
+    // Long unbroken non-space runs (e.g. a 100-char `aaaa...` or a long URL used
+    // as link text) won't break in justified paragraphs and overflow the right
+    // margin. Insert zero-width break opportunities (U+200B) every ~20 chars into
+    // any run of 40+ non-space characters so Typst can wrap it. CJK already
+    // breaks per-glyph, so this only meaningfully affects long Latin/symbol runs.
+    // The run is already escaped, so it can contain `\#`, `\$`, ... pairs; the
+    // break MUST NOT land between a backslash and the char it escapes, or the
+    // backslash would escape the zero-width space instead and re-expose the
+    // special char to Typst markup. Chunk over escape-aware units (a `\X` pair
+    // counts as one unit) so a break never splits an escape sequence.
+    .replace(/\S{40,}/g, (run) => insertSoftBreaks(run, 20))
+}
+
+/**
+ * Insert zero-width breaks (U+200B) roughly every `every` characters into an
+ * already-escaped run, treating each `\X` escape pair as an atomic unit so a
+ * break can never split a backslash from the char it escapes.
+ */
+function insertSoftBreaks(run: string, every: number): string {
+  let out = ''
+  let since = 0
+  for (let i = 0; i < run.length; i++) {
+    const ch = run[i]
+    if (ch === '\\' && i + 1 < run.length) {
+      // Emit the whole escape pair as one unit; never break inside it.
+      out += ch + run[i + 1]
+      i++
+      since += 2
+    } else {
+      out += ch
+      since += 1
+    }
+    // Insert a break only at a safe boundary (never right after a lone
+    // backslash, which the branch above already avoids) once we've accumulated
+    // enough characters and there is more to come.
+    if (since >= every && i + 1 < run.length) {
+      out += '\u200B'
+      since = 0
+    }
+  }
+  return out
 }
 
 // ── URL / CSS whitelists (shared policy with the HTML path) ────────────────────
@@ -154,6 +202,34 @@ function cssColorToTypst(v: string): string | null {
   return null
 }
 
+/**
+ * Map a LaTeX colour argument (from `\color{...}` / `\textcolor{...}`) to a
+ * Typst colour expression, or null when unsafe/unknown so the caller renders
+ * uncoloured instead of injecting raw text. Accepts named colours and hex; the
+ * hex `#` may arrive backslash-escaped from the math tokenizer, so strip a
+ * leading `\` first. LaTeX-only names not in Typst's palette map to a close
+ * Typst equivalent.
+ */
+function mathColorArgToTypst(arg: string): string | null {
+  let s = arg.trim().replace(/^\\/, '')
+  // A hex value may have been escaped to `\#rrggbb` by escMathLiteral.
+  s = s.replace(/^\\?#/, '#').toLowerCase()
+  if (/^#[0-9a-f]{3,8}$/.test(s)) return `rgb("${s}")`
+  // LaTeX/xcolor names that are not Typst palette names -> nearest Typst colour.
+  const ALIAS: Record<string, string> = {
+    cyan: 'aqua',
+    magenta: 'fuchsia',
+    violet: 'purple',
+    pink: 'rgb("#ffc0cb")',
+    brown: 'rgb("#a52a2a")',
+    darkgray: 'rgb("#a9a9a9")',
+    lightgray: 'rgb("#d3d3d3")',
+    grey: 'gray',
+  }
+  if (ALIAS[s] != null) return ALIAS[s]!
+  return cssColorToTypst(s)
+}
+
 /** Whitelisted CSS font-size -> Typst length string (pt). Returns null if unsafe. */
 function cssFontSizeToTypst(v: string): string | null {
   const m = v.trim().match(/^(\d+(?:\.\d+)?)(px|pt|em|rem|%)?$/)
@@ -191,11 +267,14 @@ function cssFontSizeToTypst(v: string): string | null {
  * convert cleanly.
  */
 const GREEK = new Set([
-  'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'varepsilon', 'zeta', 'eta',
-  'theta', 'vartheta', 'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'pi', 'varpi',
-  'rho', 'varrho', 'sigma', 'varsigma', 'tau', 'upsilon', 'phi', 'varphi', 'chi',
+  'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta',
+  'theta', 'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'pi',
+  'rho', 'sigma', 'tau', 'upsilon', 'phi', 'chi',
   'psi', 'omega', 'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma',
   'Upsilon', 'Phi', 'Psi', 'Omega',
+  // NOTE: the LaTeX var* variants (varepsilon/vartheta/varpi/varrho/varsigma/
+  // varphi) are deliberately NOT here — Typst has no `varepsilon` symbol, so
+  // they must fall through to LATEX_CMD_TO_TYPST which maps them to `*.alt`.
 ])
 
 // LaTeX command -> Typst symbol name (only those that differ or need pinning).
@@ -204,13 +283,15 @@ const LATEX_CMD_TO_TYPST: Record<string, string> = {
   cdot: 'dot.op', cdots: 'dots.c', ldots: 'dots.h', dots: 'dots.h', vdots: 'dots.v', ddots: 'dots.down',
   leq: 'lt.eq', le: 'lt.eq', geq: 'gt.eq', ge: 'gt.eq', neq: 'eq.not', ne: 'eq.not',
   approx: 'approx', equiv: 'equiv', sim: 'tilde.op', propto: 'prop',
-  infty: 'infinity', partial: 'diff', nabla: 'nabla',
+  infty: 'infinity', partial: 'partial', nabla: 'nabla',
   rightarrow: 'arrow.r', to: 'arrow.r', leftarrow: 'arrow.l', Rightarrow: 'arrow.r.double',
   Leftarrow: 'arrow.l.double', leftrightarrow: 'arrow.l.r', mapsto: 'arrow.r.bar',
   forall: 'forall', exists: 'exists', in: 'in', notin: 'in.not', subset: 'subset',
-  subseteq: 'subset.eq', supset: 'supset', supseteq: 'supset.eq', cup: 'union', cap: 'sect',
+  subseteq: 'subset.eq', supset: 'supset', supseteq: 'supset.eq', cup: 'union', cap: 'inter',
   emptyset: 'nothing', varnothing: 'nothing', setminus: 'without',
-  sum: 'sum', prod: 'product', int: 'integral', iint: 'integral.double', oint: 'integral.cont',
+  sum: 'sum', prod: 'product', int: 'integral', iint: 'integral.double', iiint: 'integral.triple', oint: 'integral.cont',
+  varepsilon: 'epsilon.alt', varphi: 'phi.alt', vartheta: 'theta.alt', varrho: 'rho.alt',
+  varsigma: 'sigma.alt', varpi: 'pi.alt',
   lim: 'lim', log: 'log', ln: 'ln', exp: 'exp', sin: 'sin', cos: 'cos', tan: 'tan',
   sec: 'sec', csc: 'csc', cot: 'cot', arcsin: 'arcsin', arccos: 'arccos', arctan: 'arctan',
   sinh: 'sinh', cosh: 'cosh', tanh: 'tanh', det: 'det', gcd: 'gcd', deg: 'deg',
@@ -222,6 +303,17 @@ const LATEX_CMD_TO_TYPST: Record<string, string> = {
   circ: 'compose', bullet: 'bullet', dagger: 'dagger', prime: 'prime',
   Re: 'Re', Im: 'Im', aleph: 'aleph', hbar: 'planck.reduce', ell: 'ell',
   quad: 'quad', qquad: 'wide',
+  // Modular arithmetic, extra relations & arrows, misc operators found while
+  // broadening the math test corpus.
+  bmod: 'mod', mid: 'divides', ll: 'lt.double', gg: 'gt.double',
+  hookrightarrow: 'arrow.r.hook', hookleftarrow: 'arrow.l.hook',
+  rightleftharpoons: 'harpoons.rtlb', longrightarrow: 'arrow.r.long',
+  longleftarrow: 'arrow.l.long', Longrightarrow: 'arrow.r.long.double',
+  uparrow: 'arrow.t', downarrow: 'arrow.b', updownarrow: 'arrow.t.b',
+  nabla_op: 'nabla', triangleq: 'eq.delta', simeq: 'tilde.eq',
+  ncong: 'tilde.equiv.not', nsubseteq: 'subset.eq.not', supseteq_op: 'supset.eq',
+  models: 'tack.r', vdash: 'tack.r', dashv: 'tack.l',
+  Pr: 'Pr', hom: 'hom', lcm: 'lcm', mod: 'mod',
 }
 
 /** Chars special in Typst math that must be escaped to render literally.
@@ -248,18 +340,41 @@ function escMathLiteral(c: string): string {
 const MAX_MATH_NESTING = 32
 function latexToTypstMath(latex: string, depth = 0): string {
   let i = 0
+  // Defensive: strip ASCII control characters (TAB, form-feed, CR, etc.) from
+  // the LaTeX before parsing. They never belong in a formula and only appear
+  // when the source was corrupted upstream — e.g. a formula authored in a
+  // non-raw JS string where an escape collapsed to a literal TAB (U+0009) /
+  // form-feed (U+000C). Left in place they desync the command scanner (a token like "rac"
+  // gets split into "r a c ...") and can emit stray tokens
+  // like `cs` that Typst rejects as an unknown variable, garbling the whole
+  // PDF. Dropping them lets the rest of the formula still render.
   const src = latex
+    // TAB and CR are legitimate-ish whitespace in hand-written LaTeX; normalize
+    // them to a space so a corrupted `	o`→TAB still reads as a token break
+    // rather than gluing identifiers together.
+    .replace(/[\t\r]/g, ' ')
+    // Drop the remaining ASCII control chars (backspace, vertical tab, FORM-FEED
+    // from a corrupted `\frac`→U+000C, etc.). Left in place they desync the
+    // command scanner and emit stray tokens like `cs` that Typst rejects as an
+    // unknown variable, garbling the whole PDF.
+    // eslint-disable-next-line no-control-regex -- intentionally strips C0 control chars
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
   const len = src.length
 
   function readBraceGroup(): string {
     if (src[i] !== '{') return ''
     i++
-    let depth = 1
+    // `braces` balances the `{...}` scan; it must NOT shadow the outer `depth`
+    // recursion-depth parameter, or the guard below would test the (post-scan
+    // zero) balance counter instead of the true recursion depth and never fire,
+    // and the recursive call would always pass depth 1 — letting deeply nested
+    // `{{{…}}}` recurse unbounded into a stack overflow.
+    let braces = 1
     const start = i
-    while (i < len && depth > 0) {
+    while (i < len && braces > 0) {
       if (src[i] === '\\') { i += 2; continue }
-      if (src[i] === '{') depth++
-      else if (src[i] === '}') { depth--; if (depth === 0) break }
+      if (src[i] === '{') braces++
+      else if (src[i] === '}') { braces--; if (braces === 0) break }
       i++
     }
     const inner = src.slice(start, i)
@@ -287,6 +402,32 @@ function latexToTypstMath(latex: string, depth = 0): string {
   }
 
   /**
+   * Read a `{...}` argument VERBATIM (no math conversion), for arguments that
+   * are not math — e.g. the colour name in `\color{red}` / `\textcolor{red}`.
+   * Returns the raw inner text so `red` stays `red` (not `r e d`).
+   */
+  function readRawGroupArg(): string {
+    while (i < len && /\s/.test(src[i]!)) i++
+    if (src[i] !== '{') {
+      // Bare single-token colour (rare): read one run of word/#/hex chars.
+      let t = ''
+      while (i < len && /[a-zA-Z0-9#]/.test(src[i]!)) { t += src[i]; i++ }
+      return t
+    }
+    i++
+    let d = 1
+    const s2 = i
+    while (i < len && d > 0) {
+      if (src[i] === '{') d++
+      else if (src[i] === '}') { d--; if (d === 0) break }
+      i++
+    }
+    const inner = src.slice(s2, i)
+    if (src[i] === '}') i++
+    return inner
+  }
+
+  /**
    * Read a SCRIPT argument (after ^ or _). Here grouping DOES need parens so
    * `x^{2n}` -> `x^(2n)` binds correctly; a single token stays bare (`x^2`).
    */
@@ -311,7 +452,11 @@ function latexToTypstMath(latex: string, depth = 0): string {
    * `name()` which Typst rejects with "missing argument: body". Empty => drop.
    */
   function decorate(fn: string, arg: string): string {
-    return arg.trim().length ? `${fn}(${arg})` : ''
+    // Leading space so the function name never fuses with a preceding letter
+    // into one identifier (e.g. `d` + `\vec{r}` must be `d arrow(r)`, not
+    // `darrow(r)` which Typst reads as an unknown variable). Typst math
+    // collapses the extra space, so this is visually a no-op.
+    return arg.trim().length ? ` ${fn}(${arg})` : ''
   }
 
   function readCommand(): string {
@@ -327,13 +472,109 @@ function latexToTypstMath(latex: string, depth = 0): string {
     let name = ''
     while (i < len && /[a-zA-Z]/.test(src[i]!)) { name += src[i]; i++ }
     switch (name) {
+      case 'color': {
+        // `\color{c} ...`: colour subsequent content. Read the colour name RAW
+        // (not math-converted — `red` must stay `red`, not become `r e d`).
+        // Unknown/unsafe colours are dropped (render uncoloured) rather than
+        // injected raw — an unhandled `\color` used to spell out as
+        // `"color"r e d…`, emitting stray identifiers like `dx` that Typst rejects
+        // as unknown variables and failing the whole PDF.
+        //
+        // Two forms are common in user input:
+        //   \color{red}{x}  — colour just the following group (like \textcolor)
+        //   \color{red} x   — switch: colour the rest of the enclosing group
+        // Prefer the localised group form when a `{` immediately follows, so we
+        // don't accidentally swallow trailing `= c` etc. into the colour.
+        const fill = mathColorArgToTypst(readRawGroupArg())
+        while (i < len && /\s/.test(src[i]!)) i++
+        let inner: string
+        if (src[i] === '{') {
+          inner = readBraceGroup().trim() || 'zws'
+        } else {
+          // Rest-of-scope form `\color{red} E = mc^2`: capture the RAW remaining
+          // LaTeX up to the enclosing `}` / end, then run it through the full
+          // converter so letters get spaced (`mc` -> `m c`) exactly like the
+          // top-level path. Accumulating already-converted fragments here used
+          // to leave bare runs like `mc` fused, which Typst rejects as an
+          // unknown variable and fails the whole PDF compile.
+          let raw = ''
+          let d = 0
+          while (i < len) {
+            const ch = src[i]!
+            if (ch === '}' && d === 0) break
+            if (ch === '\\') { raw += src[i]!; raw += src[i + 1] ?? ''; i += 2; continue }
+            if (ch === '{') d++
+            else if (ch === '}') d--
+            raw += ch
+            i++
+          }
+          inner = latexToTypstMath(raw, depth + 1).trim() || 'zws'
+        }
+        return fill ? ` #text(fill: ${fill})[$${inner}$]` : ` ${inner}`
+      }
+      case 'textcolor':
+      case 'colorbox': {
+        // `\textcolor{c}{content}` / `\colorbox{c}{content}`: colour just the
+        // second argument. Same safety policy as `\color`.
+        const fill = mathColorArgToTypst(readRawGroupArg())
+        const inner = readGroupArg().trim() || 'zws'
+        return fill ? ` #text(fill: ${fill})[$${inner}$]` : ` ${inner}`
+      }
       case 'frac':
       case 'dfrac':
-      case 'tfrac': {
+      case 'tfrac':
+      case 'cfrac': {
         const a = readGroupArg(); const b = readGroupArg()
         // Empty numerator/denominator would make Typst's frac() error; substitute
-        // a zero-width placeholder so the fraction still renders.
+        // a zero-width placeholder so the fraction still renders. `\cfrac`
+        // (continued fraction) has no dedicated Typst primitive, so it renders
+        // as a normal frac() — visually equivalent for our nesting depth.
         return `frac(${a.trim() || "zws"}, ${b.trim() || "zws"})`
+      }
+      case 'overset':
+      case 'stackrel': {
+        // \overset{top}{base} / \stackrel{top}{base}. Typst has no `overset`,
+        // but `limits(base)^(top)` places the annotation directly above.
+        const top = readGroupArg().trim() || 'zws'
+        const base = readGroupArg().trim() || 'zws'
+        return ` limits(${base})^(${top})`
+      }
+      case 'underset': {
+        // \underset{bottom}{base} -> Typst limits(base)_(bottom)
+        const bottom = readGroupArg().trim() || 'zws'
+        const base = readGroupArg().trim() || 'zws'
+        return ` limits(${base})_(${bottom})`
+      }
+      case 'pmod': {
+        // \pmod{n} -> parenthesised modulus with a leading gap: `quad (mod n)`
+        const n = readGroupArg().trim() || 'zws'
+        return ` quad (mod ${n})`
+      }
+      case 'limits':
+      case 'nolimits':
+      case 'displaystyle':
+      case 'textstyle':
+      case 'scriptstyle':
+        // Layout hints with no Typst equivalent that matters here — drop them so
+        // e.g. `\int\limits_0^1` keeps its scripts on the integral.
+        return ''
+      case 'substack': {
+        // \substack{a \\ b} -> stacked scripts. Typst has no direct primitive;
+        // render the rows in a tight `vec`-like column via `#stack`-free
+        // fallback: join rows with a thin vertical gap using `mat` single column.
+        const body = readGroupArg()
+        const rows = body.split(/\\\\|\\/).map((r) => r.trim()).filter(Boolean)
+        return rows.length ? ` mat(delim: #none, ${rows.join('; ')})` : ''
+      }
+      case 'xrightarrow':
+      case 'xleftarrow': {
+        // \xrightarrow{f} -> arrow with the label as a superscript.
+        while (i < len && /\s/.test(src[i]!)) i++
+        // optional [under] arg (rare) then {over} label
+        let over = ''
+        if (src[i] === '{') over = readBraceGroup()
+        const dir = name === 'xrightarrow' ? 'arrow.r.long' : 'arrow.l.long'
+        return over.trim() ? ` ${dir}^(${over.trim()})` : ` ${dir}`
       }
       case 'sqrt': {
         while (i < len && /\s/.test(src[i]!)) i++
@@ -384,27 +625,86 @@ function latexToTypstMath(latex: string, depth = 0): string {
       case 'dot': return decorate('dot', readGroupArg())
       case 'ddot': return decorate('dot.double', readGroupArg())
       case 'tilde': return decorate('tilde', readGroupArg())
+      case 'overbrace':
+      case 'underbrace': {
+        // \overbrace{body}^{sup} / \underbrace{body}_{sub} -> Typst
+        // overbrace(body, annotation) / underbrace(body, annotation). The
+        // annotation script is optional. A leading space avoids fusing with a
+        // preceding identifier char.
+        const body = readGroupArg().trim() || 'zws'
+        const fn = name === 'overbrace' ? 'overbrace' : 'underbrace'
+        const wantScript = name === 'overbrace' ? '^' : '_'
+        // Skip whitespace, then consume an optional matching ^{...}/_{...}.
+        let j = i
+        while (j < len && /\s/.test(src[j]!)) j++
+        if (src[j] === wantScript) {
+          i = j + 1
+          const ann = readArg().trim()
+          return ann ? ` ${fn}(${body}, ${ann})` : ` ${fn}(${body})`
+        }
+        return ` ${fn}(${body})`
+      }
       case 'boldsymbol':
       case 'mathbf': return decorate('bold', readGroupArg())
       case 'mathbb': return decorate('bb', readGroupArg())
       case 'mathcal': return decorate('cal', readGroupArg())
       case 'mathfrak': return decorate('frak', readGroupArg())
-      case 'begin':
+      case 'begin': {
+        // Environment: capture the name, then the raw body up to the matching
+        // \end{name}, and convert matrix/cases-like environments to Typst's
+        // mat()/cases() so rows & columns actually GROUP (previously begin/end
+        // and the & / \\ separators were discarded, mushing every cell into one
+        // flat run with no brackets).
+        while (i < len && /\s/.test(src[i]!)) i++
+        let env = ''
+        if (src[i] === '{') { i++; while (i < len && src[i] !== '}') { env += src[i]; i++ } if (src[i] === '}') i++ }
+        // Read raw body until the matching \end{env} (track nested begins).
+        const bodyStart = i
+        let nest = 1
+        let bodyEnd = len
+        const re = /\\(begin|end)\s*\{[^}]*\}/g
+        re.lastIndex = i
+        let mm: RegExpExecArray | null
+        while ((mm = re.exec(src))) {
+          if (mm[1] === 'begin') nest++
+          else { nest--; if (nest === 0) { bodyEnd = mm.index; break } }
+        }
+        const rawBody = src.slice(bodyStart, bodyEnd)
+        // Advance the cursor past the matching \end{...}.
+        i = bodyEnd
+        { const e = /\\end\s*\{[^}]*\}/g; e.lastIndex = i; const em = e.exec(src); if (em && em.index === i) i = e.lastIndex }
+        return renderMathEnv(env, rawBody, depth)
+      }
       case 'end': {
+        // A stray \end (no matching begin in this scope): consume its {name}.
         while (i < len && /\s/.test(src[i]!)) i++
         if (src[i] === '{') { while (i < len && src[i] !== '}') i++; if (src[i] === '}') i++ }
         return ''
       }
       default: {
-        if (GREEK.has(name)) return name
+        // Greek letters and mapped symbols/operators get a LEADING space so they
+        // never fuse with a PRECEDING identifier char into one token (e.g.
+        // `e^{i` + `\pi}` must be `i pi`, not `ipi`; `\cos` + `\theta` must be
+        // `cos theta`, not `costheta`). Both would be unknown Typst variables.
+        // Typst math collapses the extra space visually.
+        //
+        // They also need a TRAILING separator when the FOLLOWING source char is
+        // an alphanumeric that would otherwise fuse (`x\to0` -> `arrow.r0`,
+        // `\alpha2` -> `alpha2` — both invalid). But only then: a blanket
+        // trailing space breaks scripts on operators, because `\sum_` -> `sum `
+        // makes the `_` handler see no base atom and inject a `zws`
+        // (`sum zws_(...)`). So gate the trailing space on the next char.
+        const fusesNext = /[0-9A-Za-z]/.test(src[i] ?? '')
+        const tail = fusesNext ? ' ' : ''
+        if (GREEK.has(name)) return ` ${name}${tail}`
         const mapped = LATEX_CMD_TO_TYPST[name]
-        if (mapped) return mapped
+        if (mapped) return ` ${mapped}${tail}`
         // Unknown command. A bare multi-letter identifier in Typst math is an
         // ERROR (unknown variable), so emit it as an upright text string, which
         // always compiles and preserves the source legibly. Single letters are
         // valid math idents, so pass those through bare.
         if (name.length === 1) return name
-        return `"${esc(name)}"`
+        return ` "${esc(name)}"`
       }
     }
   }
@@ -419,7 +719,17 @@ function latexToTypstMath(latex: string, depth = 0): string {
       // (`unexpected hat`). If nothing renderable precedes it, insert a
       // zero-width base so `^2` / `_i` still compile.
       if (!/[^\s]$/.test(out)) out += 'zws'
-      out += ch; i++; out += readArg(); continue
+      out += ch; i++
+      const arg = readArg()
+      // If a parenthesized group immediately follows the script (e.g.
+      // `\log_b(xy)`), Typst would otherwise pull that group INTO the script
+      // (rendering `log_(b(xy))`). Force-wrap the script arg in parens so it is
+      // bounded and the following `(...)` stays a normal base-line argument.
+      let j = i
+      while (j < len && /\s/.test(src[j]!)) j++
+      const followedByParen = src[j] === '('
+      out += followedByParen && !/^\(.*\)$/.test(arg) ? `(${arg})` : arg
+      continue
     }
     if (ch === '&') { i++; continue }
     if (ch === '~') { out += ' '; i++; continue }
@@ -434,13 +744,105 @@ function latexToTypstMath(latex: string, depth = 0): string {
       out += letters.join(letters.length > 1 ? ' ' : '')
       continue
     }
+    if (ch === '|') {
+      // Two ADJACENT bars (`||`) are read by Typst as the norm delimiter `‖`,
+      // but in LaTeX `|a||b|` means abs(a)*abs(b) (two separate single bars).
+      // Insert a thin space between consecutive bars so they stay two single
+      // `|` delimiters instead of merging into a double-bar norm.
+      if (out.endsWith('|')) out += 'thin'
+      out += '|'; i++; continue
+    }
     out += escMathLiteral(ch)
     i++
   }
-  return out
+  // Collapse redundant whitespace introduced by the leading/trailing spaces we
+  // add around symbols/decorators to prevent token fusion. Typst math treats
+  // any run of spaces as a single gap, so this is visually identical but keeps
+  // the emitted source tidy (and stable for tests).
+  return out.replace(/ {2,}/g, ' ').replace(/^ | $/g, '')
 }
 
-// ── emoji ────────────────────────────────────────────────────────────────────
+/**
+ * Convert a LaTeX math environment body (matrix / cases / aligned / …) to a
+ * Typst grouped construct so rows and columns are preserved and delimited.
+ *
+ * Splits the raw body on `\\` (rows) and `&` (columns), converting each cell
+ * with the normal math converter. Without this, `\begin{pmatrix} a & b \\ c & d
+ * \end{pmatrix}` collapsed to a flat `a b c d` run with no brackets — the
+ * "公式没组合起来" bug.
+ */
+function renderMathEnv(env: string, rawBody: string, depth: number): string {
+  const name = env.replace(/\*$/, '')
+  // `array` (and `\begin{array}{cc}`-style envs) carry a LaTeX column-spec
+  // argument immediately after the environment name, e.g. `{cc}` / `{l|r}`.
+  // It is layout metadata, not content — strip a single leading `{...}` group
+  // so the spec letters don't leak into the first cell.
+  let body = rawBody
+  if (name === 'array') body = body.replace(/^\s*\{[^}]*\}/, '')
+  // Split into rows on `\\`, then columns on unescaped `&`.
+  const rows = body
+    .split(/\\\\/)
+    .map((r) => r.trim())
+  const grid = rows.map((row) =>
+    row.split(/(?<!\\)&/).map((cell) => latexToTypstMath(cell.trim(), depth + 1).trim() || 'zws'),
+  )
+  // Drop a trailing all-empty row (from a final `\\`).
+  while (grid.length > 1 && grid[grid.length - 1]!.every((c) => c === 'zws')) grid.pop()
+
+  const matDelim: Record<string, string> = {
+    matrix: '#none',
+    pmatrix: '"("',
+    bmatrix: '"["',
+    Bmatrix: '"{"',
+    vmatrix: '"|"',
+    Vmatrix: '"||"',
+  }
+  // Open/close delimiter literals (Typst math markup) for the tight `lr()` form.
+  const matFence: Record<string, [string, string]> = {
+    pmatrix: ['(', ')'],
+    bmatrix: ['[', ']'],
+    Bmatrix: ['{', '}'],
+    vmatrix: ['|', '|'],
+    Vmatrix: ['||', '||'],
+  }
+
+  if (name === 'cases') {
+    // Typst cases(): one branch per row, comma-separated. Separate the value from
+    // its condition with an explicit `quad` gap so there is always clear spacing
+    // (a bare `&` only sets an alignment point and can render with almost no gap;
+    // the value and condition looked glued together without this).
+    const rowsJoined = grid.map((r) => r.join(' quad ')).join(', ')
+    return `cases(${rowsJoined})`
+  }
+
+  if (name in matDelim) {
+    const delim = matDelim[name]!
+    if (delim === '#none') {
+      // Unfenced matrix: no delimiters to size.
+      const body = grid.map((r) => r.join(', ')).join('; ')
+      return `mat(delim: #none, ${body})`
+    }
+    // Fenced matrix (pmatrix/bmatrix/...): Typst's default `mat(delim: ...)`
+    // auto-sizes the brackets with generous padding, so a 2-row matrix's
+    // delimiters tower ~20-25% above the content. Build the grid WITHOUT a
+    // built-in delimiter and wrap it in `lr(size: #88%, ...)` so the brackets
+    // hug the two rows tightly instead of leaving big vertical gaps.
+    const body = grid.map((r) => r.join(', ')).join('; ')
+    const [open, close] = matFence[name]!
+    return `lr(size: #88%, ${open} mat(delim: #none, ${body}) ${close})`
+  }
+
+  if (name === 'array') {
+    const body = grid.map((r) => r.join(', ')).join('; ')
+    return `mat(delim: #none, ${body})`
+  }
+
+  // aligned / align / gathered / split / equation: stack rows, drop the & align
+  // tabs (Typst auto-aligns display math); join rows with line breaks.
+  return grid.map((r) => r.join(' ')).join(' \\ ')
+}
+
+// ── emoji ───────────────────────────────────────────────────────────────────
 // emoji name/shortcode -> unicode glyph, from the SAME set the editor/frontend
 // use (matches the HTML/DOCX export). Keeps backend PDF emoji identical to what
 // the user authored.
@@ -465,9 +867,15 @@ function wrapMark(mark: PMMark, inner: string): string {
   const attrs = mark.attrs ?? {}
   switch (mark.type) {
     case 'bold':
-      // Explicit heavy weight. CJK fonts often ship a single weight, so #strong
-      // alone can look weak; force weight so bold is unmistakable across fonts.
-      return `#text(weight: "bold")[${inner}]`
+      // Explicit heavy weight PLUS a hairline stroke to synthesize bold. CJK
+      // fonts (PingFang SC / Noto Sans CJK SC) often lack a true Bold cut, so
+      // `weight: "bold"` silently falls back to Regular and Chinese looks
+      // unchanged (only Latin, which has a Bold face, thickens). A thin stroke
+      // in the SAME colour as the glyph fill fattens the strokes for every
+      // script, so Chinese bold is visible too. `0.02em` ≈ fake-bold weight
+      // without turning glyphs into blobs; stroke paint defaults to the text
+      // fill so coloured/bold combinations keep their colour.
+      return `#text(weight: "bold", stroke: 0.02em)[${inner}]`
     case 'italic':
       // CJK fonts rarely have an italic/oblique cut, so #emph / style:"italic"
       // leaves Chinese upright. Synthesize a slant with skew so CJK visibly
@@ -546,6 +954,11 @@ interface RenderCtx {
   attachments: Map<string, ResolvedAttachment>
   imagePaths: Map<string, string>
   depth: number
+  /** True while rendering inside a table cell. Cell images are constrained to
+   *  the cell width (100%) instead of the page-based cap, because Typst cannot
+   *  reliably resolve a `layout()` measurement inside deeply nested `1fr`
+   *  columns — so a plain page cap let deep-nested images overflow their cell. */
+  inCell?: boolean
 }
 
 function alignArg(attrs: Record<string, unknown> | undefined): string {
@@ -589,6 +1002,13 @@ function renderImage(node: PMNode, ctx: RenderCtx): string {
       const w = m[2] === '%' ? `${Math.min(num, 100)}%` : `${(num * 0.75).toFixed(1)}pt`
       return `\n#figure(__capImage("${esc(path)}", w: ${w}))\n`
     }
+  }
+  // Inside a table cell, constrain to the cell width (100%). Typst resolves
+  // `100%` against the actual cell even when it is a deeply nested `1fr`
+  // column, whereas the `layout()` cap could not — so this stops nested-cell
+  // images from overflowing their cell / overlapping the table borders.
+  if (ctx.inCell) {
+    return `\n#figure(__capImage("${esc(path)}", w: 100%))\n`
   }
   // No explicit width: cap to the page content width so large images don't
   // overflow, but don't upscale small ones (max-width: 100% behavior).
@@ -738,12 +1158,33 @@ let mathLatexBudget = MAX_MATH_LATEX_TOTAL_BYTES
 // When true, math nodes emit their raw LaTeX as a quoted string instead of
 // converting. Set for the whole-document verbatim retry (see renderTypst).
 let forceVerbatimMath = false
+// Per-formula verbatim set: when non-null, a formula whose RAW latex is in the
+// set renders verbatim while all others convert. Enables per-formula fallback
+// (one bad formula degrades to text; the rest stay real math).
+let verbatimFormulaSet: Set<string> | null = null
 
 /** Convert LaTeX->Typst math; on any converter throw, fall back to a quoted
  *  verbatim source so the formula is still visible (never crashes the doc).
  *  Oversized formulas (or once the per-doc budget is exhausted) skip conversion
  *  and fall back to verbatim text, so a huge `latex` attr can't hang the loop. */
 function safeMath(latex: string): string {
+  // Per-formula fallback: this exact formula was probed as compile-breaking, so
+  // emit it verbatim while the rest of the document still converts to real math.
+  if (verbatimFormulaSet && verbatimFormulaSet.has(latex)) {
+    return `"${esc(latex)}"`
+  }
+  // Defensive: strip C0 control characters (except none are legal in KaTeX
+  // source). Corrupt data — e.g. a seed that stored `\to`/`\frac` as a non-raw
+  // JS string so `\t`→TAB(U+0009), `\f`→FF(U+000C) — leaves raw control bytes
+  // in the `latex` attr. Those bytes make the converter emit Typst-invalid
+  // tokens (`rac`, fused identifiers) that fail the WHOLE compile and drag the
+  // entire document into the verbatim fallback. Removing them here contains the
+  // damage to the one bad formula (it degrades to text) instead of garbling the
+  // whole export. It cannot rebuild `\frac` from `rac` — corrupt data must be
+  // fixed at the source — but it stops one bad formula from crashing the rest.
+  // eslint-disable-next-line no-control-regex -- intentionally strips C0 control chars
+  const sanitized = latex.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').replace(/[\t\r]/g, ' ')
+  latex = sanitized
   // Verbatim retry mode, or oversized/over-budget: skip conversion entirely and
   // emit the raw source as a quoted string (always compile-safe).
   if (forceVerbatimMath || latex.length > MAX_MATH_LATEX_BYTES || mathLatexBudget <= 0) {
@@ -826,9 +1267,47 @@ function renderTable(node: PMNode, ctx: RenderCtx): string {
   const hasWidths = widths.some((w) => w != null)
   // px -> pt (0.75) for set widths; unset columns get 1fr so they share the
   // rest proportionally rather than collapsing.
-  const columnsArg = hasWidths
-    ? `(${widths.map((w) => (w != null ? `${(w * 0.75).toFixed(1)}pt` : '1fr')).join(', ')})`
-    : `(${Array.from({ length: cols }, () => '1fr').join(', ')})`
+  //
+  // For a NESTED table (rendered inside a cell) we must NOT use the editor's
+  // absolute px widths: those are page-scale and easily exceed the narrow
+  // containing cell, so the nested table (and its images) overflow the cell.
+  // Instead convert every column to a proportional `fr` unit derived from the
+  // px ratios, so the nested table always fits its container while keeping the
+  // relative column proportions. Columns with no width fall back to 1fr.
+  let columnsArg: string
+  if (ctx.inCell && hasWidths) {
+    // Nested table: convert px widths to proportional `fr` so the table fits its
+    // container. But the editor's stored px widths are page-scale and often
+    // lopsided (e.g. a column holding an image is 600px while siblings are ~90px
+    // -> 75/13/12), which crushes the narrow columns to unreadable slivers in the
+    // fixed container. The web view never shows this because CSS min-content puts
+    // a floor under each column. Mirror that: clamp every column's share to at
+    // least `MIN_SHARE` of an equal split so no column collapses, then keep the
+    // remaining proportions among the columns that have room to grow.
+    const n = widths.length
+    const MIN_SHARE = 0.6 // each column gets >= 60% of an equal (1/n) share
+    const MAX_SHARE = 1.6 // and <= 1.6x an equal share, so no column dominates
+    // Raw proportional weights (unset columns treated as the average weight so
+    // they participate like a normal 1fr column).
+    const known = widths.filter((w): w is number => w != null)
+    const avg = known.length ? known.reduce((s, w) => s + w, 0) / known.length : 1
+    const raw = widths.map((w) => (w != null ? w : avg))
+    const rawSum = raw.reduce((s, w) => s + w, 0) || 1
+    // Normalize to fr-vs-equal (share * n), then clamp each to [MIN_SHARE,
+    // MAX_SHARE]. Clamping is the final step so the ceiling actually holds (a
+    // renormalize-after-clamp would push the widest column back over the cap).
+    // Typst tolerates fr tracks that don't sum to exactly n; they still split the
+    // row proportionally, so the guaranteed [floor, ceil] bound is what matters.
+    const frs = raw.map((w) => {
+      const share = (w / rawSum) * n
+      return Math.min(MAX_SHARE, Math.max(MIN_SHARE, share))
+    })
+    columnsArg = `(${frs.map((f) => `${f.toFixed(2)}fr`).join(', ')})`
+  } else {
+    columnsArg = hasWidths
+      ? `(${widths.map((w) => (w != null ? `${(w * 0.75).toFixed(1)}pt` : '1fr')).join(', ')})`
+      : `(${Array.from({ length: cols }, () => '1fr').join(', ')})`
+  }
 
   // Determine if the first row is a pure header row (all tableHeader cells). If
   // so, emit it inside table.header(...) so Typst REPEATS it on every page the
@@ -843,7 +1322,7 @@ function renderTable(node: PMNode, ctx: RenderCtx): string {
     const colspan = clampInt(a.colspan, 1, 100, 1)
     const rowspan = clampInt(a.rowspan, 1, 100, 1)
     const isHeader = cell.type === 'tableHeader'
-    const body = renderChildren(cell, ctx).trim() || ' '
+    const body = renderChildren(cell, { ...ctx, inCell: true }).trim() || ' '
     const content = isHeader ? `#text(weight: "bold")[${body}]` : body
     const spanArgs: string[] = []
     if (colspan !== 1) spanArgs.push(`colspan: ${colspan}`)
@@ -866,9 +1345,9 @@ function renderTable(node: PMNode, ctx: RenderCtx): string {
 
   // Header rows get a subtle fill via a fill function keyed on the header rows.
   const fillArg = firstIsHeader
-    ? `\n  fill: (_, row) => if row == 0 { rgb("#f6f8fa") },`
+    ? `\n  fill: (_, row) => if row == 0 { rgb("#f2f3f5") },`
     : ''
-  return `\n#table(\n  columns: ${columnsArg},\n  stroke: 0.5pt + rgb("#d0d7de"),\n  inset: 7pt,${fillArg}\n  ${parts.join(',\n  ')}\n)\n`
+  return `\n#table(\n  columns: ${columnsArg},\n  stroke: 0.5pt + rgb("#e5e6eb"),\n  inset: 7pt,${fillArg}\n  ${parts.join(',\n  ')}\n)\n`
 }
 
 // ── document assembly ─────────────────────────────────────────────────────────
@@ -894,24 +1373,37 @@ function preamble(title: string): string {
     // (measured), fixing the too-cramped look versus the browser export.
     '#set par(justify: true, leading: 0.85em, spacing: 0.9em, first-line-indent: 0pt)',
     '#show heading: set block(above: 1.2em, below: 0.6em)',
+    // Explicit per-level heading sizes. Typst's default heading scaling is subtle
+    // for a CJK-first body font (the levels look nearly identical), so pin each
+    // level to a distinct size matching the editor's H1..H6 scale.
+    '#show heading.where(level: 1): set text(size: 22pt)',
+    '#show heading.where(level: 2): set text(size: 18pt)',
+    '#show heading.where(level: 3): set text(size: 15pt)',
+    '#show heading.where(level: 4): set text(size: 13pt)',
+    '#show heading.where(level: 5): set text(size: 12pt)',
+    '#show heading.where(level: 6): set text(size: 11pt)',
     '#show link: set text(fill: rgb("#0969da"))',
     '#set table(align: left + horizon)',
+    // Compact matrix/cases spacing so auto-sized delimiters hug the entries and
+    // piecewise branches keep a clear gap between value and condition.
+    '#set math.mat(row-gap: 0em, column-gap: 0.55em)',
+    '#set math.cases(gap: 0.5em)',
     // Image max-width helper: cap to the page CONTENT width so large images
     // never overflow, but keep small images at natural size (no upscaling),
     // matching the editor/HTML `max-width: 100%; height: auto`. An optional
     // explicit width is applied but still bounded by the content width.
-    '#let __capImage(path, w: none) = context {',
-    '  let avail = page.width - 32mm',
+    '#let __capImage(path, w: none) = layout(size => {',
+    '  // `size.width` is the width of the CONTAINING block (page body at top',
+    '  // level, or the enclosing cell when nested). Cap the image to it so it',
+    '  // never overflows a narrow (possibly deeply nested) table cell, but never',
+    '  // upscale a naturally smaller image.',
+    '  let avail = size.width',
     '  let nat = measure(image(path))',
-    '  if w != none {',
-    '    let target = if type(w) == length and w > avail { avail } else { w }',
-    '    image(path, width: target)',
-    '  } else if nat.width > avail {',
-    '    image(path, width: 100%)',
-    '  } else {',
-    '    image(path)',
-    '  }',
-    '}',
+    '  let target = if w != none {',
+    '    if type(w) == length and w > avail { avail } else { w }',
+    '  } else if nat.width > avail { avail } else { nat.width }',
+    '  image(path, width: target)',
+    '})',
     `#set document(title: "${esc(title)}")`,
     '',
     // Leading H1 = document title (mirrors the HTML path).
@@ -934,6 +1426,7 @@ export function renderTypst(pmJson: unknown, opts: RenderTypstOptions): string {
   const doc = pmJson as PMNode
   mathLatexBudget = MAX_MATH_LATEX_TOTAL_BYTES // reset per-document math budget
   forceVerbatimMath = opts.mathMode === 'verbatim'
+  verbatimFormulaSet = opts.verbatimFormulas ?? null
   const ctx: RenderCtx = {
     attachments: opts.attachments,
     imagePaths: opts.imagePaths ?? new Map(),
@@ -944,4 +1437,4 @@ export function renderTypst(pmJson: unknown, opts: RenderTypstOptions): string {
 }
 
 // Exposed for unit tests only.
-export const __test = { latexToTypstMath, wrapMark, cssColorToTypst, cssFontSizeToTypst, isSafeHref, renderTypstNode: renderNode, renderTextNode, escMathLiteral }
+export const __test = { latexToTypstMath, wrapMark, cssColorToTypst, cssFontSizeToTypst, isSafeHref, renderTypstNode: renderNode, renderTextNode, escMathLiteral, escContent, insertSoftBreaks }

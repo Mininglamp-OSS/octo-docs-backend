@@ -438,6 +438,14 @@ export const config = {
     // Aggregate byte budget across all embedded images in one export. Once the
     // running total would exceed this, remaining images are dropped.
     maxImageTotalBytes: num('TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
+    // Per-formula fallback bound: after a whole-document compile failure the
+    // route probes individual formulas (one `typst` compile each) to isolate
+    // the broken one. Cap how many formulas may be probed and the total wall
+    // clock spent probing, so a doc with thousands of formulas can't hold a
+    // scarce compile slot indefinitely. When the budget is spent the route
+    // skips straight to the whole-document verbatim fallback.
+    maxFormulaProbes: num('TYPST_EXPORT_MAX_FORMULA_PROBES', 40),
+    formulaProbeBudgetMs: num('TYPST_EXPORT_FORMULA_PROBE_BUDGET_MS', 15_000),
   },
 
   // W3 server-side whiteboard image export. The decoded Excalidraw scene is

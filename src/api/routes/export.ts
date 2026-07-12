@@ -165,6 +165,69 @@ export function collectReferencedAttachIds(pmJson: unknown): Set<string> {
 }
 
 /**
+ * Collect every unique raw `latex` string from inlineMath/blockMath nodes.
+ * Used by the per-formula fallback: after a whole-document compile failure we
+ * probe each unique formula in isolation to find the one(s) that actually break
+ * Typst, so only those degrade to verbatim source and the rest stay real math.
+ */
+export function collectFormulaLatex(pmJson: unknown): string[] {
+  const set = new Set<string>()
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return
+    const n = node as { type?: unknown; attrs?: unknown; content?: unknown }
+    if ((n.type === 'inlineMath' || n.type === 'blockMath') && n.attrs && typeof n.attrs === 'object') {
+      const latex = (n.attrs as { latex?: unknown }).latex
+      if (typeof latex === 'string' && latex) set.add(latex)
+    }
+    if (Array.isArray(n.content)) for (const c of n.content) walk(c)
+  }
+  walk(pmJson)
+  return [...set]
+}
+
+/**
+ * Probe each unique formula by compiling it alone; return the set of formulas
+ * whose isolated compile fails (i.e. the malformed ones). A probe doc is a
+ * single block-math node, so a `TypstCompileError` is attributable to that one
+ * formula.
+ *
+ * Bounded to protect the scarce compile pool: at most `maxProbes` formulas are
+ * compiled and probing stops once `budgetMs` of wall-clock is spent. If the
+ * work exceeds either bound the probe is abandoned (`exhausted: true`) so the
+ * caller skips the partial retry and goes straight to the whole-document
+ * verbatim fallback instead of holding a compile slot for hundreds of probes.
+ * Non-compile errors abort probing too (treated as "can't attribute"), again
+ * deferring to the whole-doc fallback.
+ */
+export async function probeFailingFormulas(
+  latexList: string[],
+  title: string,
+  opts: { maxProbes: number; budgetMs: number },
+): Promise<{ failing: Set<string>; exhausted: boolean }> {
+  const failing = new Set<string>()
+  const deadline = Date.now() + Math.max(0, opts.budgetMs)
+  const limit = Math.max(0, opts.maxProbes)
+  if (latexList.length > limit) return { failing, exhausted: true }
+  let probed = 0
+  for (const latex of latexList) {
+    if (probed >= limit || Date.now() >= deadline) return { failing, exhausted: true }
+    probed++
+    const probeDoc = { type: 'doc', content: [{ type: 'blockMath', attrs: { latex } }] }
+    try {
+      const src = renderTypst(probeDoc, { title, attachments: new Map(), imagePaths: new Map() })
+      await compileTypst(src, [])
+    } catch (e) {
+      if (e instanceof TypstCompileError) failing.add(latex)
+      // A non-compile error (timeout, spawn failure, ...) means we can't safely
+      // attribute the break to one formula: abandon probing and let the
+      // whole-document verbatim fallback handle it.
+      else return { failing, exhausted: true }
+    }
+  }
+  return { failing, exhausted: false }
+}
+
+/**
  * Fetch up to maxBytes from a signed GET URL. Aborts and returns null on any
  * failure, non-200, or over-size body (streamed, so an oversize response can't
  * blow memory before the limit trips). A synthetic/dev host that isn't a real
@@ -242,18 +305,48 @@ export async function exportPdfHandler(req: Request, res: Response): Promise<voi
     } catch (compileErr) {
       // A single malformed formula can produce Typst-invalid math that fails the
       // whole compile (the per-formula JS-throw fallback can't catch a typst
-      // non-zero exit). Retry once with all math rendered verbatim as source
-      // text so the document still exports instead of returning 500.
+      // non-zero exit). Isolate the culprit(s): probe each unique formula alone,
+      // then re-render with ONLY the failing formulas verbatim so the rest of
+      // the document still exports as real math. If that still fails (a
+      // non-formula issue, or probing couldn't attribute it), fall back to the
+      // whole-document verbatim retry as the final safety net.
       if (!(compileErr instanceof TypstCompileError)) throw compileErr
       // eslint-disable-next-line no-console
-      console.warn(`[export:typst] compile failed for doc ${docId}; retrying with verbatim math`)
-      const fallback = renderTypst(pmJson, {
-        title: guard.meta.title,
-        attachments,
-        imagePaths,
-        mathMode: 'verbatim',
-      })
-      pdf = await compileTypst(fallback, images)
+      console.warn(`[export:typst] compile failed for doc ${docId}; probing formulas for per-formula fallback`)
+      const { failing: verbatimFormulas, exhausted } = await probeFailingFormulas(
+        collectFormulaLatex(pmJson),
+        guard.meta.title,
+        { maxProbes: config.typstExport.maxFormulaProbes, budgetMs: config.typstExport.formulaProbeBudgetMs },
+      )
+      let partialPdf: Buffer | null = null
+      if (!exhausted && verbatimFormulas.size > 0) {
+        try {
+          const partial = renderTypst(pmJson, {
+            title: guard.meta.title,
+            attachments,
+            imagePaths,
+            verbatimFormulas,
+          })
+          partialPdf = await compileTypst(partial, images)
+          // eslint-disable-next-line no-console
+          console.warn(`[export:typst] doc ${docId} recovered with ${verbatimFormulas.size} formula(s) verbatim`)
+        } catch (partialErr) {
+          if (!(partialErr instanceof TypstCompileError)) throw partialErr
+        }
+      }
+      if (partialPdf) {
+        pdf = partialPdf
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(`[export:typst] doc ${docId} per-formula fallback insufficient; whole-document verbatim retry`)
+        const fallback = renderTypst(pmJson, {
+          title: guard.meta.title,
+          attachments,
+          imagePaths,
+          mathMode: 'verbatim',
+        })
+        pdf = await compileTypst(fallback, images)
+      }
     }
 
     res.status(200)
