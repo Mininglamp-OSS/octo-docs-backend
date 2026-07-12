@@ -48,6 +48,77 @@ describe('renderTypst — latexToTypstMath', () => {
     expect(m('\\text{hello}')).toBe('"hello"')
   })
 
+  it('strips ASCII control chars so a corrupted formula cannot garble the PDF', () => {
+    // Regression ("导出pdf乱码"): a formula authored in a non-raw JS string
+    // collapsed `\to`→TAB (U+0009) and `\frac`→FORM-FEED (U+000C). The stray
+    // control bytes desynced the command scanner and emitted a bare `cs`
+    // identifier that Typst rejects as an unknown variable, failing the whole
+    // compile. Control chars must be normalized/stripped before parsing.
+    const corrupt = 'lim_{x \u0009o 0} \u000crac{x}{y}'
+    const out = m(corrupt)
+    // No form-feed / TAB survive into the emitted Typst math.
+    expect(out).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/)
+    // A clean formula is unaffected.
+    expect(m('\\lim_{x \\to 0} \\frac{\\sin x}{x} = 1')).toBe(
+      'lim_(x arrow.r 0) frac(sin x, x) = 1',
+    )
+  })
+
+  it('handles \\color / \\textcolor in math without garbling (regression: 彩色公式导出乱码)', () => {
+    // Unhandled \color/\textcolor used to spell out as `"color"r e d…`, emitting
+    // stray identifiers (dx, ey) that Typst rejects as unknown variables and
+    // failing the whole PDF compile. They must become Typst `#text(fill: ...)`.
+    expect(m('\\color{red}{x^2}')).toBe('#text(fill: red)[$x^2$]')
+    expect(m('\\textcolor{blue}{y}')).toBe('#text(fill: blue)[$y$]')
+    expect(m('\\textcolor{#ff0000}{z}')).toBe('#text(fill: rgb("#ff0000"))[$z$]')
+    // xcolor names not in Typst's palette map to a near equivalent.
+    expect(m('\\textcolor{cyan}{w}')).toBe('#text(fill: aqua)[$w$]')
+    // The colour name must NOT be math-converted to spaced letters.
+    expect(m('\\color{red}{a}')).not.toContain('r e d')
+    // `\color{c}{x}` colours only the following group — trailing content stays
+    // uncoloured (regression: rest-of-group form used to swallow `+ z` / `= c`).
+    expect(m('x + \\color{red}{y} + z')).toBe('x + #text(fill: red)[$y$] + z')
+    expect(m('\\color{red}{a} + \\color{blue}{b}')).toBe(
+      '#text(fill: red)[$a$] + #text(fill: blue)[$b$]',
+    )
+    // Rest-of-scope form must run trailing content through the full converter so
+    // adjacent letters get spaced (mc -> m c); otherwise Typst reads `mc` as an
+    // unknown variable and the whole PDF export falls back to raw-LaTeX verbatim
+    // (regression: colored formula garbled the entire export).
+    expect(m('\\color{red} E = mc^2')).toBe('#text(fill: red)[$E = m c^2$]')
+  })
+
+  it('converts a pmatrix to a bracketed Typst mat() (regression: 公式没组合)', () => {
+    // Previously \begin/\end and the & / \\\\ separators were discarded, mushing
+    // every cell into one flat run with no delimiters. The matrix is wrapped in
+    // lr(size: #88%, ...) so the brackets hug the two rows instead of towering.
+    expect(m('\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}')).toBe(
+      'lr(size: #88%, ( mat(delim: #none, a, b; c, d) ))',
+    )
+  })
+
+  it('converts bmatrix / vmatrix / matrix with correct delimiters', () => {
+    expect(m('\\begin{bmatrix} 1 & 0 \\\\ 0 & 1 \\end{bmatrix}')).toBe(
+      'lr(size: #88%, [ mat(delim: #none, 1, 0; 0, 1) ])',
+    )
+    expect(m('\\begin{vmatrix} a & b \\\\ c & d \\end{vmatrix}')).toBe(
+      'lr(size: #88%, | mat(delim: #none, a, b; c, d) |)',
+    )
+    expect(m('\\begin{matrix} a & b \\\\ c & d \\end{matrix}')).toBe('mat(delim: #none; a, b; c, d)')
+  })
+
+  it('converts a cases environment to Typst cases() with a quad gap', () => {
+    expect(m('\\begin{cases} x^2 & x \\ge 0 \\\\ -x & x < 0 \\end{cases}')).toBe(
+      'cases(x^2 quad x gt.eq 0, -x quad x < 0)',
+    )
+  })
+
+  it('multiplies two matrices without dropping either (adjacent envs)', () => {
+    expect(m('\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}\\begin{pmatrix} x \\\\ y \\end{pmatrix}')).toBe(
+      'lr(size: #88%, ( mat(delim: #none, a, b; c, d) ))lr(size: #88%, ( mat(delim: #none, x; y) ))',
+    )
+  })
+
   it('quotes unknown multi-letter commands as text so Typst never errors', () => {
     // A bare multi-letter ident is an "unknown variable" error in Typst math, so
     // unknown commands are emitted as an upright text string (always compiles).
@@ -55,8 +126,8 @@ describe('renderTypst — latexToTypstMath', () => {
   })
 
   it('drops alignment tabs and comments', () => {
-    expect(m('a & b')).toBe('a  b')
-    expect(m('a % comment')).toBe('a ')
+    expect(m('a & b')).toBe('a b')
+    expect(m('a % comment')).toBe('a')
   })
 
   it('never emits a raw #/$/backslash that would break out of $...$', () => {
@@ -85,7 +156,7 @@ describe('renderTypst — latexToTypstMath', () => {
 // ── inline mark rendering ────────────────────────────────────────────────────
 describe('renderTypst — marks', () => {
   it('renders bold/italic/underline/strike/sup/sub as Typst functions', () => {
-    expect(__test.wrapMark({ type: 'bold' }, 'x')).toBe('#text(weight: "bold")[x]')    // Italic on CJK: skew-synthesized slant wrapping an emph (Latin still italic).
+    expect(__test.wrapMark({ type: 'bold' }, 'x')).toBe('#text(weight: "bold", stroke: 0.02em)[x]')    // Italic on CJK: skew-synthesized slant wrapping an emph (Latin still italic).
     expect(__test.wrapMark({ type: 'italic' }, 'x')).toBe('#box(skew(ax: -12deg)[#emph[x]])')
     expect(__test.wrapMark({ type: 'underline' }, 'x')).toBe('#underline[x]')
     expect(__test.wrapMark({ type: 'strike' }, 'x')).toBe('#strike[x]')
@@ -125,7 +196,7 @@ describe('renderTypst — marks', () => {
     })
     expect(out).toContain('#raw("BoldCode")')
     expect(out).not.toContain('#raw("#text')
-    expect(out.startsWith('#text(weight: "bold")[')).toBe(true)
+    expect(out.startsWith('#text(weight: "bold", stroke: 0.02em)[')).toBe(true)
   })
 
   it('whitelists highlight/textStyle colours and sizes', () => {
@@ -173,6 +244,28 @@ describe('renderTypst — escaping', () => {
 describe('renderTypst — nodes', () => {
   it('renders headings by level', () => {
     expect(typ([{ type: 'heading', attrs: { level: 2 }, content: [text('H')] }])).toContain('== H')
+  })
+
+  it('pins a distinct font size per heading level in the preamble', () => {
+    // Regression: without explicit per-level sizing, Typst's default heading
+    // scale is nearly indistinguishable with a CJK body font, so H1..H6 all
+    // looked the same size in the exported PDF.
+    const out = typ([{ type: 'heading', attrs: { level: 1 }, content: [text('H')] }])
+    expect(out).toContain('#show heading.where(level: 1): set text(size: 22pt)')
+    expect(out).toContain('#show heading.where(level: 2): set text(size: 18pt)')
+    expect(out).toContain('#show heading.where(level: 6): set text(size: 11pt)')
+  })
+
+  it('inserts break opportunities into a long unbroken run so it does not overflow', () => {
+    // Regression: a 100-char `aaaa...` (or a long URL) will not break in a
+    // justified paragraph and runs off the right margin. escContent injects a
+    // zero-width space (U+200B) every 20 chars into runs of 40+ non-space chars.
+    const longWord = 'a'.repeat(100)
+    const out = typ([para([text(longWord)])])
+    expect(out).toContain('\u200B')
+    // A short word is left untouched (no stray break opportunities).
+    const shortOut = typ([para([text('hello')])])
+    expect(shortOut).not.toContain('\u200B')
   })
 
   it('renders bullet and ordered lists', () => {
@@ -262,5 +355,53 @@ describe('renderTypst — nodes', () => {
     expect(match).not.toBeNull()
     const trackCount = match![1]!.split(',').length
     expect(trackCount).toBeLessThanOrEqual(100)
+  })
+
+  it('clamps lopsided nested-table column widths so narrow columns are not crushed', () => {
+    // A nested table (rendered inside a cell) with page-scale, lopsided editor
+    // colwidths (e.g. an image column 600px vs 100/90px siblings) previously
+    // became 15fr/2.5fr/2.25fr (~75/13/12) and crushed columns 2 & 3 to slivers.
+    // The clamp bounds each column to [0.6, 1.6]x an equal share.
+    const wcell = (t: string, w: number) => ({
+      type: 'tableCell',
+      attrs: { colwidth: [w] },
+      content: [para([text(t)])],
+    })
+    const inner = {
+      type: 'table',
+      content: [
+        { type: 'tableRow', content: [wcell('a', 600), wcell('b', 100), wcell('c', 90)] },
+      ],
+    }
+    const out = typ([
+      {
+        type: 'table',
+        content: [
+          {
+            type: 'tableRow',
+            content: [
+              { type: 'tableCell', content: [para([text('x')])] },
+              { type: 'tableCell', content: [inner] },
+            ],
+          },
+        ],
+      },
+    ])
+    // The nested table's columns arg is the last one emitted.
+    const cols = [...out.matchAll(/columns: \(([^)]*)\)/g)].map((m) => m[1]!)
+    const innerCols = cols[cols.length - 1]!
+    const frs = innerCols
+      .split(',')
+      .map((s) => parseFloat(s.trim().replace('fr', '')))
+    expect(frs.length).toBe(3)
+    const n = frs.length
+    // Every column within [0.6, 1.6]x an equal (1fr) share.
+    for (const f of frs) {
+      expect(f).toBeGreaterThanOrEqual(0.6 - 0.01)
+      expect(f).toBeLessThanOrEqual(1.6 + 0.01)
+    }
+    // The widest column (a=600) hits the ceiling; the two narrow ones hit the floor.
+    expect(Math.max(...frs)).toBeCloseTo(1.6, 1)
+    expect(Math.min(...frs)).toBeCloseTo(0.6, 1)
   })
 })
