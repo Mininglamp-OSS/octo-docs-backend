@@ -60,6 +60,13 @@ export const COLLAB_FIELD = 'default'
  *         fetchedAt; data-url/data-title/data-description/data-image/
  *         data-site-name/data-fetched-at) — EXACTLY the link-card OG endpoint
  *         out-params (POST /docs/:docId/link-card).
+ *   - v16 fontFamily — ATTR on the `textStyle` mark, replicating the v7
+ *         fontSize path verbatim (no new mark/node). textStyle now carries the
+ *         v3 `color`, v7 `fontSize` and v16 `fontFamily` attrs, all riding the
+ *         inline `<span style="…">` serialization (font-family added after
+ *         color and font-size). SCHEMA_VERSION 16 is the shared front/back
+ *         contract for this feature — the octo-web @octo/docs-schema half
+ *         registers the SAME number; the backend does NOT self-assign.
  *
  * 14/15 land in the same lockstep as the frontend `@octo/docs-schema` /
  * SCHEMA-SPEC registration (node + attr byte alignment): the front-end Tiptap
@@ -69,7 +76,7 @@ export const COLLAB_FIELD = 'default'
  * horizontalRule + the marks above) use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization, consistent with the image/table nodes here.
  */
-export const SCHEMA_VERSION = 15
+export const SCHEMA_VERSION = 16
 
 /**
  * Shared attrs + DOM mapping for `tableCell` / `tableHeader` (SCHEMA-SPEC §4).
@@ -750,29 +757,33 @@ export function buildSchema(): Schema {
         },
       },
       textStyle: {
-        // v3 `color` + v7 `fontSize` ride on the same `textStyle` mark
-        // (@tiptap/extension-text-style + FontSize) -> <span style="color:…; font-size:…">.
-        attrs: { color: { default: null }, fontSize: { default: null } },
+        // v3 `color` + v7 `fontSize` + v16 `fontFamily` ride on the same
+        // `textStyle` mark (@tiptap/extension-text-style + FontSize + FontFamily)
+        // -> <span style="color:…; font-size:…; font-family:…">.
+        attrs: { color: { default: null }, fontSize: { default: null }, fontFamily: { default: null } },
         parseDOM: [
           {
             tag: 'span',
             getAttrs: (dom) => {
-              const el = dom as { style?: { color?: string; fontSize?: string } }
+              const el = dom as { style?: { color?: string; fontSize?: string; fontFamily?: string } }
               const color = el.style?.color || null
               const fontSize = el.style?.fontSize || null
-              // A plain `<span>` with neither color nor font-size must NOT match,
-              // or this mark would swallow every span on parse.
-              if (!color && !fontSize) return false
-              return { color, fontSize }
+              const fontFamily = el.style?.fontFamily || null
+              // A plain `<span>` with none of color / font-size / font-family must
+              // NOT match, or this mark would swallow every span on parse.
+              if (!color && !fontSize && !fontFamily) return false
+              return { color, fontSize, fontFamily }
             },
           },
         ],
         toDOM: (mark) => {
           const color = mark.attrs.color as string | null
           const fontSize = mark.attrs.fontSize as string | null
+          const fontFamily = mark.attrs.fontFamily as string | null
           const styles: string[] = []
           if (color) styles.push(`color: ${color}`)
           if (fontSize) styles.push(`font-size: ${fontSize}`)
+          if (fontFamily) styles.push(`font-family: ${fontFamily}`)
           return ['span', styles.length ? { style: styles.join('; ') } : {}, 0]
         },
       },

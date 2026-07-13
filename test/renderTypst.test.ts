@@ -218,6 +218,30 @@ describe('renderTypst — marks', () => {
     expect(ts).toContain('size: 12.00pt') // 16px * 0.75
   })
 
+  it('whitelists the v16 textStyle fontFamily into a Typst font: argument', () => {
+    // A single named family becomes a quoted string; a comma list becomes a tuple
+    // with the generic CSS keyword (sans-serif/serif/…) dropped.
+    const single = __test.wrapMark({ type: 'textStyle', attrs: { fontFamily: 'Georgia' } }, 'x')
+    expect(single).toBe('#text(font: "Georgia")[x]')
+    const list = __test.wrapMark({ type: 'textStyle', attrs: { fontFamily: 'Inter, sans-serif' } }, 'x')
+    expect(list).toBe('#text(font: "Inter")[x]')
+    const multi = __test.wrapMark({ type: 'textStyle', attrs: { fontFamily: '"Helvetica Neue", Arial, sans-serif' } }, 'x')
+    expect(multi).toBe('#text(font: ("Helvetica Neue", "Arial"))[x]')
+    // Font + size + colour compose in one #text() call.
+    const combined = __test.wrapMark(
+      { type: 'textStyle', attrs: { color: 'red', fontSize: '16px', fontFamily: 'Inter' } },
+      'x',
+    )
+    expect(combined).toBe('#text(fill: red, size: 12.00pt, font: "Inter")[x]')
+  })
+
+  it('cssFontFamilyToTypst drops unsafe/generic-only families (no injection)', () => {
+    expect(__test.cssFontFamilyToTypst('Inter')).toBe('"Inter"')
+    expect(__test.cssFontFamilyToTypst('sans-serif')).toBeNull()
+    expect(__test.cssFontFamilyToTypst('Arial"); #set page(')).toBeNull()
+    expect(__test.cssFontFamilyToTypst('')).toBeNull()
+  })
+
   it('cssColorToTypst rejects unknown/dangerous values', () => {
     expect(__test.cssColorToTypst('#abc')).toBe('rgb("#abc")')
     expect(__test.cssColorToTypst('rgb(1,2,3)')).toBe('rgb(1, 2, 3)')

@@ -253,6 +253,44 @@ function cssFontSizeToTypst(v: string): string | null {
   }
 }
 
+/**
+ * Whitelisted CSS font-family list -> Typst `font:` argument. Mirrors the
+ * font-size whitelist: each comma-separated family is trimmed of surrounding
+ * quotes and accepted only if it is a plain family name (letters/digits/spaces/
+ * hyphens/underscores) — generic CSS keywords (serif/sans-serif/monospace/…)
+ * and anything with unsafe characters are dropped so nothing can break Typst
+ * syntax. Returns a quoted single name, a `("A", "B")` tuple, or null when no
+ * family survives the whitelist.
+ */
+const GENERIC_CSS_FAMILIES = new Set([
+  'serif',
+  'sans-serif',
+  'monospace',
+  'cursive',
+  'fantasy',
+  'system-ui',
+  'ui-serif',
+  'ui-sans-serif',
+  'ui-monospace',
+  'ui-rounded',
+  'inherit',
+  'initial',
+  'unset',
+])
+
+function cssFontFamilyToTypst(v: string): string | null {
+  const names: string[] = []
+  for (const raw of v.split(',')) {
+    const name = raw.trim().replace(/^['"]|['"]$/g, '').trim()
+    if (!name || GENERIC_CSS_FAMILIES.has(name.toLowerCase())) continue
+    if (!/^[A-Za-z0-9 _-]+$/.test(name)) continue
+    names.push(name)
+  }
+  if (names.length === 0) return null
+  if (names.length === 1) return `"${names[0]}"`
+  return `(${names.map((n) => `"${n}"`).join(', ')})`
+}
+
 // ── LaTeX -> Typst math conversion ────────────────────────────────────
 /**
  * Convert a LaTeX math expression to Typst math syntax. Typst native math uses
@@ -910,6 +948,10 @@ function wrapMark(mark: PMMark, inner: string): string {
         const sz = cssFontSizeToTypst(String(attrs.fontSize))
         if (sz) args.push(`size: ${sz}`)
       }
+      if (attrs.fontFamily != null) {
+        const font = cssFontFamilyToTypst(String(attrs.fontFamily))
+        if (font) args.push(`font: ${font}`)
+      }
       return args.length ? `#text(${args.join(', ')})[${inner}]` : inner
     }
     case 'link': {
@@ -1437,4 +1479,4 @@ export function renderTypst(pmJson: unknown, opts: RenderTypstOptions): string {
 }
 
 // Exposed for unit tests only.
-export const __test = { latexToTypstMath, wrapMark, cssColorToTypst, cssFontSizeToTypst, isSafeHref, renderTypstNode: renderNode, renderTextNode, escMathLiteral, escContent, insertSoftBreaks }
+export const __test = { latexToTypstMath, wrapMark, cssColorToTypst, cssFontSizeToTypst, cssFontFamilyToTypst, isSafeHref, renderTypstNode: renderNode, renderTextNode, escMathLiteral, escContent, insertSoftBreaks }

@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest'
 import { buildSchema, SCHEMA_VERSION } from '../src/schema/index.js'
 
 describe('Schema v4 nodes (SCHEMA-SPEC §4: table/tableRow/tableCell/tableHeader)', () => {
-  it('keeps SCHEMA_VERSION at the current value (now 15 after the v15 co-land; v4 tables carried)', () => {
-    expect(SCHEMA_VERSION).toBe(15)
+  it('keeps SCHEMA_VERSION at the current value (now 16 after the v16 co-land; v4 tables carried)', () => {
+    expect(SCHEMA_VERSION).toBe(16)
   })
 
   it('exposes the v4 table nodes', () => {

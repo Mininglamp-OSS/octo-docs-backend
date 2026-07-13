@@ -54,8 +54,8 @@ const SCHEMA_MARKS = [
 ] as const
 
 describe('Schema v15 co-land (full @octo/docs-schema parity)', () => {
-  it('reports SCHEMA_VERSION === 15', () => {
-    expect(SCHEMA_VERSION).toBe(15)
+  it('reports SCHEMA_VERSION === 16 (v16 co-land carries the full v15 set forward)', () => {
+    expect(SCHEMA_VERSION).toBe(16)
   })
 
   it('defines every front-end SCHEMA_NODES name', () => {
@@ -72,10 +72,10 @@ describe('Schema v15 co-land (full @octo/docs-schema parity)', () => {
     }
   })
 
-  it('carries the textStyle mark with BOTH the v3 color and v7 fontSize attrs', () => {
+  it('carries the textStyle mark with the v3 color, v7 fontSize and v16 fontFamily attrs', () => {
     const ts = buildSchema().marks.textStyle
     const m = ts.create({ color: '#abc', fontSize: '18px' })
-    expect(m.attrs).toEqual({ color: '#abc', fontSize: '18px' })
+    expect(m.attrs).toEqual({ color: '#abc', fontSize: '18px', fontFamily: null })
   })
 
   // The real proof: a front-end-authored v15 document containing the custom
@@ -157,7 +157,7 @@ describe('Schema v15 co-land (full @octo/docs-schema parity)', () => {
               text: 'styled',
               // Ordered by schema mark rank so the round-trip is order-stable.
               marks: [
-                { type: 'textStyle', attrs: { color: 'rgb(1, 2, 3)', fontSize: '14px' } },
+                { type: 'textStyle', attrs: { color: 'rgb(1, 2, 3)', fontSize: '14px', fontFamily: null } },
                 { type: 'underline', attrs: {} },
                 { type: 'superscript', attrs: {} },
               ],
@@ -372,7 +372,7 @@ describe('Schema v15 co-land (full @octo/docs-schema parity)', () => {
             {
               type: 'text',
               text: 'big',
-              marks: [{ type: 'textStyle', attrs: { color: null, fontSize: '32px' } }],
+              marks: [{ type: 'textStyle', attrs: { color: null, fontSize: '32px', fontFamily: null } }],
             },
           ],
         },
