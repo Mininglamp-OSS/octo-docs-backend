@@ -27,7 +27,7 @@ import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { editDocSheet } from '../services/editDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
 import { decodeSheetSnapshot, decodeSheetDimsSnapshot } from '../../collab/versionRestore.js'
-import { SheetSnapshotInvalidError, type SheetCell } from '../../agent/sheetConversion.js'
+import { SheetSnapshotInvalidError, type SheetCell, type StoredDrawing } from '../../agent/sheetConversion.js'
 import {
   decodeSheetCursor,
   encodeSheetCursor,
@@ -277,14 +277,15 @@ function readBaseVersion(req: Request): string | null {
 
 /**
  * A cell-edit batch: `{ cellKey: {v,f,s} | null }` (null = delete the cell).
- * Structural (shape-only) validation — a non-object, empty, or array batch is a
- * 400. Contract-level validation of each cell ({v,f,s} field types, key shape)
- * is deferred to validateSheetCellBatch in the service, which maps to 422.
+ * Structural (shape-only) validation — a non-object or array batch is a 400. An
+ * empty object is allowed HERE (the handler separately requires that cells+dims
+ * are not BOTH empty, so a dims-only edit may omit cells); contract-level
+ * validation of each cell ({v,f,s} field types, key shape) is deferred to
+ * validateSheetCellBatch in the service, which maps to 422.
  */
 function validateCellsShape(cells: unknown): cells is Record<string, SheetCell | null> {
   if (!cells || typeof cells !== 'object' || Array.isArray(cells)) return false
   const entries = Object.entries(cells as Record<string, unknown>)
-  if (entries.length === 0) return false
   return entries.every(([, v]) => v === null || (typeof v === 'object' && !Array.isArray(v)))
 }
 
@@ -313,6 +314,63 @@ function checkCellsBounds(
   return null
 }
 
+/**
+ * A dims-edit batch: `{ dimKey: number | null }` (null = delete the dim).
+ * Structural (shape-only) validation — a non-object or array batch is a 400. An
+ * empty object is allowed HERE (the handler separately requires that cells+dims
+ * are not BOTH empty); contract-level validation of each key/value (`c<idx>`/
+ * `r<idx>` shape, positive-finite px) is deferred to validateSheetDimBatch in the
+ * service, which maps to 422.
+ */
+function validateDimsShape(dims: unknown): dims is Record<string, number | null> {
+  if (!dims || typeof dims !== 'object' || Array.isArray(dims)) return false
+  return Object.values(dims as Record<string, unknown>).every(
+    (v) => v === null || typeof v === 'number',
+  )
+}
+
+/**
+ * Fail-fast dims count bound (DoS gate), mirroring checkCellsBounds. A dims value
+ * is a single number so there is no per-entry payload cap; only the count is
+ * bounded, reusing the sheet-write maxCells budget. Returns the error to send, or
+ * null when within bounds.
+ */
+function checkDimsBounds(
+  dims: Record<string, number | null>,
+): { status: number; error: string } | null {
+  if (Object.keys(dims).length > config.sheetWrite.maxCells) {
+    return { status: 413, error: 'too_many_cells' }
+  }
+  return null
+}
+
+/**
+ * A drawings-edit batch: `{ "${sheetId}!${drawingId}": <ISheetImage> | null }`
+ * (null = delete). Shape-only: a non-object or array batch is a 400; each value
+ * must be null or a plain object. Contract validation (key shape, drawingId
+ * match) is deferred to validateSheetDrawingBatch in the service → 422.
+ */
+function validateDrawingsShape(drawings: unknown): drawings is Record<string, StoredDrawing | null> {
+  if (!drawings || typeof drawings !== 'object' || Array.isArray(drawings)) return false
+  return Object.values(drawings as Record<string, unknown>).every(
+    (v) => v === null || (typeof v === 'object' && !Array.isArray(v)),
+  )
+}
+
+/**
+ * Fail-fast drawings count bound (DoS gate), mirroring checkDimsBounds. Per-drawing
+ * byte size is not capped here (an image's inline base64 is legitimately large);
+ * the total is bounded downstream by the maxDocBytes gate in editDocSheet.
+ */
+function checkDrawingsBounds(
+  drawings: Record<string, StoredDrawing | null>,
+): { status: number; error: string } | null {
+  if (Object.keys(drawings).length > config.sheetWrite.maxCells) {
+    return { status: 413, error: 'too_many_cells' }
+  }
+  return null
+}
+
 // ── PATCH /:docId/sheet — batch cell edit (writer) ────────────────────────────
 docSheetRouter.patch('/:docId/sheet', patchDocSheetHandler)
 
@@ -329,13 +387,30 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     res.status(400).json({ error: 'invalid_body' })
     return
   }
-  const cells = (req.body ?? {}).cells
-  if (!validateCellsShape(cells)) {
+  // Default ONLY an absent (undefined) surface to {}. An explicit `null` (or any
+  // non-object) must fall through to the shape check below and be rejected as
+  // invalid_body — coercing null → {} here would silently accept a malformed
+  // body, contradicting the "non-object/array → 400" contract.
+  const body = (req.body ?? {}) as Record<string, unknown>
+  const cells = body.cells === undefined ? {} : body.cells
+  const dims = body.dims === undefined ? {} : body.dims
+  const drawings = body.drawings === undefined ? {} : body.drawings
+  if (!validateCellsShape(cells) || !validateDimsShape(dims) || !validateDrawingsShape(drawings)) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+  // An edit that changes nothing is a no-op — reject ALL-empty as invalid_body
+  // (a cells-only / dims-only / drawings-only edit is fine; surfaces are independent).
+  if (
+    Object.keys(cells).length === 0 &&
+    Object.keys(dims).length === 0 &&
+    Object.keys(drawings).length === 0
+  ) {
     res.status(400).json({ error: 'invalid_body' })
     return
   }
   // Fail-fast request-shape bounds (DoS gate) before any batch validation.
-  const bounds = checkCellsBounds(cells)
+  const bounds = checkCellsBounds(cells) ?? checkDimsBounds(dims) ?? checkDrawingsBounds(drawings)
   if (bounds) {
     res.status(bounds.status).json({ error: bounds.error })
     return
@@ -348,6 +423,8 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       documentName: guard.meta.document_name,
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       cells,
+      dims,
+      drawings,
       authorizedEpoch: guard.meta.permission_epoch,
     })
     if (result.ok) {

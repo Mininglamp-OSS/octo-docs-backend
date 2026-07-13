@@ -31,6 +31,14 @@ export const SHEET_YMAP_FIELD = 'sheet'
 export const SHEET_DIMS_FIELD = 'sheetDims'
 
 /**
+ * Y.Map field for floating images / drawings, keyed `${sheetId}!${drawingId}`
+ * (matches octo-web binding.ts SHEET_DRAWINGS_FIELD). Each value is a serialized
+ * Univer ISheetImage (opaque here — inline base64 `source`, transform, cell
+ * anchor). The bot write surface lets a bot insert/remove a floating image.
+ */
+export const SHEET_DRAWINGS_FIELD = 'sheetDrawings'
+
+/**
  * Cell shape synced in V1: value, optional formula, optional resolved style, and
  * the two rich-cell fields the live editor also syncs.
  *
@@ -53,6 +61,11 @@ export interface SheetCell {
   v?: string | number | boolean | null
   f?: string
   s?: Record<string, unknown>
+  // Univer also carries `p` (a rich-text cell snapshot — an inline CELL IMAGE
+  // rides here as `p.drawings[id].source`) and `t` (cell type; 1 = rich text).
+  // The web (Univer) writes these on image / rich cells, so they MUST round-trip
+  // through the bot API or a human-edited sheet fails to read (409) / loses its
+  // images on a bot write. Treated as opaque (like `s`) — see validateSheetCell.
   p?: Record<string, unknown>
   t?: number
 }
@@ -146,6 +159,8 @@ export function validateSheetCell(key: unknown, value: unknown): SheetCell {
     }
     out.s = s as Record<string, unknown>
   }
+  // `p` (rich-text snapshot / inline image) is opaque, treated exactly like `s`:
+  // a plain object, preserved verbatim so a human-authored image cell round-trips.
   if ('p' in rec) {
     const p = rec.p
     if (p === null || typeof p !== 'object' || Array.isArray(p)) {
@@ -288,6 +303,124 @@ export function applySheetCellsToYMap(
   for (const [key, cell] of toSet) ymap.set(key, cell)
 }
 
+export interface SheetDimBatch {
+  toDelete: string[]
+  toSet: Array<[string, number]>
+}
+
+/**
+ * Validate a whole `{ key: number|null }` dims edit batch WITHOUT mutating,
+ * fail-closed. A null value is a deletion (key-shape-checked so a malformed key
+ * cannot be smuggled in); any other value is validated against the dims contract
+ * (`c<idx>`/`r<idx>` key, positive finite px <= MAX_DIM_PX). The dims counterpart
+ * of validateSheetCellBatch — one source of truth for the dims contract, shared
+ * by the HTTP write path's no-lock pre-flight and the live mutation.
+ */
+export function validateSheetDimBatch(dims: Record<string, number | null>): SheetDimBatch {
+  const toDelete: string[] = []
+  const toSet: Array<[string, number]> = []
+  for (const [key, val] of Object.entries(dims)) {
+    if (val == null) {
+      if (typeof key === 'string' && DIMS_KEY_RE.test(key)) toDelete.push(key)
+      else throw new SheetSnapshotInvalidError(`delete: invalid dims key ${String(key).slice(0, 64)}`)
+    } else {
+      toSet.push([key, validateSheetDim(key, val)])
+    }
+  }
+  return { toDelete, toSet }
+}
+
+/**
+ * Pure mutation applied INSIDE a Yjs transaction (live doc or transient). A null
+ * value deletes the dims key; otherwise it is set. Validate-all-then-apply
+ * (mirrors applySheetCellsToYMap) so a mixed { valid, invalid } batch never
+ * half-applies.
+ */
+export function applySheetDimsToYMap(
+  ymap: Y.Map<number>,
+  dims: Record<string, number | null>,
+): void {
+  const { toDelete, toSet } = validateSheetDimBatch(dims)
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, px] of toSet) ymap.set(key, px)
+}
+
+/** A serialized Univer floating image/drawing. Opaque beyond `drawingId` — it
+ * carries transform / cell-anchor / inline base64 `source`; we store it verbatim
+ * (like a cell's `s`/`p`) so it round-trips to the web binding. */
+export interface StoredDrawing {
+  drawingId: string
+  [k: string]: unknown
+}
+
+export interface SheetDrawingBatch {
+  toDelete: string[]
+  toSet: Array<[string, StoredDrawing]>
+}
+
+/** Canonical drawing-key shape: `${sheetId}!${drawingId}` (drawingId alnum/-/_). */
+const DRAWING_KEY_RE = /^[^!]{1,64}![A-Za-z0-9_-]{1,64}$/
+
+/**
+ * Validate a single raw drawing key + value. Fail-closed. The value is kept
+ * opaque (a Univer ISheetImage — transform / source / anchor) EXCEPT `drawingId`,
+ * which must be a non-empty string equal to the key's drawingId segment (so a
+ * hostile key can't point at a different id). Returns the object verbatim.
+ */
+export function validateSheetDrawing(key: unknown, value: unknown): StoredDrawing {
+  if (typeof key !== 'string' || !DRAWING_KEY_RE.test(key)) {
+    throw new SheetSnapshotInvalidError(
+      `drawing key does not match ${'${sheetId}!${drawingId}'}: ${String(key).slice(0, 64)}`,
+    )
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new SheetSnapshotInvalidError(`drawing ${key}: value is not a plain object`)
+  }
+  const rec = value as Record<string, unknown>
+  const keyDrawingId = key.slice(key.indexOf('!') + 1)
+  if (typeof rec.drawingId !== 'string' || rec.drawingId !== keyDrawingId) {
+    throw new SheetSnapshotInvalidError(
+      `drawing ${key}: drawingId must be the string "${keyDrawingId}" (key segment)`,
+    )
+  }
+  return rec as StoredDrawing
+}
+
+/**
+ * Validate a whole `{ key: drawing|null }` batch WITHOUT mutating, fail-closed.
+ * null = delete (key-shape-checked); else validated via validateSheetDrawing.
+ * The drawings counterpart of validateSheetDimBatch.
+ */
+export function validateSheetDrawingBatch(
+  drawings: Record<string, StoredDrawing | null>,
+): SheetDrawingBatch {
+  const toDelete: string[] = []
+  const toSet: Array<[string, StoredDrawing]> = []
+  for (const [key, val] of Object.entries(drawings)) {
+    if (val == null) {
+      if (typeof key === 'string' && DRAWING_KEY_RE.test(key)) toDelete.push(key)
+      else throw new SheetSnapshotInvalidError(`delete: invalid drawing key ${String(key).slice(0, 64)}`)
+    } else {
+      toSet.push([key, validateSheetDrawing(key, val)])
+    }
+  }
+  return { toDelete, toSet }
+}
+
+/**
+ * Pure mutation applied INSIDE a Yjs transaction. A null value deletes the
+ * drawing; otherwise it is set. Validate-all-then-apply (mirrors the cell/dim
+ * appliers) so a mixed batch never half-applies.
+ */
+export function applySheetDrawingsToYMap(
+  ymap: Y.Map<StoredDrawing>,
+  drawings: Record<string, StoredDrawing | null>,
+): void {
+  const { toDelete, toSet } = validateSheetDrawingBatch(drawings)
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, d] of toSet) ymap.set(key, d)
+}
+
 /**
  * Measure the sheet AFTER applying an edit batch, the two ways its downstream
  * caps are enforced, so the write path can reject an oversized result in its
@@ -312,16 +445,26 @@ export function applySheetCellsToYMap(
 export function measureSheetAfterEdit(
   preEditState: Uint8Array,
   cells: Record<string, SheetCell | null>,
+  dims: Record<string, number | null> = {},
+  drawings: Record<string, StoredDrawing | null> = {},
 ): { docBytes: number; payloadBytes: number } {
   const scratch = new Y.Doc()
   Y.applyUpdate(scratch, preEditState)
   const ymap = scratch.getMap<SheetCell>(SHEET_YMAP_FIELD)
+  const dimsMap = scratch.getMap<number>(SHEET_DIMS_FIELD)
+  const drawingMap = scratch.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD)
   // Apply the batch exactly as the live commit will (validate-all-then-apply), so
   // the measured post-edit doc matches what commitLiveSheetEdit would persist.
-  scratch.transact(() => applySheetCellsToYMap(ymap, cells))
+  scratch.transact(() => {
+    applySheetCellsToYMap(ymap, cells)
+    applySheetDimsToYMap(dimsMap, dims)
+    applySheetDrawingsToYMap(drawingMap, drawings)
+  })
   const docBytes = Y.encodeStateAsUpdate(scratch).length
-  // Decode + validate BOTH synced maps exactly as GET does (decodeSheetSnapshot /
+  // Decode + validate the READ maps exactly as GET does (decodeSheetSnapshot /
   // decodeSheetDimsSnapshot) so payloadBytes is byte-identical to the read body.
+  // NOTE: drawings are NOT part of the GET payload (their inline base64 would blow
+  // the read cap); they only grow docBytes, which the maxDocBytes gate bounds.
   const rawCells: Record<string, unknown> = {}
   for (const [key, val] of scratch.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
   const rawDims: Record<string, unknown> = {}
