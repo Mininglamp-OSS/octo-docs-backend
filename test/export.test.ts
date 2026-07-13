@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { collectReferencedAttachIds, isSupportedImage, sniffImageExt } from '../src/api/routes/export.js'
+import {
+  collectReferencedAttachIds,
+  collectFormulaLatex,
+  probeFailingFormulas,
+  isSupportedImage,
+  sniffImageExt,
+} from '../src/api/routes/export.js'
 
 // The PDF export must only download images the document actually references,
 // never the full attachment list (a doc can carry orphaned/unreferenced
@@ -93,5 +99,64 @@ describe('sniffImageExt', () => {
     expect(sniffImageExt(Buffer.from('not an image'))).toBeNull()
     expect(sniffImageExt(Buffer.from([0x89, 0x50]))).toBeNull()
     expect(sniffImageExt(Buffer.alloc(0))).toBeNull()
+  })
+})
+
+// The per-formula fallback isolates a broken formula after a whole-document
+// compile failure. collectFormulaLatex must surface exactly the unique formula
+// strings (any nesting depth) so probing has the right candidate set.
+describe('collectFormulaLatex', () => {
+  it('collects unique inline/block math latex at any depth', () => {
+    const doc = {
+      type: 'doc',
+      content: [
+        { type: 'blockMath', attrs: { latex: 'a^2 + b^2' } },
+        { type: 'paragraph', content: [{ type: 'inlineMath', attrs: { latex: '\\pi' } }] },
+        {
+          type: 'callout',
+          content: [{ type: 'paragraph', content: [{ type: 'inlineMath', attrs: { latex: 'a^2 + b^2' } }] }],
+        },
+        { type: 'paragraph', content: [{ type: 'text', text: 'no math' }] },
+      ],
+    }
+    expect(new Set(collectFormulaLatex(doc))).toEqual(new Set(['a^2 + b^2', '\\pi']))
+  })
+
+  it('ignores math nodes without a non-empty latex string', () => {
+    const doc = {
+      type: 'doc',
+      content: [
+        { type: 'blockMath', attrs: { latex: '' } },
+        { type: 'blockMath', attrs: {} },
+        { type: 'inlineMath', attrs: { latex: 'x' } },
+      ],
+    }
+    expect(collectFormulaLatex(doc)).toEqual(['x'])
+  })
+})
+
+// The probe compiles each formula in isolation and MUST stay bounded: it holds
+// a scarce compile slot, so an unbounded probe over thousands of formulas is a
+// DoS. These tests assert the count/budget guards short-circuit before spawning
+// any compile, which is the security-relevant invariant (they do not depend on
+// a real `typst` binary being present).
+describe('probeFailingFormulas — bounding', () => {
+  it('abandons probing (exhausted) without compiling when the formula count exceeds the cap', async () => {
+    const many = Array.from({ length: 100 }, (_, i) => `x_${i}`)
+    const { failing, exhausted } = await probeFailingFormulas(many, 't', { maxProbes: 40, budgetMs: 15_000 })
+    // Over the cap -> bail out immediately, no formula marked, defer to whole-doc verbatim.
+    expect(exhausted).toBe(true)
+    expect(failing.size).toBe(0)
+  })
+
+  it('does not exhaust for an empty formula set', async () => {
+    const { failing, exhausted } = await probeFailingFormulas([], 't', { maxProbes: 40, budgetMs: 15_000 })
+    expect(exhausted).toBe(false)
+    expect(failing.size).toBe(0)
+  })
+
+  it('treats a zero probe budget as immediately exhausted', async () => {
+    const { exhausted } = await probeFailingFormulas(['a', 'b'], 't', { maxProbes: 0, budgetMs: 15_000 })
+    expect(exhausted).toBe(true)
   })
 })
