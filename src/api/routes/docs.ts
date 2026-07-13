@@ -10,6 +10,8 @@ import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
 import { buildWhiteboardName, WhiteboardNameError } from '../../whiteboard/schema/index.js'
 import { newDocId } from '../../util/ids.js'
+import { buildDocShareUrl } from '../../util/docShareLink.js'
+import { config } from '../../config/env.js'
 import { requireDocRole } from '../guard.js'
 
 export const docsRouter = Router()
@@ -118,6 +120,9 @@ export async function createDocHandler(req: Request, res: Response) {
     docType: resolvedDocType,
     role: 'admin',
     createdAt: meta?.created_at,
+    // Canonical browser-facing link a caller can pass straight to chat. See
+    // buildDocShareUrl / config.webOrigin.
+    shareUrl: buildDocShareUrl(config.webOrigin, docId, spaceId),
   })
 }
 
@@ -141,6 +146,9 @@ export async function getDocHandler(req: Request, res: Response) {
     role,
     createdAt: meta.created_at,
     updatedAt: meta.updated_at,
+    // Canonical browser-facing link a caller can pass straight to chat. See
+    // buildDocShareUrl / config.webOrigin.
+    shareUrl: buildDocShareUrl(config.webOrigin, meta.doc_id, meta.space_id),
     ...(meta.permission_epoch != null ? { permissionEpoch: meta.permission_epoch } : {}),
   })
 }
