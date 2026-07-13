@@ -63,9 +63,10 @@ import type { Node as PMNode } from 'prosemirror-model'
 export function reconcileRestoreOntoDoc(doc: Y.Doc, targetPMDoc: PMNode, targetState: Uint8Array): void {
   const fragment = doc.getXmlFragment(COLLAB_FIELD)
   reconcileFragment(targetPMDoc, fragment)
-  // Spreadsheet cells + dims live in their own Y.Maps, not the fragment — restore
-  // them onto the same live doc so connected clients converge on the restored
-  // grid. No-op for a text document (it has no 'sheet' map).
+  // Spreadsheet cells + dims + drawings (floating images) live in their own
+  // Y.Maps, not the fragment — restore all three onto the same live doc so
+  // connected clients converge on the restored grid. No-op for a text document
+  // (it has no 'sheet' map). reconcileSheetMap reconciles all three surfaces.
   reconcileSheetMap(doc, targetState)
   // Advance the base-version token so a delete-only restore is still detected by
   // the read cursor / write guards (see the doc comment above).

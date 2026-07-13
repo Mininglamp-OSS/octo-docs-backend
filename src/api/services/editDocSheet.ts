@@ -30,9 +30,12 @@ import { readLiveSheet, commitLiveSheetEdit } from '../../collab/liveSheetWrite.
 import { encodeBaseVersion, stateVectorsEqual, BaseVersionStaleError } from '../../collab/docBodyEdit.js'
 import {
   validateSheetCellBatch,
+  validateSheetDimBatch,
+  validateSheetDrawingBatch,
   measureSheetAfterEdit,
   SheetSnapshotInvalidError,
   type SheetCell,
+  type StoredDrawing,
 } from '../../agent/sheetConversion.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
@@ -46,6 +49,10 @@ export interface EditDocSheetInput {
   clientBaseVersion: Uint8Array
   /** Keyed cells to set; a null value deletes that cell. */
   cells: Record<string, SheetCell | null>
+  /** Keyed dims (`c<idx>`/`r<idx>` -> px) to set; a null value deletes that dim. */
+  dims: Record<string, number | null>
+  /** Keyed drawings (`${sheetId}!${drawingId}` -> ISheetImage) to set; null deletes. */
+  drawings: Record<string, StoredDrawing | null>
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
 }
@@ -96,9 +103,11 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
   }
 
   // contract check: surface 422 sheet_cell_invalid fail-fast, before any lock or
-  // live write, using the SAME validator the live mutation runs.
+  // live write, using the SAME validators the live mutation runs (cells + dims).
   try {
     validateSheetCellBatch(input.cells)
+    validateSheetDimBatch(input.dims)
+    validateSheetDrawingBatch(input.drawings)
   } catch (err) {
     const mapped = mapEditError(err)
     if (mapped) return { ok: false, ...mapped }
@@ -115,7 +124,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
   // chained PATCH→PATCH could grow the sheet past the read cap into a
   // write-but-not-readable state (GET permanently 413s). No lock is held yet, so a
   // rejection here leaves no snapshot row and no live side effect.
-  const { docBytes, payloadBytes } = measureSheetAfterEdit(preEditState, input.cells)
+  const { docBytes, payloadBytes } = measureSheetAfterEdit(preEditState, input.cells, input.dims, input.drawings)
   // Align the write cap to the read cap so a written sheet is always GET-readable.
   // Report payloadBytes/limit (the read-payload dimension) so the write-gate 413
   // carries the SAME observability field the read gate emits (docSheet.ts).
@@ -182,6 +191,8 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       input.uid,
       input.clientBaseVersion,
       input.cells,
+      input.dims,
+      input.drawings,
     )
     bytes = committed.bytes
     newSV = committed.newSV

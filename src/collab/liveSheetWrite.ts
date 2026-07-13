@@ -15,7 +15,7 @@
 import type { Document } from '@hocuspocus/server'
 import * as Y from 'yjs'
 import { getCollabServer } from './server.js'
-import { applySheetCellsToYMap, SHEET_YMAP_FIELD, type SheetCell } from '../agent/sheetConversion.js'
+import { validateSheetCellBatch, validateSheetDimBatch, validateSheetDrawingBatch, SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, type SheetCell, type StoredDrawing } from '../agent/sheetConversion.js'
 import { advanceEditVersion } from './liveDocWrite.js'
 import { stateVectorsEqual, BaseVersionStaleError } from './docBodyEdit.js'
 
@@ -82,6 +82,8 @@ export async function commitLiveSheetEdit(
   uid: string,
   clientBaseVersion: Uint8Array,
   cells: Record<string, SheetCell | null>,
+  dims: Record<string, number | null> = {},
+  drawings: Record<string, StoredDrawing | null> = {},
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
   const server = getCollabServer()
   const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
@@ -95,11 +97,26 @@ export async function commitLiveSheetEdit(
       if (!stateVectorsEqual(clientBaseVersion, currentSV)) {
         throw new BaseVersionStaleError()
       }
-      // (2) The single, last content mutation. applySheetCellsToYMap validates
-      //     the whole batch fail-closed BEFORE it mutates, so a bad cell throws
-      //     here (SheetSnapshotInvalidError) with nothing written.
+      // (2) The single, last content mutation. Validate ALL THREE batches FIRST
+      //     (validate* return the split batches without mutating), THEN apply —
+      //     so a bad dim/drawing can't leave cells half-applied. Yjs does NOT roll
+      //     back a thrown transact callback and disconnect flushes onStore, so a
+      //     per-map validate-then-mutate would broadcast a partial write on a
+      //     mixed { good cells, bad dim } batch. Cross-map atomicity requires the
+      //     validate-all-then-apply-all shape here (each apply* alone is only
+      //     atomic within its own map).
+      const cellBatch = validateSheetCellBatch(cells)
+      const dimBatch = validateSheetDimBatch(dims)
+      const drawingBatch = validateSheetDrawingBatch(drawings)
       const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
-      applySheetCellsToYMap(ymap, cells)
+      for (const key of cellBatch.toDelete) ymap.delete(key)
+      for (const [key, cell] of cellBatch.toSet) ymap.set(key, cell)
+      const dimsMap = doc.getMap<number>(SHEET_DIMS_FIELD)
+      for (const key of dimBatch.toDelete) dimsMap.delete(key)
+      for (const [key, px] of dimBatch.toSet) dimsMap.set(key, px)
+      const drawingMap = doc.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD)
+      for (const key of drawingBatch.toDelete) drawingMap.delete(key)
+      for (const [key, d] of drawingBatch.toSet) drawingMap.set(key, d)
       // (3) Advance the edit-version counter so a delete-only batch also moves
       //     the state vector forward; the token is read AFTER this bump.
       advanceEditVersion(doc)

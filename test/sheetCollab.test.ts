@@ -16,6 +16,7 @@ import * as Y from 'yjs'
 import {
   SHEET_YMAP_FIELD,
   SHEET_DIMS_FIELD,
+  SHEET_DRAWINGS_FIELD,
   sheetCellKey,
   yDocStateToSheetCells,
   applySheetCellsToYMap,
@@ -23,8 +24,10 @@ import {
   validateSheetCells,
   validateSheetDim,
   validateSheetDims,
+  validateSheetDrawing,
   SheetSnapshotInvalidError,
   type SheetCell,
+  type StoredDrawing,
 } from '../src/agent/sheetConversion.js'
 import {
   decodeSheetSnapshot,
@@ -33,6 +36,7 @@ import {
   decodeTargetSnapshot,
   SHEET_YMAP_FIELD as RESTORE_SHEET_FIELD,
   SHEET_DIMS_FIELD as RESTORE_DIMS_FIELD,
+  SHEET_DRAWINGS_FIELD as RESTORE_DRAWINGS_FIELD,
 } from '../src/collab/versionRestore.js'
 import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
 import { advanceEditVersion } from '../src/collab/liveDocWrite.js'
@@ -479,6 +483,111 @@ describe('versionRestore — sheetDims decode + restore (P1: full-grid restore)'
     )
     // fail-closed: live dims + cells unchanged (no half-restore)
     expect(live.getMap<number>(SHEET_DIMS_FIELD).get('c0')).toBe(120)
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'safe' })
+  })
+})
+
+/** A minimal well-formed drawing whose drawingId matches what the key will carry. */
+function drawing(id: string, source = 'data:image/png;base64,AAAA'): StoredDrawing {
+  return { drawingId: id, drawingType: 0, imageSourceType: 'BASE64', source }
+}
+
+/** Build a Y.Doc state carrying sheetDrawings (+ optional cells/dims). */
+function drawingsState(
+  drawings: Record<string, StoredDrawing>,
+  cells: Record<string, SheetCell> = {},
+  dims: Record<string, number> = {},
+): Uint8Array {
+  const doc = new Y.Doc()
+  doc.transact(() => {
+    const cellMap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    for (const [k, v] of Object.entries(cells)) cellMap.set(k, v)
+    const dimMap = doc.getMap<number>(SHEET_DIMS_FIELD)
+    for (const [k, v] of Object.entries(dims)) dimMap.set(k, v)
+    const drawMap = doc.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD)
+    for (const [k, v] of Object.entries(drawings)) drawMap.set(k, v)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+describe('sheetConversion — validateSheetDrawing (fail-closed key + drawingId contract)', () => {
+  it('accepts a well-formed drawing whose drawingId equals the key segment', () => {
+    const d = drawing('img1')
+    expect(validateSheetDrawing('default!img1', d)).toBe(d)
+  })
+
+  it('rejects a bad key shape (no sheetId! prefix, or colon in drawingId)', () => {
+    expect(() => validateSheetDrawing('img1', drawing('img1'))).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDrawing('default!0:0', drawing('0:0'))).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a drawingId that does not match the key segment (anti-spoof)', () => {
+    expect(() => validateSheetDrawing('default!img1', drawing('OTHER'))).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a non-object / null / missing-drawingId value', () => {
+    expect(() => validateSheetDrawing('default!img1', null)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDrawing('default!img1', [] as never)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDrawing('default!img1', { drawingType: 0 } as never)).toThrow(
+      SheetSnapshotInvalidError,
+    )
+  })
+})
+
+describe('versionRestore — sheetDrawings restore (floating images roll back with the grid)', () => {
+  it('SHEET_DRAWINGS_FIELD is the single shared constant across modules', () => {
+    expect(SHEET_DRAWINGS_FIELD).toBe('sheetDrawings')
+    expect(RESTORE_DRAWINGS_FIELD).toBe(SHEET_DRAWINGS_FIELD)
+  })
+
+  it('reconcileSheetMap restores drawings alongside cells (insert-then-restore removes the live-only image, rolls back the changed one)', () => {
+    const k = sheetCellKey('default', 0, 0)
+    const target = drawingsState(
+      { 'default!img1': drawing('img1', 'data:image/png;base64,OLD') },
+      { [k]: { v: 'old' } },
+    )
+    // Live: user changed img1's source AND added a stray image img2.
+    const live = liveDocFrom(
+      drawingsState(
+        {
+          'default!img1': drawing('img1', 'data:image/png;base64,NEW'),
+          'default!img2': drawing('img2'),
+        },
+        { [k]: { v: 'new' } },
+      ),
+    )
+
+    live.transact(() => reconcileSheetMap(live, target))
+
+    const draw = live.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD)
+    expect(draw.has('default!img2')).toBe(false) // live-only image removed
+    expect((draw.get('default!img1') as StoredDrawing).source).toBe('data:image/png;base64,OLD') // rolled back
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'old' })
+  })
+
+  it('reconcileSheetMap fires (returns true) when only drawings differ, cells+dims empty', () => {
+    const target = drawingsState({ 'default!img1': drawing('img1') })
+    const live = liveDocFrom() // empty doc
+    let touched = false
+    live.transact(() => {
+      touched = reconcileSheetMap(live, target)
+    })
+    expect(touched).toBe(true)
+    expect(live.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD).has('default!img1')).toBe(true)
+  })
+
+  it('reconcileSheetMap throws + leaves maps untouched on a malformed target drawing', () => {
+    const k = sheetCellKey('default', 0, 0)
+    const live = liveDocFrom(drawingsState({ 'default!keep': drawing('keep') }, { [k]: { v: 'safe' } }))
+    // Hostile target: drawingId mismatches the key segment.
+    const badTarget = (() => {
+      const doc = new Y.Doc()
+      doc.getMap(SHEET_DRAWINGS_FIELD).set('default!img1', { drawingId: 'WRONG' } as never)
+      return Y.encodeStateAsUpdate(doc)
+    })()
+    expect(() => live.transact(() => reconcileSheetMap(live, badTarget))).toThrow(SheetSnapshotInvalidError)
+    // fail-closed: live drawings + cells unchanged (no half-restore)
+    expect(live.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD).has('default!keep')).toBe(true)
     expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'safe' })
   })
 })
