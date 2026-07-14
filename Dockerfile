@@ -7,7 +7,11 @@ WORKDIR /app
 # The PDF export renders the document to Typst source and compiles it with the
 # standalone `typst` binary (see below). Typst resolves fonts from the system
 # font book, so the image must carry real CJK and emoji faces:
-#   - font-noto-cjk  → Chinese/Japanese/Korean glyphs
+#   - font-noto-cjk  → Chinese/Japanese/Korean glyphs. This package ships BOTH
+#     Noto Sans CJK and Noto Serif CJK (NotoSansCJK-*.ttc / NotoSerifCJK-*.ttc)
+#     under /usr/share/fonts/noto — the OSS Source Han Sans/Serif faces the PDF
+#     export maps CJK font choices onto (renderTypst.ts CJK_FONT_MAP). SIL OFL,
+#     free to subset-embed and redistribute inside the exported PDF.
 #   - font-noto-emoji → colour emoji (matches what the editor shows)
 # The whiteboard PNG export (@napi-rs/canvas / Skia, whiteboard/exportScene.ts)
 # draws text with these same faces: it loads this directory explicitly at
@@ -17,6 +21,12 @@ RUN apk add --no-cache \
       font-noto=2026.06.01-r0 \
       font-noto-cjk=0_git20220127-r1 \
       font-noto-emoji=2.051-r0
+
+# Point the Typst PDF export at the font dir explicitly (--font-path) so the
+# embedded OSS CJK families (Noto Sans/Serif CJK SC) the document maps to resolve
+# deterministically regardless of system font-book state; typst subset-embeds
+# only the glyphs actually used, keeping the PDF small. See typstService.ts.
+ENV TYPST_EXPORT_FONT_PATH=/usr/share/fonts
 
 # Typst binary for server-side PDF export (renderTypst.ts / typstService.ts).
 #

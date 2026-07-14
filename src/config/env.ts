@@ -424,6 +424,13 @@ export const config = {
   typstExport: {
     // Path to the `typst` binary; empty => resolved from PATH.
     binaryPath: str('TYPST_EXPORT_BINARY', ''),
+    // Directory of embedded OSS CJK fonts (Noto Sans/Serif CJK SC == Source Han
+    // Sans/Serif, SIL OFL) passed to typst as `--font-path`. Empty => typst uses
+    // only its system font book. Set it so CJK faces the document maps to are
+    // found deterministically regardless of the host's installed fonts; typst
+    // subset-embeds just the used glyphs into the PDF. The Dockerfile points
+    // this at the image's font dir.
+    fontPath: str('TYPST_EXPORT_FONT_PATH', ''),
     // Max concurrent typst compiles; the rest queue.
     maxConcurrent: num('TYPST_EXPORT_MAX_CONCURRENT', 2),
     // Max compiles allowed to WAIT; over this the route returns 503.
