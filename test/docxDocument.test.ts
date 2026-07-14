@@ -110,6 +110,23 @@ describe('walkDocument — hyperlinks', () => {
 })
 
 describe('walkDocument — code blocks & callouts (styled paragraphs)', () => {
+  it('coalesces consecutive BlockQuote paragraphs into one blockquote node', () => {
+    const xml = docXml(
+      '<w:p><w:pPr><w:pStyle w:val="BlockQuote"/></w:pPr><w:r><w:t>quote line 1</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="BlockQuote"/></w:pPr><w:r><w:t>quote line 2</w:t></w:r></w:p>',
+    )
+    const out = walkDocument(xml, new Map())
+    expect(out.content).toEqual([
+      {
+        type: 'blockquote',
+        content: [
+          { type: 'paragraph', content: [{ type: 'text', text: 'quote line 1' }] },
+          { type: 'paragraph', content: [{ type: 'text', text: 'quote line 2' }] },
+        ],
+      },
+    ])
+  })
+
   it('coalesces consecutive CodeBlock paragraphs into one codeBlock node', () => {
     const xml = docXml(
       '<w:p><w:pPr><w:pStyle w:val="CodeBlock"/></w:pPr><w:r><w:t>const a = 1</w:t></w:r></w:p>' +
@@ -123,6 +140,67 @@ describe('walkDocument — code blocks & callouts (styled paragraphs)', () => {
         content: [{ type: 'text', text: 'const a = 1\nconst b = 2' }],
       },
     ])
+  })
+
+  it('rebuilds a details block from Details markers + summary', () => {
+    const xml = docXml(
+      '<w:p><w:pPr><w:pStyle w:val="DetailsStart"/></w:pPr></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="DetailsSummary"/></w:pPr><w:r><w:t>▸ Summary</w:t></w:r></w:p>' +
+        '<w:p><w:r><w:t>body line</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="DetailsEnd"/></w:pPr></w:p>',
+    )
+    const out = walkDocument(xml, new Map())
+    expect(out.content).toEqual([
+      {
+        type: 'details',
+        attrs: { open: false },
+        content: [
+          { type: 'detailsSummary', content: [{ type: 'text', text: 'Summary' }] },
+          {
+            type: 'detailsContent',
+            content: [{ type: 'paragraph', content: [{ type: 'text', text: 'body line' }] }],
+          },
+        ],
+      },
+    ])
+  })
+
+  it('rebuilds nested details (outer > inner) from stacked markers', () => {
+    const xml = docXml(
+      '<w:p><w:pPr><w:pStyle w:val="DetailsStart"/></w:pPr></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="DetailsSummary"/></w:pPr><w:r><w:t>▸ Outer</w:t></w:r></w:p>' +
+        '<w:p><w:r><w:t>outer body</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="DetailsStart"/></w:pPr></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="DetailsSummary"/></w:pPr><w:r><w:t>▸ Inner</w:t></w:r></w:p>' +
+        '<w:p><w:r><w:t>inner body</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="DetailsEnd"/></w:pPr></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="DetailsEnd"/></w:pPr></w:p>',
+    )
+    const out = walkDocument(xml, new Map())
+    expect(out.content).toHaveLength(1)
+    const outer = out.content[0]!
+    expect(outer.type).toBe('details')
+    expect(outer.content![0]).toEqual({
+      type: 'detailsSummary',
+      content: [{ type: 'text', text: 'Outer' }],
+    })
+    const outerContent = outer.content![1]!
+    expect(outerContent.type).toBe('detailsContent')
+    // outer content: a paragraph then the nested details
+    expect(outerContent.content![0]).toEqual({
+      type: 'paragraph',
+      content: [{ type: 'text', text: 'outer body' }],
+    })
+    const inner = outerContent.content![1]!
+    expect(inner.type).toBe('details')
+    expect(inner.content![0]).toEqual({
+      type: 'detailsSummary',
+      content: [{ type: 'text', text: 'Inner' }],
+    })
+    expect(inner.content![1]).toEqual({
+      type: 'detailsContent',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'inner body' }] }],
+    })
   })
 
   it('maps a CalloutWarn run to a callout node and strips the leading icon', () => {

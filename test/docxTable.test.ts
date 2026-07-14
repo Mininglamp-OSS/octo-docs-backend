@@ -28,6 +28,41 @@ function table(out: ReturnType<typeof walkDocument>) {
 }
 
 describe('mapTable — basic grid', () => {
+  it('scales a percentage-width table\'s columns up to the editor content width', () => {
+    // Two DIFFERENT-width columns (non-uniform → author ratios) under a pct table
+    // should scale up proportionally to fill the editor content width.
+    const grid = '<w:tblGrid><w:gridCol w:w="6000"/><w:gridCol w:w="3000"/></w:tblGrid>'
+    const tblPr = '<w:tblPr><w:tblW w:type="pct" w:w="100%"/></w:tblPr>'
+    const xml = doc(tbl(tr(tc('a') + tc('b')) + tr(tc('c') + tc('d')), tblPr + grid))
+    const t = table(walkDocument(xml, new Map()))
+    const c0 = (t.content![0]!.content![0]!.attrs as { colwidth?: number[] }).colwidth!
+    const c1 = (t.content![0]!.content![1]!.attrs as { colwidth?: number[] }).colwidth!
+    // 6000/15=400, 3000/15=200, total 600 → scaled by 756/600 ≈ 504 / 252.
+    expect(c0[0]! + c1[0]!).toBeGreaterThan(740)
+    expect(c0[0]! + c1[0]!).toBeLessThanOrEqual(760)
+    expect(c0[0]!).toBeGreaterThan(c1[0]!) // ratio preserved
+  })
+
+  it('drops colwidth for a uniform percentage-width table so it fills 100%', () => {
+    // Even A4 distribution (both 4513) → no author ratios → fill full width.
+    const grid = '<w:tblGrid><w:gridCol w:w="4513"/><w:gridCol w:w="4513"/></w:tblGrid>'
+    const tblPr = '<w:tblPr><w:tblW w:type="pct" w:w="100%"/></w:tblPr>'
+    const xml = doc(tbl(tr(tc('a') + tc('b')), tblPr + grid))
+    const t = table(walkDocument(xml, new Map()))
+    const attrs = (t.content![0]!.content![0]!.attrs ?? {}) as { colwidth?: number[] }
+    expect(attrs.colwidth).toBeUndefined()
+  })
+
+  it('does not scale a fixed-width (dxa) table', () => {
+    const grid = '<w:tblGrid><w:gridCol w:w="1500"/><w:gridCol w:w="1500"/></w:tblGrid>'
+    const tblPr = '<w:tblPr><w:tblW w:type="dxa" w:w="3000"/></w:tblPr>'
+    const xml = doc(tbl(tr(tc('a') + tc('b')), tblPr + grid))
+    const t = table(walkDocument(xml, new Map()))
+    const firstCell = t.content![0]!.content![0]!
+    const colwidth = (firstCell.attrs as { colwidth?: number[] }).colwidth!
+    expect(colwidth[0]).toBe(100) // 1500/15, unscaled
+  })
+
   it('maps a 2x2 table', () => {
     const xml = doc(tbl(tr(tc('a') + tc('b')) + tr(tc('c') + tc('d'))))
     const t = table(walkDocument(xml, new Map()))

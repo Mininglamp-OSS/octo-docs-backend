@@ -75,6 +75,7 @@ function mapBlockChildren(
   rels: RelMap,
   numbering: Numbering | undefined,
   warnings: string[],
+  parentFillsWidth?: boolean,
 ): PmNode[] {
   const content: PmNode[] = []
   let listRun: ListLine[] = []
@@ -90,10 +91,13 @@ function mapBlockChildren(
   let styledRun:
     | { kind: 'code'; variant?: undefined; ps: OrderedNode[] }
     | { kind: 'callout'; variant: string; ps: OrderedNode[] }
+    | { kind: 'blockquote'; variant?: undefined; ps: OrderedNode[] }
     | null = null
   const flushStyled = (): void => {
     if (!styledRun) return
     if (styledRun.kind === 'code') content.push(codeBlockFrom(styledRun.ps))
+    else if (styledRun.kind === 'blockquote')
+      content.push(blockquoteFrom(styledRun.ps, rels, warnings))
     else content.push(calloutFrom(styledRun.variant, styledRun.ps, rels, warnings))
     styledRun = null
   }
@@ -126,7 +130,9 @@ function mapBlockChildren(
           styledRun =
             styled.kind === 'code'
               ? { kind: 'code', ps: [child] }
-              : { kind: 'callout', variant: styled.variant, ps: [child] }
+              : styled.kind === 'blockquote'
+                ? { kind: 'blockquote', ps: [child] }
+                : { kind: 'callout', variant: styled.variant, ps: [child] }
         }
         continue
       }
@@ -136,7 +142,23 @@ function mapBlockChildren(
         listRun.push(listLine)
       } else {
         flushList()
-        content.push(...mapParagraph(child, rels, warnings))
+        // Details boundary markers (DetailsStart / DetailsEnd) and the summary
+        // line are emitted as sentinel nodes; foldDetails() rebuilds the nested
+        // details tree from them after the linear walk.
+        const marker = detailsMarkerOf(child)
+        if (marker === 'start') {
+          content.push({ type: '__detailsStart' } as unknown as PmNode)
+        } else if (marker === 'end') {
+          content.push({ type: '__detailsEnd' } as unknown as PmNode)
+        } else if (marker === 'summary') {
+          const { inline } = collectInline(kids(child, 'w:p'), rels, warnings)
+          content.push({
+            type: 'detailsSummary',
+            content: stripLeadingDetailsToggle(inline),
+          })
+        } else {
+          content.push(...mapParagraph(child, rels, warnings))
+        }
       }
     } else if (tag === 'm:oMathPara' || tag === 'm:oMath') {
       // Display math can also sit directly at block level.
@@ -150,13 +172,18 @@ function mapBlockChildren(
       flushStyled()
       const tblChildren = kids(child, 'w:tbl')
       content.push(
-        mapTable(tblChildren, (tcChildren) => mapBlockChildren(tcChildren, rels, numbering, warnings)),
+        mapTable(
+          tblChildren,
+          (tcChildren, fillsWidth) =>
+            mapBlockChildren(tcChildren, rels, numbering, warnings, fillsWidth),
+          parentFillsWidth,
+        ),
       )
     }
   }
   flushList()
   flushStyled()
-  return content
+  return foldDetails(content)
 }
 
 /** Paragraph-style ids our exporter uses for code blocks / callouts. */
@@ -172,12 +199,114 @@ const CALLOUT_STYLE_VARIANT: Record<string, string> = {
 const CALLOUT_PREFIX_GLYPHS = ['ℹ️', '⚠️', '💡', '✅', 'ℹ', '⚠']
 
 /**
+ * Classify a paragraph as a details boundary marker or summary line by its
+ * pStyle (DetailsStart / DetailsEnd / DetailsSummary), or null otherwise.
+ */
+function detailsMarkerOf(p: OrderedNode): 'start' | 'end' | 'summary' | null {
+  const pChildren = kids(p, 'w:p')
+  const pPr = firstChild(pChildren, 'w:pPr')
+  if (!pPr) return null
+  const styleId = orderedAttr(firstChild(kids(pPr, 'w:pPr'), 'w:pStyle') ?? {}, 'w:val')
+  if (!styleId) return null
+  const key = styleId.toLowerCase().replace(/\s+/g, '')
+  if (key === 'detailsstart') return 'start'
+  if (key === 'detailsend') return 'end'
+  if (key === 'detailssummary') return 'summary'
+  return null
+}
+
+/**
+ * Strip the leading "▸ " toggle glyph the exporter prepends to a details
+ * summary line (and any immediately following whitespace) so it does not show
+ * up as literal text — the editor renders its own disclosure triangle.
+ */
+function stripLeadingDetailsToggle(inline: PmNode[]): PmNode[] {
+  if (inline.length === 0) return inline
+  const first = inline[0]
+  if (first?.type === 'text' && typeof first.text === 'string') {
+    const stripped = first.text.replace(/^\s*▸\s*/, '')
+    if (stripped !== first.text) {
+      const rest = inline.slice(1)
+      return stripped ? [{ ...first, text: stripped }, ...rest] : rest
+    }
+  }
+  return inline
+}
+
+/**
+ * Fold a linear block list containing details sentinels
+ * (`__detailsStart` / `detailsSummary` / …content… / `__detailsEnd`) into
+ * nested `details` nodes. A stack handles arbitrary nesting: each Start opens a
+ * frame, the first following detailsSummary becomes the summary, remaining
+ * blocks fill detailsContent, and End closes the frame (attaching it to its
+ * parent frame or the output). Unbalanced or malformed markers degrade
+ * gracefully: a stray summary becomes a paragraph, an unmatched End is dropped,
+ * and any frames left open at the end are flushed as best-effort details.
+ */
+function foldDetails(blocks: PmNode[]): PmNode[] {
+  const hasMarker = blocks.some(
+    (b) => b.type === '__detailsStart' || b.type === '__detailsEnd' || b.type === 'detailsSummary',
+  )
+  if (!hasMarker) return blocks
+
+  interface Frame {
+    summary: PmNode | null
+    content: PmNode[]
+  }
+  const out: PmNode[] = []
+  const stack: Frame[] = []
+  const emit = (node: PmNode): void => {
+    if (stack.length > 0) stack[stack.length - 1]!.content.push(node)
+    else out.push(node)
+  }
+
+  const summaryToParagraph = (summary: PmNode | null): PmNode => ({
+    type: 'paragraph',
+    content: (summary?.content as PmNode[]) ?? [],
+  })
+
+  const closeFrame = (frame: Frame): PmNode => {
+    const summary: PmNode = frame.summary ?? { type: 'detailsSummary', content: [] }
+    const content = frame.content.length > 0 ? frame.content : [{ type: 'paragraph', content: [] }]
+    return {
+      type: 'details',
+      attrs: { open: false },
+      content: [summary, { type: 'detailsContent', content }],
+    }
+  }
+
+  for (const b of blocks) {
+    if (b.type === '__detailsStart') {
+      stack.push({ summary: null, content: [] })
+    } else if (b.type === '__detailsEnd') {
+      const frame = stack.pop()
+      if (!frame) continue // unmatched End: drop
+      emit(closeFrame(frame))
+    } else if (b.type === 'detailsSummary') {
+      const top = stack[stack.length - 1]
+      if (top && top.summary === null) top.summary = b
+      else emit(summaryToParagraph(b)) // stray summary: degrade to paragraph
+    } else {
+      emit(b)
+    }
+  }
+  // Flush any frames left open by malformed input (missing End markers).
+  while (stack.length > 0) {
+    const frame = stack.pop()!
+    const node = closeFrame(frame)
+    if (stack.length > 0) stack[stack.length - 1]!.content.push(node)
+    else out.push(node)
+  }
+  return out
+}
+
+/**
  * Classify a paragraph by its pStyle: a CodeBlock line, a Callout* line, or
  * neither. Consecutive same-kind paragraphs are later coalesced into one node.
  */
 function styledKindOf(
   p: OrderedNode,
-): { kind: 'code' } | { kind: 'callout'; variant: string } | null {
+): { kind: 'code' } | { kind: 'callout'; variant: string } | { kind: 'blockquote' } | null {
   const pChildren = kids(p, 'w:p')
   const pPr = firstChild(pChildren, 'w:pPr')
   if (!pPr) return null
@@ -185,6 +314,7 @@ function styledKindOf(
   if (!styleId) return null
   const key = styleId.toLowerCase().replace(/\s+/g, '')
   if (key === 'codeblock') return { kind: 'code' }
+  if (key === 'blockquote') return { kind: 'blockquote' }
   const variant = CALLOUT_STYLE_VARIANT[key]
   if (variant) return { kind: 'callout', variant }
   return null
@@ -225,6 +355,20 @@ function calloutFrom(
   })
   if (inner.length === 0) inner.push({ type: 'paragraph', content: [] })
   return { type: 'callout', attrs: { variant }, content: inner }
+}
+
+/**
+ * Build a `blockquote` node (content `block+`) from a run of paragraphs styled
+ * with the exporter's `BlockQuote` pStyle. Each source paragraph becomes a
+ * child paragraph, preserving inline marks (unlike code blocks).
+ */
+function blockquoteFrom(ps: OrderedNode[], rels: RelMap, warnings: string[]): PmNode {
+  const inner: PmNode[] = ps.map((p) => {
+    const { inline } = collectInline(kids(p, 'w:p'), rels, warnings)
+    return { type: 'paragraph', content: inline }
+  })
+  if (inner.length === 0) inner.push({ type: 'paragraph', content: [] })
+  return { type: 'blockquote', content: inner }
 }
 
 /** Concatenated plain text of a paragraph (w:t across all runs), ignoring marks. */

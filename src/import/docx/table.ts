@@ -41,6 +41,16 @@ function twipsToPx(twips: number): number {
   return Math.round(twips / 15)
 }
 
+// The editor renders documents in an 820px column with 32px side padding, so a
+// full-width table fills ~756px of usable content. The exporter writes
+// full-width tables as `w:tblW type="pct" w:w="100%"` and sizes the grid to the
+// A4 page content (~9026 twips ≈ 602px). Importing those grid twips verbatim
+// makes the table render ~150px too narrow. For a percentage-width table we
+// therefore either drop the widths (uniform columns → let the table fill 100%
+// like a natively inserted one) or rescale them to the editor width (non-uniform
+// columns → keep the author's ratios while still filling the page).
+const EDITOR_CONTENT_WIDTH_PX = 756
+
 /** An open vertical merge: the originating cell + its current rowspan. */
 interface OpenVMerge {
   cell: PmNode
@@ -53,18 +63,33 @@ interface OpenVMerge {
  */
 export function mapTable(
   tblChildren: OrderedNode[],
-  mapCellBlocks: (tcChildren: OrderedNode[]) => PmNode[],
+  mapCellBlocks: (tcChildren: OrderedNode[], fillsWidth?: boolean) => PmNode[],
+  parentFillsWidth?: boolean,
 ): PmNode {
   const rows = tblChildren.filter((c) => orderedTag(c) === 'w:tr')
 
   // Grid-column widths from w:tblGrid/w:gridCol (twips → px), best-effort.
-  const colWidths = readGridWidths(tblChildren)
+  let colWidths = readGridWidths(tblChildren)
 
   // Header declaration: tblPr/w:tblHeader OR the first row's trPr/w:tblHeader.
   const tblPr = firstChild(tblChildren, 'w:tblPr')
   const tableDeclaresHeader = tblPr
     ? !!firstChild(kids(tblPr, 'w:tblPr'), 'w:tblHeader')
     : false
+
+  // Column-width normalization so imported tables match how the editor lays out
+  // natively created ones (CSS `table-layout:fixed; width:100%`). Only tables the
+  // exporter marked full-width (`w:tblW type="pct"`) OR nested tables inside such
+  // a table (`parentFillsWidth`) are normalized — a genuine fixed-width Word
+  // table is left untouched.
+  //   - UNIFORM columns (even distribution, no author ratios) → drop colwidth so
+  //     the table fills its container (page for top-level, cell for nested).
+  //   - NON-UNIFORM columns (author resized) → keep ratios; a top-level pct table
+  //     is scaled to the editor content width.
+  const fillsWidth = isPercentWidthTable(tblPr) || parentFillsWidth === true
+  if (fillsWidth && colWidths.length > 0) {
+    colWidths = columnsAreUniform(colWidths) ? [] : scaleWidthsToEditor(colWidths)
+  }
 
   // Track open vertical merges keyed by the grid column they occupy.
   const openVMerges = new Map<number, OpenVMerge>()
@@ -113,7 +138,7 @@ export function mapTable(
       const cell: PmNode = {
         type: rowIsHeader ? 'tableHeader' : 'tableCell',
         attrs,
-        content: ensureBlocks(mapCellBlocks(tcChildren)),
+        content: ensureBlocks(mapCellBlocks(tcChildren, fillsWidth)),
       }
 
       if (vMerge === 'restart') {
@@ -158,6 +183,36 @@ function readVMerge(tcPrChildren: OrderedNode[]): 'restart' | 'continue' | null 
   // Present with no val means "continue" per the OOXML spec.
   if (val === 'restart') return 'restart'
   return 'continue'
+}
+
+/** True when column widths are effectively uniform (within a small tolerance),
+ *  i.e. the exporter's even page distribution rather than author-set ratios. */
+function columnsAreUniform(colWidths: number[]): boolean {
+  const positive = colWidths.filter((w) => w > 0)
+  if (positive.length <= 1) return true
+  const min = Math.min(...positive)
+  const max = Math.max(...positive)
+  // Allow ~5% drift to absorb rounding in the even A4 distribution.
+  return max - min <= Math.max(2, min * 0.05)
+}
+
+/** True when the table's tblPr declares a percentage width (`w:tblW type="pct"`). */
+function isPercentWidthTable(tblPr: OrderedNode | null | undefined): boolean {
+  if (!tblPr) return false
+  const tblW = firstChild(kids(tblPr, 'w:tblPr'), 'w:tblW')
+  if (!tblW) return false
+  const type = orderedAttr(tblW, 'w:type')
+  return type === 'pct'
+}
+
+/** Scale a set of px column widths so their sum equals the editor content
+ *  width, preserving the relative ratios. No-op when the widths already meet or
+ *  exceed the editor width (never shrink a table that is already wide enough). */
+function scaleWidthsToEditor(colWidths: number[]): number[] {
+  const total = colWidths.reduce((s, w) => s + (w > 0 ? w : 0), 0)
+  if (total <= 0 || total >= EDITOR_CONTENT_WIDTH_PX) return colWidths
+  const factor = EDITOR_CONTENT_WIDTH_PX / total
+  return colWidths.map((w) => (w > 0 ? Math.round(w * factor) : w))
 }
 
 /** Grid-column widths in px from w:tblGrid/w:gridCol (twips). */

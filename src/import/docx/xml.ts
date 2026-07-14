@@ -76,10 +76,16 @@ export function orderedAttr(node: OrderedNode, name: string): string | null {
   return v == null ? null : String(v)
 }
 
-/** Escape text for XML content / attribute values. */
+/** Escape text for XML content / attribute values.
+ *
+ * The parser runs with `processEntities:false`, so a node's `#text` still holds
+ * any original XML entities verbatim (e.g. `&lt;` from `<m:t>&lt;</m:t>`).
+ * Re-escaping the bare `&` there would double-encode it to `&amp;lt;`, which the
+ * downstream OMML→LaTeX converter turns into the literal characters `& l t ;`.
+ * So we escape a `&` only when it does NOT already begin a valid entity. */
 function xmlEscape(s: string): string {
   return s
-    .replace(/&/g, '&amp;')
+    .replace(/&(?!#[0-9]+;|#x[0-9a-fA-F]+;|[a-zA-Z][a-zA-Z0-9]*;)/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')

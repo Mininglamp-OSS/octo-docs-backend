@@ -106,3 +106,55 @@ describe('walkDocument — math integration', () => {
     expect(out.content[0]).toEqual({ type: 'blockMath', attrs: { latex: '\\frac{a}{b}' } })
   })
 })
+
+describe('ommlToLatex — recovered-LaTeX normalization', () => {
+  const M2 = 'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"'
+
+  it('round-trips a matrix (m:m) to \\begin{matrix}', () => {
+    const mat = `<m:oMath ${M2}><m:m><m:mr><m:e><m:r><m:t>a</m:t></m:r></m:e><m:e><m:r><m:t>b</m:t></m:r></m:e></m:mr><m:mr><m:e><m:r><m:t>c</m:t></m:r></m:e><m:e><m:r><m:t>d</m:t></m:r></m:e></m:mr></m:m></m:oMath>`
+    const latex = ommlToLatex(mat)
+    expect(latex).not.toBeNull()
+    expect(latex).toContain('\\begin{matrix}')
+    expect(latex).toContain('a')
+    expect(latex).toContain('d')
+  })
+
+  it('normalizes accent operators to dedicated commands', () => {
+    const acc = (chr: string) =>
+      `<m:oMath ${M2}><m:acc><m:accPr><m:chr m:val="${chr}"/></m:accPr><m:e><m:r><m:t>x</m:t></m:r></m:e></m:acc></m:oMath>`
+    expect(ommlToLatex(acc('\u0307'))).toBe('\\dot{x}') // combining dot above
+    expect(ommlToLatex(acc('\u20d7'))).toBe('\\vec{x}') // combining right arrow above
+    expect(ommlToLatex(acc('~'))).toBe('\\tilde{x}')
+  })
+
+  it('recovers a scripted function name from \\left(…\\right)^{…}', () => {
+    const sinsup = `<m:oMath ${M2}><m:sSup><m:e><m:r><m:t>sin</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup></m:oMath>`
+    const latex = ommlToLatex(sinsup)
+    expect(latex).not.toBeNull()
+    expect(latex).not.toContain('\\left(')
+    expect(latex).toContain('\\sin')
+  })
+
+  it('recovers a uniform run color as \\textcolor', () => {
+    const colored =
+      `<m:oMath ${M2} xmlns:w="http://w">` +
+      `<m:r><m:rPr><w:color w:val="FF0000"/></m:rPr><m:t>E</m:t></m:r>` +
+      `<m:r><m:rPr><w:color w:val="FF0000"/></m:rPr><m:t>=</m:t></m:r>` +
+      `<m:r><m:rPr><w:color w:val="FF0000"/></m:rPr><m:t>m</m:t></m:r>` +
+      `</m:oMath>`
+    const latex = ommlToLatex(colored)
+    expect(latex).not.toBeNull()
+    expect(latex).toMatch(/^\\textcolor\{#FF0000\}\{/)
+  })
+
+  it('does not wrap in \\textcolor when coloring is mixed / partial', () => {
+    const mixed =
+      `<m:oMath ${M2} xmlns:w="http://w">` +
+      `<m:r><m:rPr><w:color w:val="FF0000"/></m:rPr><m:t>a</m:t></m:r>` +
+      `<m:r><m:t>b</m:t></m:r>` + // uncolored run
+      `</m:oMath>`
+    const latex = ommlToLatex(mixed)
+    expect(latex).not.toBeNull()
+    expect(latex).not.toContain('\\textcolor')
+  })
+})

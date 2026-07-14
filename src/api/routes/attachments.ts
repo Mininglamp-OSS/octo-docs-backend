@@ -15,6 +15,12 @@ import { newAttachId } from '../../util/ids.js'
 import { config } from '../../config/env.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { docAttachmentRepo, type DocAttachment } from '../../db/repos/docAttachmentRepo.js'
+import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import { resolveRole } from '../../permission/resolveRole.js'
+import { roleAtLeast } from '../../permission/role.js'
+import { fetchExternalImage } from '../../util/fetchExternalImage.js'
+import { LinkCardError } from '../../util/ssrfGuard.js'
+import { sniffImageMime } from '../../import/docx/media.js'
 
 export const attachmentsRouter = Router()
 
@@ -306,4 +312,279 @@ export async function resolveHandler(req: Request, res: Response): Promise<void>
   }
 
   res.status(200).json({ items, notFound })
+}
+
+/**
+ * Copy attachments FROM other docs INTO this doc (§ markdown-import image migration).
+ *
+ *   POST /:docId/attachments/copy   editor — server-to-server copy of already-stored
+ *                                   attachments so a Markdown/PDF import that references
+ *                                   another doc's images re-hosts them under the target doc.
+ *
+ * Why server-side: the client only holds a short-lived signed URL for the source image, so a
+ * browser "download then re-upload" breaks as soon as that signature expires. The backend copies
+ * the bytes store-to-store from the source object key, so it never depends on a signed URL and
+ * never expires. Only attachments our own service already stores (a real doc_attachment row the
+ * caller can read) are eligible — an external/foreign URL has no source ref and is simply not
+ * sent to this endpoint.
+ *
+ * Security (default-deny, matches presign/resolve):
+ *   - writer on the TARGET doc (this is a write) AND reader on the SOURCE doc (no copying bytes
+ *     you cannot read). Cross-space sources 404 via requireDocRole's same-space gate — no leak.
+ *   - the source attachment must actually belong to the claimed source doc (else 404, no leak).
+ *   - the source mime is re-validated against the SAME allow/deny lists + size caps as a fresh
+ *     upload, so a historically-stored but now-disallowed type (e.g. an SVG that predates the
+ *     denylist) cannot be laundered into the new doc.
+ *   - one bad source degrades to `notCopied` (best-effort) instead of sinking the whole import.
+ */
+attachmentsRouter.post('/:docId/attachments/copy', copyHandler)
+
+interface CopySourceRef {
+  docId: string
+  attachId: string
+}
+
+export async function copyHandler(req: Request, res: Response): Promise<void> {
+  // Copy WRITES into the target doc → writer role, default-deny.
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  if (!guard) return
+  const targetDocId = guard.meta.doc_id
+
+  const { sources } = req.body ?? {}
+  if (!Array.isArray(sources) || sources.length === 0) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+  if (sources.length > config.attachments.maxResolveBatch) {
+    res.status(400).json({ error: 'sources_too_many' })
+    return
+  }
+  // Shape-validate every entry up front so a single bad element is a 400, not a partial copy.
+  const refs: CopySourceRef[] = []
+  for (const s of sources) {
+    if (
+      typeof s !== 'object' || s === null ||
+      typeof (s as CopySourceRef).docId !== 'string' || (s as CopySourceRef).docId === '' ||
+      typeof (s as CopySourceRef).attachId !== 'string' || (s as CopySourceRef).attachId === ''
+    ) {
+      res.status(400).json({ error: 'invalid_body' })
+      return
+    }
+    refs.push({ docId: (s as CopySourceRef).docId, attachId: (s as CopySourceRef).attachId })
+  }
+
+  // Dedup by source (docId+attachId) keeping first-seen order so a repeated image is copied once.
+  const seen = new Set<string>()
+  const unique: CopySourceRef[] = []
+  for (const r of refs) {
+    const k = `${r.docId}\u0000${r.attachId}`
+    if (!seen.has(k)) { seen.add(k); unique.push(r) }
+  }
+
+  const ttl = config.attachments.readUrlTtlSeconds
+  const mappings: Array<{
+    sourceDocId: string
+    sourceAttachId: string
+    attachId: string
+    url: string
+    mime: string
+    sizeBytes: number
+    fileName: string
+  }> = []
+  const notCopied: Array<{ sourceDocId: string; sourceAttachId: string; reason: string }> = []
+
+  for (const ref of unique) {
+    const fail = (reason: string) =>
+      notCopied.push({ sourceDocId: ref.docId, sourceAttachId: ref.attachId, reason })
+
+    // Reader on the SOURCE doc: you may only copy bytes you are allowed to read. A cross-space
+    // or missing source resolves to a guard failure below; we translate it into notCopied
+    // (no existence leak) rather than aborting the whole batch.
+    const srcMeta = await docMetaRepo.getByDocId(ref.docId)
+    if (!srcMeta || srcMeta.status === 0 || srcMeta.space_id !== req.spaceId!) {
+      fail('source_not_found')
+      continue
+    }
+    const srcRole = await resolveRole(req.uid!, ref.docId)
+    if (srcRole === 'none' || !roleAtLeast(srcRole, 'reader')) {
+      fail('source_forbidden')
+      continue
+    }
+
+    const src = await docAttachmentRepo.getById(ref.attachId)
+    // The attachment must exist AND belong to the claimed source doc (no cross-doc smuggling).
+    if (!src || src.docId !== ref.docId) {
+      fail('source_not_found')
+      continue
+    }
+    // Re-validate the source type against the CURRENT policy (denylist beats allow-list) and the
+    // size tier — a previously-stored type that is no longer permitted must not be re-hosted.
+    if (mimeBlocked(src.mime) || !mimeAllowed(src.mime)) {
+      fail('mime_not_allowed')
+      continue
+    }
+    if (src.sizeBytes > maxSizeFor(src.mime)) {
+      fail('size_too_large')
+      continue
+    }
+
+    try {
+      const attachId = await copyStoredObject(src, targetDocId, req.uid!)
+      const created = await docAttachmentRepo.getById(attachId)
+      if (!created) { fail('copy_failed'); continue }
+      mappings.push({
+        sourceDocId: ref.docId,
+        sourceAttachId: ref.attachId,
+        attachId,
+        url: presignReadUrl(created, ttl),
+        mime: created.mime,
+        sizeBytes: created.sizeBytes,
+        fileName: created.fileName,
+      })
+    } catch {
+      fail('copy_failed')
+    }
+  }
+
+  res.status(200).json({ mappings, notCopied })
+}
+
+/**
+ * Copy a stored attachment's bytes into the target doc and register a fresh row. Store-to-store:
+ * sign a GET on the source object key, stream it, sign a PUT on the new key, upload, register.
+ * Never touches a client-supplied URL — only object keys the DB already vouches for. Returns the
+ * new attachId.
+ */
+async function copyStoredObject(
+  src: DocAttachment,
+  targetDocId: string,
+  uid: string,
+): Promise<string> {
+  const store = getObjectStore()
+  const getUrl = store.presignGet(src.objectKey, config.attachments.readUrlTtlSeconds)
+  const getResp = await fetch(getUrl, { method: 'GET' })
+  if (!getResp.ok) throw new Error(`source read failed: ${getResp.status}`)
+  const bytes = Buffer.from(await getResp.arrayBuffer())
+  // Defence in depth: the copied bytes must not exceed the tier cap even if the recorded
+  // sizeBytes was wrong/understated at register time.
+  if (bytes.length > maxSizeFor(src.mime)) throw new Error('copied bytes exceed size cap')
+
+  const attachId = newAttachId()
+  // src.fileName was sanitized at its own register time; keep it (it is already a safe segment).
+  const objectKey = `${targetDocId}/${attachId}/${src.fileName}`
+  await docAttachmentRepo.register({
+    attachId,
+    docId: targetDocId,
+    objectKey,
+    mime: src.mime,
+    sizeBytes: bytes.length,
+    fileName: src.fileName,
+    createdBy: uid,
+  })
+  const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
+  const putResp = await fetch(put.uploadUrl, {
+    method: 'PUT',
+    body: bytes,
+    headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
+  })
+  if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
+  return attachId
+}
+
+/**
+ * Ingest EXTERNAL image URLs into this doc (§ markdown-import external-image re-hosting).
+ *
+ *   POST /:docId/attachments/ingest   editor — download a plain external image URL server-side
+ *                                     (SSRF-guarded) and store it under this doc, so an imported
+ *                                     document does not silently break when the external host
+ *                                     later goes away. On any failure the caller keeps the
+ *                                     original URL (best-effort), so a blocked/oversized/dead
+ *                                     source never sinks the import.
+ *
+ * Security: writer on the target doc; every URL goes through the link-card SSRF guard
+ * (loopback / private / link-local / CGNAT / metadata IPs refused, connect pinned to the
+ * validated IP, http/https + port allowlist only); the downloaded bytes are validated by MAGIC
+ * NUMBER (never the Content-Type header or the URL extension) and must be an allowed, non-blocked
+ * image within the image size tier. This is deliberately image-only — arbitrary file ingestion
+ * from a URL is a broader abuse surface we do not want here.
+ */
+attachmentsRouter.post('/:docId/attachments/ingest', ingestHandler)
+
+export async function ingestHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  if (!guard) return
+  const targetDocId = guard.meta.doc_id
+
+  const { urls } = req.body ?? {}
+  if (!Array.isArray(urls) || urls.length === 0) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+  if (urls.length > config.attachments.maxResolveBatch) {
+    res.status(400).json({ error: 'urls_too_many' })
+    return
+  }
+  // De-dupe + shape check: every entry must be a non-empty http(s) string.
+  const seen = new Set<string>()
+  const unique: string[] = []
+  for (const u of urls) {
+    if (typeof u !== 'string' || u === '') {
+      res.status(400).json({ error: 'invalid_body' })
+      return
+    }
+    if (!seen.has(u)) { seen.add(u); unique.push(u) }
+  }
+
+  const ttl = config.attachments.readUrlTtlSeconds
+  const maxImage = config.attachments.maxImageSizeBytes
+  const mappings: Array<{ sourceUrl: string; attachId: string; url: string; mime: string; sizeBytes: number }> = []
+  const notIngested: Array<{ sourceUrl: string; reason: string }> = []
+
+  for (const sourceUrl of unique) {
+    try {
+      const { bytes } = await fetchExternalImage(sourceUrl, maxImage)
+      // Magic-number sniff: the declared Content-Type / extension is never trusted.
+      const mime = sniffImageMime(bytes)
+      if (!mime) { notIngested.push({ sourceUrl, reason: 'not_an_image' }); continue }
+      if (mimeBlocked(mime) || !mimeAllowed(mime)) { notIngested.push({ sourceUrl, reason: 'mime_not_allowed' }); continue }
+      if (bytes.length > maxImage) { notIngested.push({ sourceUrl, reason: 'size_too_large' }); continue }
+
+      const attachId = newAttachId()
+      const fileName = safeImageFileName(sourceUrl, mime)
+      const objectKey = `${targetDocId}/${attachId}/${fileName}`
+      await docAttachmentRepo.register({
+        attachId, docId: targetDocId, objectKey, mime, sizeBytes: bytes.length, fileName, createdBy: req.uid!,
+      })
+      const store = getObjectStore()
+      const put = store.presignPut(objectKey, mime, config.attachments.uploadUrlTtlSeconds)
+      const putResp = await fetch(put.uploadUrl, {
+        method: 'PUT', body: bytes, headers: { 'Content-Type': mime, ...(put.headers ?? {}) },
+      })
+      if (!putResp.ok) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
+      const created = await docAttachmentRepo.getById(attachId)
+      if (!created) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
+      mappings.push({ sourceUrl, attachId, url: presignReadUrl(created, ttl), mime, sizeBytes: bytes.length })
+    } catch (err) {
+      // SSRF-blocked / oversized / dead host / bad scheme all land here; keep the original URL.
+      const reason = err instanceof LinkCardError ? err.code : 'fetch_failed'
+      notIngested.push({ sourceUrl, reason })
+    }
+  }
+
+  res.status(200).json({ mappings, notIngested })
+}
+
+/** A safe object-key file segment for an ingested image: basename from the URL path, sanitized,
+ * with an extension coerced from the sniffed mime. Never uses a client-controlled path. */
+function safeImageFileName(sourceUrl: string, mime: string): string {
+  const ext = mime === 'image/jpeg' ? 'jpg' : mime.split('/')[1] || 'img'
+  let base = 'image'
+  try {
+    const p = new URL(sourceUrl).pathname.split('/').filter(Boolean).pop() || ''
+    const cleaned = p.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64)
+    if (cleaned) base = cleaned
+  } catch {
+    /* keep default */
+  }
+  return `${base}.${ext}`
 }
