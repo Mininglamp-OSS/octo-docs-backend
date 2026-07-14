@@ -1511,7 +1511,7 @@ process.on('SIGTERM', async () => {
 | 资源耗尽 | 超大文档/海量连接/消息洪泛 | 见 9.5 限流；maxPayload、连接/文档上限、事件循环保护 |
 | 传输 | 中间人窃听 | 强制 wss/TLS；附件用签名 URL + 防盗链 |
 | 附件 | 任意文件/盗链 | 预签名上传 + MIME/大小校验 + 私有桶 + 临时签名读 URL |
-| 多租隔离 | 跨空间数据泄露 | documentName 含 space/folder；鉴权按 doc_member + owner（与 space 无关，space 仅组织维度）；Redis key 前缀隔离 |
+| 多租隔离 | 跨空间数据泄露 | documentName 含 space/folder；鉴权基线按 doc_member + owner；space 作为**补充**权限来源（仅当文档设置了分享 share_scope=anyone_in_space 时对本空间成员生效，见 #64/§4；不改变直接的 owner/doc_member 授权，`effectiveRole=max(直接角色, 分享派生角色)` 只加不减）；Redis key 前缀隔离 |
 
 ---
 
