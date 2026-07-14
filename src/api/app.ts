@@ -28,7 +28,7 @@ import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
-import { invitesRouter, acceptInviteRouter } from './routes/invites.js'
+import { invitesRouter, acceptInviteRouter, botAcceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
@@ -131,14 +131,18 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // /v1/bot/docs -> docs-backend while other /v1/bot/* -> octo-server. No handler
   // code is copied or forked — each router only reads req.uid / req.spaceId, both
   // of which verifyBot injects (uid from the bot token, spaceId from octo-server's
-  // server-side reverse lookup). Deliberately excludes the public collab-token /
-  // invite-accept routes (those are a separate user-token path) and does NOT mount
-  // spaceContextMiddleware — the bot space is server-resolved, never header-driven.
+  // server-side reverse lookup). The bot invite-accept route (docs #61) is the one
+  // public route re-exposed here: it reuses the human accept transaction via
+  // acceptInviteForUid, reading the bot uid verifyBot injected on req.uid (not a
+  // user session token). The collab-token route stays human-only. This mount does
+  // NOT add spaceContextMiddleware — the bot space is server-resolved, never
+  // header-driven.
   const botApi = Router()
   // Same per-IP rate limit for the bot chain (independent budget from the human
   // mount), mounted ahead of verifyBot so the authorizing bot routes are covered.
   botApi.use(createRateLimiter(opts.rateLimit))
   botApi.use(verifyBotMiddleware)
+  botApi.use(botAcceptInviteRouter) // POST /v1/bot/docs/invites/:inviteToken/accept (docs #61)
   botApi.use(docsRouter)
   botApi.use(membersRouter)
   botApi.use(forwardGrantRouter)

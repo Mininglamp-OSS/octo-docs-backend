@@ -50,8 +50,29 @@ export async function acceptInvite(
   // step 1: verify octo identity -> trusted uid (HARD CONSTRAINT). 401 if not.
   const identity = await getOctoIdentity().verifyToken(octoToken)
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
-  const uid = identity.uid
+  return acceptInviteForUid(identity.uid, inviteToken, nowMs)
+}
 
+/**
+ * Accept an invite on behalf of an ALREADY-TRUSTED uid.
+ *
+ * This is the DB-side transaction, factored out of acceptInvite so a second
+ * caller can reuse the exact same idempotency/branch semantics after resolving
+ * the uid through a different identity path. The human accept route resolves the
+ * uid from an octo session token (see acceptInvite above); the bot accept route
+ * resolves it from the bot bearer token via verifyBot, which injects the trusted
+ * bot uid on req.uid. Either way the uid reaching here is server-verified — never
+ * client-self-reported — so the doc_member row is always a real octo/bot user.
+ *
+ * Only ever returns 200 (success/idempotent) or 410 (invite invalid/expired/
+ * exhausted); the 401 branch belongs to the caller's identity step, which runs
+ * before this function.
+ */
+export async function acceptInviteForUid(
+  uid: string,
+  inviteToken: string,
+  nowMs: number = Date.now(),
+): Promise<AcceptResult> {
   return transaction(async (tx) => {
     // step 2: lock invite row.
     const invite = await docInviteRepo.getForUpdateTx(tx, inviteToken)

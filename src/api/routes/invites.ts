@@ -10,7 +10,7 @@ import { docInviteRepo } from '../../db/repos/docInviteRepo.js'
 import { requireDocRole } from '../guard.js'
 import { newInviteToken } from '../../util/ids.js'
 import { roleToNumber, type Role } from '../../permission/role.js'
-import { acceptInvite } from '../services/acceptInvite.js'
+import { acceptInvite, acceptInviteForUid } from '../services/acceptInvite.js'
 import { extractOctoToken } from '../middleware/auth.js'
 
 export const invitesRouter = Router()
@@ -102,6 +102,28 @@ export const acceptInviteRouter = Router()
 acceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res: Response) => {
   const octoToken = extractOctoToken(req)
   const out = await acceptInvite(octoToken, req.params.inviteToken!)
+  if (!out.ok) {
+    res.status(out.status).json({ error: out.error })
+    return
+  }
+  res.status(200).json(out.body)
+})
+
+/**
+ * POST accept — bot path (§ v4.3, docs #61). Mounted on the bot chain behind
+ * verifyBot, which resolves the bot bearer token to a trusted bot uid and
+ * injects it on req.uid. This handler reuses the SAME accept transaction as the
+ * human route via acceptInviteForUid, so the doc_member row (role/source=invite)
+ * and the invite idempotency/expiry semantics are identical — only the identity
+ * source differs. Exported as its own router so it is mounted ONLY on the bot
+ * chain (the human `/api/v1/docs` mount is untouched). Invite validity (invalid/
+ * expired/exhausted -> 410) applies to the bot exactly as to a human; an invalid
+ * bot token is already rejected upstream by verifyBot (401).
+ */
+export const botAcceptInviteRouter = Router()
+
+botAcceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res: Response) => {
+  const out = await acceptInviteForUid(req.uid!, req.params.inviteToken!)
   if (!out.ok) {
     res.status(out.status).json({ error: out.error })
     return
