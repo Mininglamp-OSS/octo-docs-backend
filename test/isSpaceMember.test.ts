@@ -90,4 +90,32 @@ describe('HttpOctoIdentity.isSpaceMember (#64)', () => {
     expect(await identity.isSpaceMember('u_1', 's1')).toBe(true) // retried, now confirmed
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
+
+  it('bounds a confirmed answer to the cache TTL: a revocation is picked up after it expires (#64 N5)', async () => {
+    // Decision #3: membership revocation is not epoch-bounded on the live socket;
+    // the exposure bound is this cache TTL (SPACE_MEMBERSHIP_CACHE_TTL_SECONDS,
+    // default 30s) for callers that re-derive membership (the REST recheck path).
+    // Prove the bound: a cached `true` is NOT served indefinitely — once the TTL
+    // elapses the next call re-fetches and observes the fresh `false`.
+    vi.useFakeTimers()
+    try {
+      let member = true
+      const fetchMock = vi.fn(async () => membershipResponse(member))
+      vi.stubGlobal('fetch', fetchMock)
+      const identity = new HttpOctoIdentity('http://octo.test')
+
+      expect(await identity.isSpaceMember('u_1', 's1')).toBe(true)
+      member = false // user removed from the space
+      // Within the TTL the stale confirmed `true` is still served (bounded window).
+      vi.advanceTimersByTime(29_000)
+      expect(await identity.isSpaceMember('u_1', 's1')).toBe(true)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      // Past the 30s TTL the entry expires => re-fetch observes the revocation.
+      vi.advanceTimersByTime(2_000)
+      expect(await identity.isSpaceMember('u_1', 's1')).toBe(false)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

@@ -8,17 +8,17 @@ vi.mock('../src/api/guard.js', () => ({
 }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: {
-    setShareSettings: vi.fn(async () => undefined),
+    setShareSettings: vi.fn(async () => 8),
   },
 }))
 vi.mock('../src/permission/epoch.js', () => ({
-  bumpEpoch: vi.fn(async () => 8),
+  refreshAndPublish: vi.fn(async () => undefined),
 }))
 
 import { getShareHandler, putShareHandler } from '../src/api/routes/docs.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
-import { bumpEpoch } from '../src/permission/epoch.js'
+import { refreshAndPublish } from '../src/permission/epoch.js'
 
 interface MockRes {
   statusCode: number
@@ -60,7 +60,7 @@ const guardMeta = (over: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   vi.mocked(requireDocRole).mockReset()
   vi.mocked(docMetaRepo.setShareSettings).mockClear()
-  vi.mocked(bumpEpoch).mockClear()
+  vi.mocked(refreshAndPublish).mockClear()
 })
 
 describe('GET /api/v1/docs/:docId/share (#64)', () => {
@@ -96,9 +96,10 @@ describe('PUT /api/v1/docs/:docId/share (#64)', () => {
     await putShareHandler(req({ shareScope: 'anyone_in_space', shareRole: 'edit' }), res as never)
     expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('admin')
     expect(docMetaRepo.setShareSettings).toHaveBeenCalledWith('d_1', 1, 2)
-    // doc-wide invalidation: bumpEpoch called with (docId, documentName) and NO uid.
-    expect(bumpEpoch).toHaveBeenCalledWith('d_1', 'octo:s1:f_default:d_1')
-    expect(vi.mocked(bumpEpoch).mock.calls[0]!.length).toBe(2)
+    // doc-wide invalidation: refreshAndPublish called with (documentName, newEpoch)
+    // and NO uid — the setShareSettings tx already bumped the epoch atomically.
+    expect(refreshAndPublish).toHaveBeenCalledWith('octo:s1:f_default:d_1', 8)
+    expect(vi.mocked(refreshAndPublish).mock.calls[0]!.length).toBe(2)
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual({ docId: 'd_1', shareScope: 'anyone_in_space', shareRole: 'edit' })
   })
@@ -127,7 +128,7 @@ describe('PUT /api/v1/docs/:docId/share (#64)', () => {
     expect(res.statusCode).toBe(400)
     expect(res.body).toEqual({ error: 'invalid_scope' })
     expect(docMetaRepo.setShareSettings).not.toHaveBeenCalled()
-    expect(bumpEpoch).not.toHaveBeenCalled()
+    expect(refreshAndPublish).not.toHaveBeenCalled()
   })
 
   it('400 invalid_role when anyone_in_space is missing a valid shareRole', async () => {
@@ -150,6 +151,6 @@ describe('PUT /api/v1/docs/:docId/share (#64)', () => {
     const res = mockRes()
     await putShareHandler(req({ shareScope: 'anyone_in_space', shareRole: 'edit' }), res as never)
     expect(docMetaRepo.setShareSettings).not.toHaveBeenCalled()
-    expect(bumpEpoch).not.toHaveBeenCalled()
+    expect(refreshAndPublish).not.toHaveBeenCalled()
   })
 })

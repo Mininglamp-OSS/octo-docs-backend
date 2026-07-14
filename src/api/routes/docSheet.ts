@@ -473,6 +473,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       drawings,
       hyperlinks,
       authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
     })
     if (result.ok) {
       res.status(200).json({

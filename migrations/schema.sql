@@ -41,7 +41,13 @@ CREATE TABLE doc_meta (
   UNIQUE KEY uk_document_name (document_name),    -- document_name 全局唯一
   KEY idx_space (space_id, status, updated_at),
   KEY idx_folder (folder_id, status, updated_at),
-  KEY idx_owner (owner_id, status, updated_at)
+  KEY idx_owner (owner_id, status, updated_at),
+  -- #64 defense-in-depth: keep a fresh DB's DB-level invariants identical to an
+  -- upgraded one (the 2026-07-14-add-doc-share-scope upgrade adds these same two
+  -- CHECKs). Authoritative validation lives in the PUT /share handler; these are
+  -- the backstop so a raw UPDATE with an out-of-enum value fails on BOTH paths.
+  CONSTRAINT chk_doc_meta_share_scope CHECK (share_scope IN (0, 1)),
+  CONSTRAINT chk_doc_meta_share_role  CHECK (share_role  IN (1, 2))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 文档自治成员（v2.0 新增，替代 v1.x 的 doc_acl —— 见下方迁移说明）

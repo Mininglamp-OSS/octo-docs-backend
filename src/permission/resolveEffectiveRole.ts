@@ -1,0 +1,54 @@
+/**
+ * The single membership-aware effective-role resolver (#64, design §5.1).
+ *
+ * Shared by every write-time role-resolution seam — the REST guard
+ * (requireDocRole) and the three transactional write services (editDocBody /
+ * editBoardScene / editDocSheet under their FOR UPDATE lock) — so no seam can
+ * disagree about whether an `anyone_in_space` share member is a writer. Lives in
+ * the permission layer (not api/guard) so the guard and the services depend on
+ * it without a cross-layer import, and so a test that mocks api/guard does not
+ * accidentally strip it from the services.
+ *
+ *   effectiveRole = max(directRole, share-derived)   // only ever raises access
+ *
+ * Membership is resolved LAZILY: only when the doc is `anyone_in_space` AND the
+ * direct role is below what the share path can ever grant (`writer`). A
+ * restricted doc (the default) and any caller already at writer/admin therefore
+ * add ZERO new IO and stay byte-identical to the pre-feature result. A verified
+ * bot's membership is implied by the cross-space gate (req.spaceId ===
+ * meta.space_id, enforced before this runs); a human's is resolved via
+ * isSpaceMember, which fails closed to `false` on any lookup error, so the share
+ * path can only open access on a confirmed membership, never on a failure.
+ */
+import { effectiveRole, SHARE_SCOPE_ANYONE } from './shareScope.js'
+import { roleAtLeast, type ResolvedRole } from './role.js'
+import { getOctoIdentity } from '../auth/octoIdentity.js'
+
+/**
+ * The doc_meta fields the share path reads. A structural type so both the full
+ * DocMeta row (REST guard) and the narrow FOR-UPDATE locked row read by the
+ * transactional write services satisfy it.
+ */
+export interface ShareResolvable {
+  space_id: string
+  share_scope: number
+  share_role: number
+}
+
+/** Caller-principal hint: a verified bot derives membership from its space. */
+export interface ShareCaller {
+  isBot?: boolean
+}
+
+export async function resolveEffectiveRole(
+  uid: string,
+  direct: ResolvedRole,
+  meta: ShareResolvable,
+  caller: ShareCaller = {},
+): Promise<ResolvedRole> {
+  if (meta.share_scope !== SHARE_SCOPE_ANYONE || roleAtLeast(direct, 'writer')) {
+    return direct
+  }
+  const member = caller.isBot ? true : await getOctoIdentity().isSpaceMember(uid, meta.space_id)
+  return effectiveRole(direct, member, meta.share_scope, meta.share_role)
+}

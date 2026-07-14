@@ -77,6 +77,24 @@ describe('recheckCurrentRole — share-aware live recheck (#64)', () => {
     expect(await recheckCurrentRole(KEY, 'u_m')).toBe('reader')
   })
 
+  it('N5 space-membership revocation: scope stays anyone_in_space/edit but the claim is now false => write cut to none', async () => {
+    // Decision #3 (boss-locked): live-socket membership revocation is bounded by
+    // the collab-token TTL (≤ COLLAB_TOKEN_TTL_SECONDS), not epoch-bounded. This
+    // asserts the cut itself: a share-derived writer with no doc_member row, once
+    // their space_member claim resolves false (removed from the space), drops to
+    // `none` on the next recheck even though the doc is STILL anyone_in_space/edit.
+    setup({ share_scope: 1, share_role: 2 }, 'none')
+    expect(await recheckCurrentRole(KEY, 'u_removed', true)).toBe('writer') // still a member
+    expect(await recheckCurrentRole(KEY, 'u_removed', false)).toBe('none') // removed => cut
+  })
+
+  it('N5 revocation preserves a direct doc_member role (share loss only removes the share-derived grant)', async () => {
+    // A removed space member who is ALSO a doc_member keeps their direct role —
+    // revocation only strips the share-derived portion, never the base grant.
+    setup({ share_scope: 1, share_role: 2 }, 'reader')
+    expect(await recheckCurrentRole(KEY, 'u_both', false)).toBe('reader')
+  })
+
   it('deleted / missing doc => none', async () => {
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(null as never)
     expect(await recheckCurrentRole(KEY, 'u_m', true)).toBe('none')

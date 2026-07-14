@@ -91,18 +91,30 @@ export const docMetaRepo = {
   },
 
   /**
-   * Update a doc's share settings (#64). The caller (PUT /share handler) has
-   * already validated + normalized scopeNum/roleNum (restricted forces role=1),
-   * and MUST follow this write with a doc-wide epoch bump so live sessions
-   * re-derive access. Pure UPDATE; the CHECK constraints in the migration are a
-   * defense-in-depth backstop against an out-of-enum value reaching the column.
+   * Update a doc's share settings (#64) AND bump permission_epoch in the SAME
+   * transaction, so a narrowing (e.g. anyone_in_space -> restricted) is atomic:
+   * the row can never be observed at its new scope with a stale epoch, which
+   * would leave live non-members editing until the next unrelated bump. Mirrors
+   * softDelete's flip-status-and-bump pattern. The caller (PUT /share handler)
+   * has already validated + normalized scopeNum/roleNum (restricted forces
+   * role=1); the migration CHECK constraints are a defense-in-depth backstop.
+   * Returns the new epoch so the caller refreshes caches + publishes the
+   * invalidation event (via refreshAndPublish), exactly like softDelete.
    */
-  async setShareSettings(docId: string, scopeNum: number, roleNum: number): Promise<void> {
-    await query('UPDATE doc_meta SET share_scope = ?, share_role = ? WHERE doc_id = ?', [
-      scopeNum,
-      roleNum,
-      docId,
-    ])
+  async setShareSettings(docId: string, scopeNum: number, roleNum: number): Promise<number> {
+    return transaction(async (tx) => {
+      await tx.query('UPDATE doc_meta SET share_scope = ?, share_role = ? WHERE doc_id = ?', [
+        scopeNum,
+        roleNum,
+        docId,
+      ])
+      await docMetaRepo.bumpEpochTx(tx, docId)
+      const rows = await tx.query<{ permission_epoch: number }>(
+        'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+        [docId],
+      )
+      return Number(rows[0]?.permission_epoch ?? 0)
+    })
   },
 
   /**

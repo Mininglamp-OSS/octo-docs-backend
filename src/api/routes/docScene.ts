@@ -182,6 +182,7 @@ export async function patchDocSceneHandler(req: Request, res: Response): Promise
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       ops,
       authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
     })
     if (result.ok) {
       res.status(200).json({

@@ -404,10 +404,13 @@ export async function putShareHandler(req: Request, res: Response) {
     // restricted: normalize+persist read, ignoring any body shareRole.
     roleNum = SHARE_ROLE_READ
   }
-  await docMetaRepo.setShareSettings(guard.meta.doc_id, scopeNum, roleNum)
-  // Doc-wide invalidation (no uid): a narrowing must cut every non-member's live
-  // session; live sessions re-derive access on the epoch bump (§3.2 / §5.3).
-  await bumpEpoch(guard.meta.doc_id, guard.meta.document_name)
+  // Flip the share settings AND bump the epoch atomically (one transaction), so
+  // a narrowing is never observable at the new scope with a stale epoch. Then
+  // refresh caches + publish the doc-wide invalidation (no uid) so every
+  // non-member's live session re-derives access (§3.2 / §5.3), mirroring the
+  // softDelete -> refreshAndPublish path.
+  const newEpoch = await docMetaRepo.setShareSettings(guard.meta.doc_id, scopeNum, roleNum)
+  await refreshAndPublish(guard.meta.document_name, newEpoch)
   res.status(200).json({
     docId: guard.meta.doc_id,
     shareScope: shareScopeName(scopeNum),

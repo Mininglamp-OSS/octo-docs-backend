@@ -196,6 +196,7 @@ export async function patchDocContentHandler(req: Request, res: Response): Promi
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       ops,
       authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
     })
     if (result.ok) {
       res.status(200).json({

@@ -5,8 +5,7 @@ import type { Response } from 'express'
 import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
 import { resolveRole } from '../permission/resolveRole.js'
 import { roleAtLeast, type ResolvedRole, type Role } from '../permission/role.js'
-import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
-import { getOctoIdentity } from '../auth/octoIdentity.js'
+import { resolveEffectiveRole } from '../permission/resolveEffectiveRole.js'
 
 export interface DocGuard {
   meta: DocMeta
@@ -80,18 +79,13 @@ export async function requireDocRole(
   }
   const direct = await resolveRole(uid, docId)
   // #64 space-scoped share (design §5.1): effectiveRole = max(directRole,
-  // share-derived). Resolved LAZILY — only when the direct role is insufficient
-  // AND the doc is anyone_in_space — so restricted docs (the default) and
-  // already-authorized callers add zero new IO. A bot's membership is implied by
-  // the cross-space gate above (req.spaceId === meta.space_id); a human's is
-  // resolved via isSpaceMember (fail-closed false on any lookup error => 403).
-  let role = direct
-  if (!roleAtLeast(direct, minRole) && meta.share_scope === SHARE_SCOPE_ANYONE) {
-    const member = caller.isBot
-      ? true
-      : await getOctoIdentity().isSpaceMember(uid, meta.space_id)
-    role = effectiveRole(direct, member, meta.share_scope, meta.share_role)
-  }
+  // share-derived). Resolved through the shared seam so the returned role is the
+  // caller's TRUE effective role — not merely "enough to pass minRole". A direct
+  // reader of an anyone_in_space/edit doc must be reported as `writer` here (the
+  // read/load responses echo guard.role to the client), so the resolution is NOT
+  // gated on minRole; resolveEffectiveRole still short-circuits (zero IO) for
+  // restricted docs and callers already at writer/admin.
+  const role = await resolveEffectiveRole(uid, direct, meta, caller)
   if (role === 'none' || !roleAtLeast(role, minRole)) {
     res.status(403).json({ error: 'forbidden' })
     return null
