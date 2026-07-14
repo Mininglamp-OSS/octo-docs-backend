@@ -165,10 +165,16 @@ function setCellAttrs(node: { attrs: Record<string, unknown> }): Record<string, 
  *
  * The attrs survive the Y.Doc <-> ProseMirror round-trip as node attrs
  * regardless of DOM serialization; the style mapping only governs HTML
- * import/export. Every value is whitelist-sanitized at BOTH parse and render
- * (see the sanitizers below) so a hostile inline style can never enter the
- * Y.Doc nor serialize back out — the same both-ends-sanitize pattern the
- * bookmark URL uses.
+ * import/export. Every value is whitelist-sanitized on all THREE paths that can
+ * put a value into (or take one out of) the Y.Doc:
+ *   1. HTML import  — `getBlockAttrs` (parseDOM getAttrs) reads the inline style.
+ *   2. HTML export  — `setBlockAttrs` (toDOM) re-sanitizes before serializing.
+ *   3. JSON write   — `sanitizeBlockAttrValues` runs over every node parsed from
+ *      untrusted `PMNode.fromJSON` input (the authoritative bot/API write path,
+ *      which never touches parseDOM/getAttrs — see the function's own comment).
+ * So a hostile inline style can neither enter the Y.Doc through any write path
+ * nor serialize back out — the same both-ends-sanitize pattern the bookmark URL
+ * uses, extended to the DOM-less JSON write path.
  */
 const VALID_TEXT_ALIGNS = new Set(['left', 'center', 'right', 'justify'])
 
@@ -226,6 +232,63 @@ function setBlockAttrs(node: { attrs: Record<string, unknown> }): Record<string,
   const spaceAfter = sanitizeSpacing(node.attrs.spaceAfter)
   if (spaceAfter) decls.push(`margin-bottom: ${spaceAfter}`)
   return decls.length ? { style: decls.join('; ') } : {}
+}
+
+/**
+ * The set of block node types that carry the v17 block-spacing attrs. Kept in
+ * one place so the JSON-write sanitizer below stays in lockstep with the two
+ * node definitions in buildSchema().
+ */
+const BLOCK_SPACING_NODE_TYPES = new Set(['paragraph', 'heading'])
+
+/**
+ * Sanitize the v17 block-spacing attr VALUES (lineHeight / spaceBefore /
+ * spaceAfter) on every paragraph / heading in a ProseMirror-JSON tree, coercing
+ * any value that fails the whitelist to `null`. Mutates the passed JSON in place
+ * and returns it.
+ *
+ * WHY this exists (the parse-side sanitizer is not enough): `getBlockAttrs`
+ * (parseDOM getAttrs) only runs on the HTML-import path. The authoritative
+ * client/bot write path is JSON, not HTML — `PATCH /:docId/content` →
+ * editDocBody → applyIncrementalOps → parseContent → `PMNode.fromJSON(schema,
+ * json)`. `PMNode.fromJSON` reads `attrs` verbatim (via `computeAttrs`) and
+ * `.check()` only validates attr SHAPE/existence, never the VALUE — neither one
+ * calls parseDOM/getAttrs. So without this pass an API caller can smuggle a
+ * hostile `lineHeight` / `spaceBefore` / `spaceAfter` (e.g. a multi-declaration
+ * `"1.5; position: fixed; ..."`) straight into the Y.Doc, where it round-trips
+ * through prosemirrorJSONToYDocState ↔ yDocStateToProsemirrorJSON and is handed
+ * back verbatim by `GET /:docId/content`.
+ *
+ * Running this over every node parsed from untrusted JSON restores the
+ * "hostile value never enters the Y.Doc" invariant on the JSON write path,
+ * matching the guarantee the HTML parse path already had.
+ */
+export function sanitizeBlockAttrValues(json: unknown): unknown {
+  if (Array.isArray(json)) {
+    for (const child of json) sanitizeBlockAttrValues(child)
+    return json
+  }
+  if (!json || typeof json !== 'object') return json
+  const node = json as {
+    type?: unknown
+    attrs?: Record<string, unknown>
+    content?: unknown
+  }
+  if (
+    typeof node.type === 'string' &&
+    BLOCK_SPACING_NODE_TYPES.has(node.type) &&
+    node.attrs &&
+    typeof node.attrs === 'object'
+  ) {
+    const attrs = node.attrs
+    if ('lineHeight' in attrs) attrs.lineHeight = sanitizeLineHeight(attrs.lineHeight)
+    if ('spaceBefore' in attrs) attrs.spaceBefore = sanitizeSpacing(attrs.spaceBefore)
+    if ('spaceAfter' in attrs) attrs.spaceAfter = sanitizeSpacing(attrs.spaceAfter)
+  }
+  // Recurse into children so nested paragraphs/headings (list items, table
+  // cells, blockquotes, details, callouts) are covered too.
+  if (node.content !== undefined) sanitizeBlockAttrValues(node.content)
+  return json
 }
 
 /**
