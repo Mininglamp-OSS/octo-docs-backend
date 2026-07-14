@@ -525,3 +525,47 @@ describe('renderTypst — nodes', () => {
     expect(Math.min(...frs)).toBeCloseTo(0.6, 1)
   })
 })
+
+describe('renderTypst — v17 paragraph spacing (lineHeight / spaceBefore / spaceAfter)', () => {
+  it('maps lineHeight to par(leading) as (L-1)em', () => {
+    const out = typ([{ type: 'paragraph', attrs: { lineHeight: '1.5' }, content: [text('hi')] }])
+    expect(out).toContain('#set par(leading: 0.500em)')
+  })
+
+  it('maps spaceBefore/spaceAfter (px) to a block above/below in pt', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { spaceBefore: '8px', spaceAfter: '12px' }, content: [text('hi')] },
+    ])
+    expect(out).toContain('#block(above: 6.0pt, below: 9.0pt)')
+  })
+
+  it('leaves a plain paragraph free of block/leading wrapping', () => {
+    const out = typ([para([text('plain')])])
+    expect(out).not.toContain('#set par(leading')
+    expect(out).not.toContain('#block(above')
+  })
+
+  it('drops out-of-range spacing (>1000) to match the schema sanitizer cap', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { spaceBefore: '10000px', spaceAfter: '1001em' }, content: [text('hi')] },
+    ])
+    // 10000px would map to 7500.0pt and 1001em to 1001em if not capped; both must be dropped.
+    expect(out).not.toContain('7500.0pt')
+    expect(out).not.toContain('1001em')
+    expect(out).not.toContain('#block(above')
+  })
+
+  it('keeps spacing at the 1000 boundary (px → pt)', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { spaceBefore: '1000px' }, content: [text('hi')] },
+    ])
+    expect(out).toContain('#block(above: 750.0pt)')
+  })
+
+  it('composes alignment with spacing (align stays innermost)', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { textAlign: 'center', lineHeight: '2' }, content: [text('c')] },
+    ])
+    expect(out).toContain('#set par(leading: 1.000em); #align(center)')
+  })
+})

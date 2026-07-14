@@ -54,8 +54,8 @@ const SCHEMA_MARKS = [
 ] as const
 
 describe('Schema v15 co-land (full @octo/docs-schema parity)', () => {
-  it('reports SCHEMA_VERSION === 16 (v16 co-land carries the full v15 set forward)', () => {
-    expect(SCHEMA_VERSION).toBe(16)
+  it('reports SCHEMA_VERSION === 17', () => {
+    expect(SCHEMA_VERSION).toBe(17)
   })
 
   it('defines every front-end SCHEMA_NODES name', () => {

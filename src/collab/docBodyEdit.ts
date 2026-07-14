@@ -18,7 +18,7 @@
 import * as Y from 'yjs'
 import { Node as PMNode, type Schema } from 'prosemirror-model'
 import { Transform } from 'prosemirror-transform'
-import { buildSchema, COLLAB_FIELD } from '../schema/index.js'
+import { buildSchema, COLLAB_FIELD, sanitizeBlockAttrValues } from '../schema/index.js'
 import { reconcileFragment, SchemaIncompatibleError } from './versionRestore.js'
 
 /**
@@ -198,7 +198,14 @@ function parseContent(content: unknown, schema: Schema): PMNode[] {
   }
   try {
     return content.map((json) =>
-      PMNode.fromJSON(schema, json as Parameters<typeof PMNode.fromJSON>[1]),
+      // Sanitize the v17 block-spacing attr VALUES before fromJSON: fromJSON +
+      // .check() validate attr shape but never value, and this JSON write path
+      // never touches parseDOM/getAttrs, so an unsanitized hostile lineHeight/
+      // spacing would otherwise reach the Y.Doc (see sanitizeBlockAttrValues).
+      PMNode.fromJSON(
+        schema,
+        sanitizeBlockAttrValues(json) as Parameters<typeof PMNode.fromJSON>[1],
+      ),
     )
   } catch (err) {
     throw new SchemaIncompatibleError(err)
