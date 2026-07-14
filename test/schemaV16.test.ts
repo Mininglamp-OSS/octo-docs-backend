@@ -12,9 +12,9 @@ import {
 // fontFamily (v16), all riding the inline <span style="…"> serialization. This
 // is the backend half of the @octo/docs-schema SCHEMA_VERSION 16 lockstep.
 describe('Schema v16 (SCHEMA-SPEC §16: textStyle.fontFamily)', () => {
-  it('keeps SCHEMA_VERSION at or above 16 (now 17 after the v17 block-spacing attrs; v16 fontFamily carried)', () => {
+  it('keeps SCHEMA_VERSION at or above 16 (now 18 after the v18 indent attr; v16 fontFamily carried)', () => {
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(16)
-    expect(SCHEMA_VERSION).toBe(17)
+    expect(SCHEMA_VERSION).toBe(18)
   })
 
   it('carries the textStyle mark with color (v3) + fontSize (v7) + fontFamily (v16)', () => {
