@@ -1125,7 +1125,9 @@ function typstLength(v: unknown): string | null {
   const m = /^(\d+(?:\.\d+)?)(px|em)$/.exec(v.trim())
   if (!m) return null
   const n = Number(m[1])
-  if (!Number.isFinite(n) || n < 0) return null
+  // Bound at 1000, byte-aligned to the schema `sanitizeSpacing` cap so an
+  // out-of-range length is dropped identically on the export path.
+  if (!Number.isFinite(n) || n < 0 || n > 1000) return null
   return m[2] === 'px' ? `${(n * 0.75).toFixed(1)}pt` : `${m[1]}em`
 }
 

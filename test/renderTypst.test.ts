@@ -545,6 +545,23 @@ describe('renderTypst — v17 paragraph spacing (lineHeight / spaceBefore / spac
     expect(out).not.toContain('#block(above')
   })
 
+  it('drops out-of-range spacing (>1000) to match the schema sanitizer cap', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { spaceBefore: '10000px', spaceAfter: '1001em' }, content: [text('hi')] },
+    ])
+    // 10000px would map to 7500.0pt and 1001em to 1001em if not capped; both must be dropped.
+    expect(out).not.toContain('7500.0pt')
+    expect(out).not.toContain('1001em')
+    expect(out).not.toContain('#block(above')
+  })
+
+  it('keeps spacing at the 1000 boundary (px → pt)', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { spaceBefore: '1000px' }, content: [text('hi')] },
+    ])
+    expect(out).toContain('#block(above: 750.0pt)')
+  })
+
   it('composes alignment with spacing (align stays innermost)', () => {
     const out = typ([
       { type: 'paragraph', attrs: { textAlign: 'center', lineHeight: '2' }, content: [text('c')] },
