@@ -1111,6 +1111,39 @@ function alignArg(attrs: Record<string, unknown> | undefined): string {
   return a === 'justify' ? '' : a // justify handled via par(justify) globally; l/r/c map directly
 }
 
+/**
+ * Map the v17 block-spacing attrs (lineHeight / spaceBefore / spaceAfter) onto
+ * Typst. `lineHeight` is a unitless CSS multiplier L; Typst's `par(leading)` is
+ * the *extra* gap between adjacent lines, so we approximate leading ≈ (L-1)em
+ * (clamped at 0). `spaceBefore`/`spaceAfter` are px/em lengths mapped to a
+ * `#block(above:…, below:…)` (px → pt at the 0.75 CSS ratio used elsewhere in
+ * this renderer). Returns the inner content unchanged when no spacing attr is
+ * set, so plain paragraphs keep their exact prior output.
+ */
+function typstLength(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  const m = /^(\d+(?:\.\d+)?)(px|em)$/.exec(v.trim())
+  if (!m) return null
+  const n = Number(m[1])
+  if (!Number.isFinite(n) || n < 0) return null
+  return m[2] === 'px' ? `${(n * 0.75).toFixed(1)}pt` : `${m[1]}em`
+}
+
+function applyParSpacing(attrs: Record<string, unknown> | undefined, inner: string): string {
+  const lhRaw = attrs?.lineHeight
+  const lh =
+    typeof lhRaw === 'string' && /^\d+(\.\d+)?$/.test(lhRaw.trim()) ? Number(lhRaw) : NaN
+  const leading = Number.isFinite(lh) && lh > 0 ? Math.max(0, lh - 1) : null
+  const above = typstLength(attrs?.spaceBefore)
+  const below = typstLength(attrs?.spaceAfter)
+  if (leading == null && !above && !below) return inner
+  const content = leading != null ? `#set par(leading: ${leading.toFixed(3)}em); ${inner}` : inner
+  const blockArgs: string[] = []
+  if (above) blockArgs.push(`above: ${above}`)
+  if (below) blockArgs.push(`below: ${below}`)
+  return blockArgs.length ? `#block(${blockArgs.join(', ')})[${content}]` : `#block[${content}]`
+}
+
 function renderChildren(node: PMNode, ctx: RenderCtx): string {
   return (node.content ?? []).map((c) => renderNode(c, ctx)).join('')
 }
@@ -1200,7 +1233,8 @@ function renderNode(node: PMNode, ctx: RenderCtx): string {
     case 'paragraph': {
       const body = renderChildren(node, c)
       const al = alignArg(attrs)
-      const inner = al ? `#align(${al})[${body}]` : body
+      const aligned = al ? `#align(${al})[${body}]` : body
+      const inner = applyParSpacing(attrs, aligned)
       return `\n${inner}\n`
     }
     case 'heading': {

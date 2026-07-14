@@ -525,3 +525,30 @@ describe('renderTypst — nodes', () => {
     expect(Math.min(...frs)).toBeCloseTo(0.6, 1)
   })
 })
+
+describe('renderTypst — v17 paragraph spacing (lineHeight / spaceBefore / spaceAfter)', () => {
+  it('maps lineHeight to par(leading) as (L-1)em', () => {
+    const out = typ([{ type: 'paragraph', attrs: { lineHeight: '1.5' }, content: [text('hi')] }])
+    expect(out).toContain('#set par(leading: 0.500em)')
+  })
+
+  it('maps spaceBefore/spaceAfter (px) to a block above/below in pt', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { spaceBefore: '8px', spaceAfter: '12px' }, content: [text('hi')] },
+    ])
+    expect(out).toContain('#block(above: 6.0pt, below: 9.0pt)')
+  })
+
+  it('leaves a plain paragraph free of block/leading wrapping', () => {
+    const out = typ([para([text('plain')])])
+    expect(out).not.toContain('#set par(leading')
+    expect(out).not.toContain('#block(above')
+  })
+
+  it('composes alignment with spacing (align stays innermost)', () => {
+    const out = typ([
+      { type: 'paragraph', attrs: { textAlign: 'center', lineHeight: '2' }, content: [text('c')] },
+    ])
+    expect(out).toContain('#set par(leading: 1.000em); #align(center)')
+  })
+})

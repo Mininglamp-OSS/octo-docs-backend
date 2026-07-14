@@ -67,6 +67,16 @@ export const COLLAB_FIELD = 'default'
  *         color and font-size). SCHEMA_VERSION 16 is the shared front/back
  *         contract for this feature — the octo-web @octo/docs-schema half
  *         registers the SAME number; the backend does NOT self-assign.
+ *   - v17 block-spacing ATTRS on heading/paragraph (no new node/mark, same
+ *         shape as v5 textAlign / v7 fontSize): `lineHeight` (unitless CSS
+ *         multiplier, e.g. "1.5"), `spaceBefore` (margin-top), `spaceAfter`
+ *         (margin-bottom). All default null. They ride the SAME inline `style`
+ *         string as textAlign — the block toDOM merges text-align + line-height
+ *         + margin-top + margin-bottom into ONE style attr in that fixed order
+ *         (see setBlockAttrs — the canonical serialization the frontend
+ *         LineHeight extension byte-aligns to). Values are whitelist-sanitized
+ *         at BOTH parse and render so a hostile style can neither enter the
+ *         Y.Doc nor serialize back out.
  *
  * 14/15 land in the same lockstep as the frontend `@octo/docs-schema` /
  * SCHEMA-SPEC registration (node + attr byte alignment): the front-end Tiptap
@@ -76,7 +86,7 @@ export const COLLAB_FIELD = 'default'
  * horizontalRule + the marks above) use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization, consistent with the image/table nodes here.
  */
-export const SCHEMA_VERSION = 16
+export const SCHEMA_VERSION = 17
 
 /**
  * Shared attrs + DOM mapping for `tableCell` / `tableHeader` (SCHEMA-SPEC §4).
@@ -136,23 +146,86 @@ function setCellAttrs(node: { attrs: Record<string, unknown> }): Record<string, 
 }
 
 /**
- * Shared `textAlign` attr helpers for `paragraph` / `heading` (SCHEMA-SPEC §5,
- * @tiptap/extension-text-align). The attr defaults to null; it rides the inline
- * `style="text-align:…"` (Tiptap's TextAlign rendering) at parse + render, and
- * — most importantly — survives the Y.Doc <-> ProseMirror round-trip as a node
- * attr regardless of DOM serialization.
+ * Shared block-attr helpers for `paragraph` / `heading` (SCHEMA-SPEC §5 + §17).
+ *
+ * These two nodes carry four global attrs that all ride the same inline
+ * `style` string and all default to null:
+ *   - `textAlign`   (v5)  → `text-align:…`   (@tiptap/extension-text-align)
+ *   - `lineHeight`  (v17) → `line-height:…`  (unitless CSS multiplier)
+ *   - `spaceBefore` (v17) → `margin-top:…`
+ *   - `spaceAfter`  (v17) → `margin-bottom:…`
+ *
+ * CANONICAL STYLE SERIALIZATION (frontend `LineHeight` extension MUST byte-align
+ * to this verbatim, or HTML import/export drifts): declarations are emitted only
+ * for non-null attrs, in the FIXED order [text-align, line-height, margin-top,
+ * margin-bottom], each written `prop: value` (single space after the colon) and
+ * joined by `"; "` (semicolon + single space) with NO trailing semicolon.
+ * Examples: `text-align: center`; `line-height: 1.5`;
+ * `text-align: right; line-height: 2; margin-top: 8px; margin-bottom: 12px`.
+ *
+ * The attrs survive the Y.Doc <-> ProseMirror round-trip as node attrs
+ * regardless of DOM serialization; the style mapping only governs HTML
+ * import/export. Every value is whitelist-sanitized at BOTH parse and render
+ * (see the sanitizers below) so a hostile inline style can never enter the
+ * Y.Doc nor serialize back out — the same both-ends-sanitize pattern the
+ * bookmark URL uses.
  */
-function getTextAlignAttrs(dom: unknown): { textAlign: string | null } {
-  const el = dom as {
-    style?: { textAlign?: string }
-    getAttribute(name: string): string | null
-  }
-  return { textAlign: el.style?.textAlign || el.getAttribute('data-text-align') || null }
+const VALID_TEXT_ALIGNS = new Set(['left', 'center', 'right', 'justify'])
+
+// Unitless CSS line-height multiplier: a bare non-negative number in (0, 10].
+function sanitizeLineHeight(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  const s = v.trim()
+  if (!/^\d+(\.\d+)?$/.test(s)) return null
+  const n = Number(s)
+  return Number.isFinite(n) && n > 0 && n <= 10 ? s : null
 }
 
-function setTextAlignAttrs(node: { attrs: Record<string, unknown> }): Record<string, string> {
+// Block spacing: a non-negative length in px or em, capped at 1000 to bound the
+// value (spaceBefore → margin-top, spaceAfter → margin-bottom).
+function sanitizeSpacing(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  const m = /^(\d+(?:\.\d+)?)(px|em)$/.exec(v.trim())
+  if (!m) return null
+  const n = Number(m[1])
+  return Number.isFinite(n) && n >= 0 && n <= 1000 ? `${m[1]}${m[2]}` : null
+}
+
+function getBlockAttrs(dom: unknown): {
+  textAlign: string | null
+  lineHeight: string | null
+  spaceBefore: string | null
+  spaceAfter: string | null
+} {
+  const el = dom as {
+    style?: {
+      textAlign?: string
+      lineHeight?: string
+      marginTop?: string
+      marginBottom?: string
+    }
+    getAttribute(name: string): string | null
+  }
+  const rawAlign = el.style?.textAlign || el.getAttribute('data-text-align') || null
+  return {
+    textAlign: rawAlign && VALID_TEXT_ALIGNS.has(rawAlign) ? rawAlign : null,
+    lineHeight: sanitizeLineHeight(el.style?.lineHeight),
+    spaceBefore: sanitizeSpacing(el.style?.marginTop),
+    spaceAfter: sanitizeSpacing(el.style?.marginBottom),
+  }
+}
+
+function setBlockAttrs(node: { attrs: Record<string, unknown> }): Record<string, string> {
+  const decls: string[] = []
   const textAlign = node.attrs.textAlign as string | null
-  return textAlign ? { style: `text-align: ${textAlign}` } : {}
+  if (textAlign && VALID_TEXT_ALIGNS.has(textAlign)) decls.push(`text-align: ${textAlign}`)
+  const lineHeight = sanitizeLineHeight(node.attrs.lineHeight)
+  if (lineHeight) decls.push(`line-height: ${lineHeight}`)
+  const spaceBefore = sanitizeSpacing(node.attrs.spaceBefore)
+  if (spaceBefore) decls.push(`margin-top: ${spaceBefore}`)
+  const spaceAfter = sanitizeSpacing(node.attrs.spaceAfter)
+  if (spaceAfter) decls.push(`margin-bottom: ${spaceAfter}`)
+  return decls.length ? { style: decls.join('; ') } : {}
 }
 
 /**
@@ -179,7 +252,8 @@ function sanitizeBookmarkUrl(raw: string | null | undefined): string | null {
 /**
  * Build the ProseMirror schema used for server-side Y.Doc <-> ProseMirror
  * conversion (§7.1). Mirrors the frozen `@octo/docs-schema` package at
- * SCHEMA_VERSION 15 — the FULL Tiptap node/mark set — so any front-end-authored
+ * SCHEMA_VERSION 17 — the FULL Tiptap node/mark set (v17 adds the block-spacing
+ * attrs on heading/paragraph) — so any front-end-authored
  * document round-trips through y-prosemirror and `PMNode.fromJSON(...).check()`
  * without loss. The standard nodes/marks use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization; the self-built nodes (image/table/callout/
@@ -192,20 +266,31 @@ export function buildSchema(): Schema {
       paragraph: {
         group: 'block',
         content: 'inline*',
-        attrs: { textAlign: { default: null } },
-        parseDOM: [{ tag: 'p', getAttrs: getTextAlignAttrs }],
-        toDOM: (node) => ['p', setTextAlignAttrs(node), 0],
+        attrs: {
+          textAlign: { default: null },
+          lineHeight: { default: null },
+          spaceBefore: { default: null },
+          spaceAfter: { default: null },
+        },
+        parseDOM: [{ tag: 'p', getAttrs: getBlockAttrs }],
+        toDOM: (node) => ['p', setBlockAttrs(node), 0],
       },
       heading: {
         group: 'block',
         content: 'inline*',
-        attrs: { textAlign: { default: null }, level: { default: 1 } },
+        attrs: {
+          textAlign: { default: null },
+          lineHeight: { default: null },
+          spaceBefore: { default: null },
+          spaceAfter: { default: null },
+          level: { default: 1 },
+        },
         defining: true,
         parseDOM: [1, 2, 3, 4, 5, 6].map((level) => ({
           tag: `h${level}`,
-          getAttrs: (dom) => ({ ...getTextAlignAttrs(dom), level }),
+          getAttrs: (dom) => ({ ...getBlockAttrs(dom), level }),
         })),
-        toDOM: (node) => [`h${node.attrs.level as number}`, setTextAlignAttrs(node), 0],
+        toDOM: (node) => [`h${node.attrs.level as number}`, setBlockAttrs(node), 0],
       },
       // Standard StarterKit-style block nodes brought in by the v15 co-land
       // (lists / task list / blockquote / codeBlock / horizontalRule). Each uses

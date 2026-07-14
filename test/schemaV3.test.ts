@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest'
 import { buildSchema, SCHEMA_VERSION } from '../src/schema/index.js'
 
 describe('Schema v3 marks (SCHEMA-SPEC §3: highlight + textStyle)', () => {
-  it('keeps SCHEMA_VERSION at or above 3 (now 16 after the v16 co-land; v3 marks carried)', () => {
+  it('keeps SCHEMA_VERSION at or above 3 (now 17 after the v17 block-spacing attrs; v3 marks carried)', () => {
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(3)
-    expect(SCHEMA_VERSION).toBe(16)
+    expect(SCHEMA_VERSION).toBe(17)
   })
 
   it('exposes the v3 marks alongside the carried-forward v2 marks', () => {
