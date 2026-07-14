@@ -93,6 +93,9 @@ function mapBlockChildren(
     | { kind: 'callout'; variant: string; ps: OrderedNode[] }
     | { kind: 'blockquote'; variant?: undefined; ps: OrderedNode[] }
     | null = null
+  // Depth of open BlockQuoteStart markers; while > 0, inner BlockQuote-styled
+  // paragraphs are treated as plain paragraphs inside the marker frame.
+  let bqDepth = 0
   const flushStyled = (): void => {
     if (!styledRun) return
     if (styledRun.kind === 'code') content.push(codeBlockFrom(styledRun.ps))
@@ -106,17 +109,56 @@ function mapBlockChildren(
     const tag = orderedTag(child)
     if (tag === 'w:p') {
       // A paragraph whose flow is a display-math wrapper (m:oMathPara) becomes
-      // a block-level math node rather than a paragraph.
-      const blockMath = blockMathOf(child, warnings)
+      // a block-level math node rather than a paragraph — UNLESS it is also a
+      // numbered/bulleted list item (carries w:numPr). A numbered formula
+      // ("1. x^2 = ...") must stay a list item (the math rendered inline inside
+      // it) so its number survives; treating it as standalone blockMath drops
+      // the list entirely (the "12345 都没了" bug).
+      const blockMath = hasNumPr(child) ? null : blockMathOf(child, warnings)
       if (blockMath) {
         flushList()
         flushStyled()
         content.push(blockMath)
         continue
       }
+      // Code block boundary marker: flush the current CodeBlock run so an
+      // immediately-following code block starts a NEW codeBlock node instead of
+      // merging. The marker itself carries no content and is dropped.
+      if (codeBlockEndMarker(child)) {
+        flushStyled()
+        continue
+      }
       // Code block / callout paragraphs (recognised by pStyle). Group runs of
       // the same kind; a callout run also requires the same variant.
       const styled = styledKindOf(child)
+      // Blockquote boundary markers (BlockQuoteStart / BlockQuoteEnd) bracket a
+      // quote's content; foldBlockquote() rebuilds the quote (and nesting) from
+      // them. Handle these BEFORE the pStyle grouping: inside a frame, a
+      // `BlockQuote`-styled paragraph is a plain quote paragraph, not a separate
+      // grouped blockquote node (the frame is the wrapper).
+      const bqMarker = blockquoteMarkerOf(child)
+      if (bqMarker === 'start') {
+        flushList()
+        flushStyled()
+        bqDepth++
+        content.push({ type: '__blockquoteStart' } as unknown as PmNode)
+        continue
+      }
+      if (bqMarker === 'end') {
+        flushList()
+        flushStyled()
+        if (bqDepth > 0) bqDepth--
+        content.push({ type: '__blockquoteEnd' } as unknown as PmNode)
+        continue
+      }
+      if (styled && styled.kind === 'blockquote' && bqDepth > 0) {
+        // Inside a marker frame: emit as a plain paragraph so foldBlockquote
+        // wraps it once (avoids double-wrapping via the legacy pStyle grouping).
+        flushList()
+        flushStyled()
+        content.push(...mapParagraph(child, rels, warnings))
+        continue
+      }
       if (styled) {
         flushList()
         if (
@@ -183,7 +225,7 @@ function mapBlockChildren(
   }
   flushList()
   flushStyled()
-  return foldDetails(content)
+  return foldDetails(foldBlockquote(content))
 }
 
 /** Paragraph-style ids our exporter uses for code blocks / callouts. */
@@ -213,6 +255,83 @@ function detailsMarkerOf(p: OrderedNode): 'start' | 'end' | 'summary' | null {
   if (key === 'detailsend') return 'end'
   if (key === 'detailssummary') return 'summary'
   return null
+}
+
+/**
+ * Classify a paragraph as a blockquote boundary marker by its pStyle
+ * (BlockQuoteStart / BlockQuoteEnd), or null otherwise. These invisible markers
+ * bracket a quote's content so any inner block (list, nested quote, …) stays
+ * inside the quote on re-import.
+ */
+function blockquoteMarkerOf(p: OrderedNode): 'start' | 'end' | null {
+  const pChildren = kids(p, 'w:p')
+  const pPr = firstChild(pChildren, 'w:pPr')
+  if (!pPr) return null
+  const styleId = orderedAttr(firstChild(kids(pPr, 'w:pPr'), 'w:pStyle') ?? {}, 'w:val')
+  if (!styleId) return null
+  const key = styleId.toLowerCase().replace(/\s+/g, '')
+  if (key === 'blockquotestart') return 'start'
+  if (key === 'blockquoteend') return 'end'
+  return null
+}
+
+/**
+ * True if the paragraph is the invisible `CodeBlockEnd` boundary marker the
+ * exporter appends after each code block (so adjacent code blocks do not merge).
+ */
+function codeBlockEndMarker(p: OrderedNode): boolean {
+  const pChildren = kids(p, 'w:p')
+  const pPr = firstChild(pChildren, 'w:pPr')
+  if (!pPr) return false
+  const styleId = orderedAttr(firstChild(kids(pPr, 'w:pPr'), 'w:pStyle') ?? {}, 'w:val')
+  if (!styleId) return false
+  return styleId.toLowerCase().replace(/\s+/g, '') === 'codeblockend'
+}
+
+/**
+ * Fold a linear block list containing blockquote sentinels
+ * (`__blockquoteStart` / …content… / `__blockquoteEnd`) into nested `blockquote`
+ * nodes. Mirrors foldDetails: a stack handles arbitrary nesting, and malformed
+ * markers degrade gracefully (unmatched End dropped, open frames flushed).
+ */
+function foldBlockquote(blocks: PmNode[]): PmNode[] {
+  const hasMarker = blocks.some(
+    (b) => b.type === '__blockquoteStart' || b.type === '__blockquoteEnd',
+  )
+  if (!hasMarker) return blocks
+
+  const out: PmNode[] = []
+  const stack: PmNode[][] = []
+  const emit = (node: PmNode): void => {
+    if (stack.length > 0) stack[stack.length - 1]!.push(node)
+    else out.push(node)
+  }
+  const closeFrame = (content: PmNode[]): PmNode => ({
+    type: 'blockquote',
+    // Fold any details sentinels that were nested inside this quote.
+    content:
+      content.length > 0 ? foldDetails(content) : [{ type: 'paragraph', content: [] }],
+  })
+
+  for (const b of blocks) {
+    if (b.type === '__blockquoteStart') {
+      stack.push([])
+    } else if (b.type === '__blockquoteEnd') {
+      const frame = stack.pop()
+      if (!frame) continue // unmatched End: drop
+      emit(closeFrame(frame))
+    } else {
+      emit(b)
+    }
+  }
+  // Flush any frames left open by malformed input (missing End markers).
+  while (stack.length > 0) {
+    const frame = stack.pop()!
+    const node = closeFrame(frame)
+    if (stack.length > 0) stack[stack.length - 1]!.push(node)
+    else out.push(node)
+  }
+  return out
 }
 
 /**
@@ -271,7 +390,8 @@ function foldDetails(blocks: PmNode[]): PmNode[] {
     return {
       type: 'details',
       attrs: { open: false },
-      content: [summary, { type: 'detailsContent', content }],
+      // Fold any blockquote sentinels nested inside this details content.
+      content: [summary, { type: 'detailsContent', content: foldBlockquote(content) }],
     }
   }
 
@@ -372,6 +492,30 @@ function blockquoteFrom(ps: OrderedNode[], rels: RelMap, warnings: string[]): Pm
 }
 
 /** Concatenated plain text of a paragraph (w:t across all runs), ignoring marks. */
+/**
+ * A thematic break (horizontal rule). The exporter emits an empty paragraph
+ * carrying only a bottom border. Detect that, and (for older exports) a
+ * paragraph whose entire visible text is a run of horizontal-line glyphs
+ * (─ box-drawing, — em dash, - hyphen, _ underscore), with no other content.
+ */
+function isHorizontalRule(pPrChildren: OrderedNode[], p: OrderedNode): boolean {
+  // (a) empty paragraph with a bottom border (`w:pBdr/w:bottom`).
+  const pBdr = firstChild(pPrChildren, 'w:pBdr')
+  if (pBdr) {
+    const bottom = firstChild(kids(pBdr, 'w:pBdr'), 'w:bottom')
+    const val = bottom ? orderedAttr(bottom, 'w:val') : null
+    const hasBorder = !!bottom && val !== 'none' && val !== 'nil'
+    if (hasBorder && paragraphPlainText(p).trim() === '') return true
+  }
+  // (b) back-compat: text is only line glyphs (≥ 3 chars), nothing else.
+  const text = paragraphPlainText(p).trim()
+  if (text.length >= 3 && /^[\u2500\u2014\u2015\-_]+$/.test(text)) {
+    // Guard: the paragraph must not carry images or other embedded blocks.
+    return true
+  }
+  return false
+}
+
 function paragraphPlainText(p: OrderedNode): string {
   let s = ''
   for (const child of kids(p, 'w:p')) {
@@ -462,7 +606,12 @@ function listLineOf(
       const kind = numbering ? numbering.kindOf(numId, ilvl) : 'bullet'
       const { inline, blocks } = collectInline(pChildren, rels, warnings)
       if (blocks.length) warnings.push('an image inside a list item was dropped')
-      return { ilvl: Number.isFinite(ilvl) && ilvl >= 0 ? ilvl : 0, kind, inline }
+      const safeIlvl = Number.isFinite(ilvl) && ilvl >= 0 ? ilvl : 0
+      // An ordered list's first number (w:start / w:startOverride) so a list
+      // beginning at 20/41 is not silently reset to 1 on import.
+      const start =
+        kind === 'ordered' && numbering ? numbering.startOf(numId, safeIlvl) : undefined
+      return { ilvl: safeIlvl, kind, inline, start }
     }
   }
 
@@ -512,6 +661,15 @@ function mapParagraph(p: OrderedNode, rels: RelMap, warnings: string[]): PmNode[
   const pPrChildren = pPr ? kids(pPr, 'w:pPr') : []
   const styleId = pPr ? orderedAttr(firstChild(pPrChildren, 'w:pStyle') ?? {}, 'w:val') : null
   const align = readAlign(pPrChildren)
+
+  // Thematic break (horizontal rule). The exporter writes an empty paragraph
+  // whose only property is a bottom border (`w:pBdr/w:bottom`). Older exports
+  // used a centered run of box-drawing dashes instead, so also recognise a
+  // paragraph whose entire text is a run of ─ / — / - / _ glyphs. Either form
+  // maps back to a single `horizontalRule` node.
+  if (isHorizontalRule(pPrChildren, p)) {
+    return [{ type: 'horizontalRule' }]
+  }
 
   // Images are block-level atoms in the schema, so they cannot live in the
   // paragraph's inline content. collectInline separates them out; we emit them
@@ -563,6 +721,13 @@ function blockMathOf(p: OrderedNode, warnings: string[]): PmNode | null {
   if (latex) return mathNode(latex, true)
   warnings.push('a block formula could not be converted')
   return null
+}
+
+/** True when a paragraph carries a list numbering reference (w:pPr/w:numPr). */
+function hasNumPr(p: OrderedNode): boolean {
+  const pPr = firstChild(kids(p, 'w:p'), 'w:pPr')
+  if (!pPr) return false
+  return firstChild(kids(pPr, 'w:pPr'), 'w:numPr') != null
 }
 
 function readAlign(pPrChildren: OrderedNode[]): string | null {
@@ -725,6 +890,21 @@ function marksFromRunProps(rPr: OrderedNode | undefined): PmMark[] {
   if (highlight && highlight !== 'none') {
     const col = safeCssColor(highlight)
     marks.push(col ? { type: 'highlight', attrs: { color: col } } : { type: 'highlight' })
+  } else {
+    // Exporter emits an arbitrary highlight colour as `w:shd` (shading fill), not
+    // `w:highlight` (which is limited to ~16 named colours). Read the shading
+    // fill back into the highlight mark so a self-exported doc round-trips its
+    // exact background colour. `w:shd/@w:fill` of `auto` / absent means no fill.
+    // Guard: inline `code` runs are exported as `w:shd fill=F0F0F0` + the code
+    // font; that shading is the code chip background, NOT a user highlight, so
+    // skip it when the run carries the code font.
+    const shdFill = ooxmlHexColor(orderedAttr(firstChild(c, 'w:shd') ?? {}, 'w:fill'))
+    const runFont = orderedAttr(firstChild(c, 'w:rFonts') ?? {}, 'w:ascii')
+    const isCodeFont =
+      runFont != null && /^(consolas|courier new)$/i.test(runFont.trim())
+    if (shdFill && !(isCodeFont && shdFill === '#f0f0f0')) {
+      marks.push({ type: 'highlight', attrs: { color: shdFill } })
+    }
   }
 
   const color = ooxmlHexColor(orderedAttr(firstChild(c, 'w:color') ?? {}, 'w:val'))

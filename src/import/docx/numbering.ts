@@ -18,6 +18,13 @@ export type ListKind = 'ordered' | 'bullet'
 export interface Numbering {
   /** (numId → ilvl → kind). Missing entries default to 'bullet'. */
   kindOf(numId: string, ilvl: number): ListKind
+  /**
+   * (numId → ilvl → first number). The list's starting value, read from the
+   * level's `w:start` (or a `w:num`-level `w:startOverride`). Missing entries
+   * return 1. Lets an ordered list that begins at e.g. 20/41 keep its numbering
+   * instead of silently restarting at 1 on import.
+   */
+  startOf(numId: string, ilvl: number): number
 }
 
 /** OOXML w:numFmt/@w:val values that mean "ordered" (everything else = bullet). */
@@ -42,8 +49,12 @@ const ORDERED_FORMATS = new Set([
 export function parseNumbering(numberingXml: Buffer | undefined): Numbering {
   // abstractNumId → (ilvl → kind)
   const abstract = new Map<string, Map<number, ListKind>>()
+  // abstractNumId → (ilvl → start value from the level's w:start)
+  const abstractStart = new Map<string, Map<number, number>>()
   // numId → abstractNumId
   const numToAbstract = new Map<string, string>()
+  // numId → (ilvl → startOverride) from <w:num>/<w:lvlOverride>/<w:startOverride>
+  const startOverride = new Map<string, Map<number, number>>()
 
   if (numberingXml) {
     const root = parseXml(numberingXml)
@@ -53,18 +64,33 @@ export function parseNumbering(numberingXml: Buffer | undefined): Numbering {
         const abstractId = attr(an, 'w:abstractNumId')
         if (!abstractId) continue
         const levels = new Map<number, ListKind>()
+        const starts = new Map<number, number>()
         for (const lvl of asArray<XmlNode>(an['w:lvl'])) {
           const ilvl = Number(attr(lvl, 'w:ilvl') ?? '0')
           const fmt = (attr(asArray<XmlNode>(lvl['w:numFmt'])[0], 'w:val') ?? '').toLowerCase()
           // 'none' formats render no marker but are still list levels; treat as bullet.
           levels.set(ilvl, ORDERED_FORMATS.has(fmt) ? 'ordered' : 'bullet')
+          const start = Number(attr(asArray<XmlNode>(lvl['w:start'])[0], 'w:val') ?? '')
+          if (Number.isFinite(start)) starts.set(ilvl, start)
         }
         abstract.set(abstractId, levels)
+        abstractStart.set(abstractId, starts)
       }
       for (const num of asArray<XmlNode>(numbering['w:num'])) {
         const numId = attr(num, 'w:numId')
         const abstractId = attr(asArray<XmlNode>(num['w:abstractNumId'])[0], 'w:val')
         if (numId && abstractId) numToAbstract.set(numId, abstractId)
+        // A <w:lvlOverride>/<w:startOverride> on the instance wins over the
+        // abstract level's own w:start (Word uses this to restart/continue).
+        if (numId) {
+          const ov = new Map<number, number>()
+          for (const lo of asArray<XmlNode>(num['w:lvlOverride'])) {
+            const ilvl = Number(attr(lo, 'w:ilvl') ?? '0')
+            const so = Number(attr(asArray<XmlNode>(lo['w:startOverride'])[0], 'w:val') ?? '')
+            if (Number.isFinite(so)) ov.set(ilvl, so)
+          }
+          if (ov.size) startOverride.set(numId, ov)
+        }
       }
     }
   }
@@ -81,6 +107,15 @@ export function parseNumbering(numberingXml: Buffer | undefined): Numbering {
         if (k) return k
       }
       return 'bullet'
+    },
+    startOf(numId: string, ilvl: number): number {
+      // Instance-level startOverride wins, then the abstract level's w:start.
+      const ov = startOverride.get(numId)?.get(ilvl)
+      if (ov != null && Number.isFinite(ov)) return ov
+      const abstractId = numToAbstract.get(numId)
+      if (abstractId == null) return 1
+      const start = abstractStart.get(abstractId)?.get(ilvl)
+      return start != null && Number.isFinite(start) ? start : 1
     },
   }
 }

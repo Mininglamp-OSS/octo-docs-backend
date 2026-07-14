@@ -40,7 +40,7 @@ export function ommlToLatex(ommlXml: string): string | null {
     const mmlStr =
       (mml as { outerHTML?: string }).outerHTML ??
       new XMLSerializer().serializeToString(mml as unknown)
-    const latex = MathMLToLaTeX.convert(mmlStr)
+    const latex = MathMLToLaTeX.convert(restoreDefaultFences(mmlStr))
     const trimmed = typeof latex === 'string' ? latex.trim() : ''
     if (!trimmed.length) return null
     const normalized = normalizeRecoveredLatex(trimmed)
@@ -101,15 +101,47 @@ export function normalizeRecoveredLatex(latex: string): string {
   out = out.replace(/\\hdots(?![a-zA-Z])/g, '\\dots')
 
   // 1. Accent operators emitted as \overset{diacritic}{base} → dedicated command.
+  //    `mathml-to-latex` recovers some accents as backslash operators
+  //    (`\cdot`, `\rightarrow`, …) and others as the raw Unicode combining mark
+  //    (e.g. the macron U+0304 for `\bar`, which then breaks KaTeX as a bare
+  //    `\overset{̄}{y}`). Map both forms back to the dedicated accent command.
   const ACCENTS: Array<[RegExp, string]> = [
     [/\\overset\{\\cdot\\cdot\}/g, '\\ddot'],
     [/\\overset\{\\cdot\}/g, '\\dot'],
-    [/\\overset\{\\rightarrow\}/g, '\\vec'],
-    [/\\overset\{\\to\}/g, '\\vec'],
     [/\\overset\{\\sim\}/g, '\\tilde'],
-    [/\\overset\{\^\}/g, '\\hat'],
+    // Raw Unicode combining marks (U+03xx) and standalone accent glyphs the
+    // converter leaves inside \overset. Order: double-mark before single.
+    [/\\overset\{\u0308\}/g, '\\ddot'], // combining diaeresis
+    [/\\overset\{\u0307\}/g, '\\dot'], // combining dot above
+    [/\\overset\{[\u0304\u0305\u00af]\}/g, '\\bar'], // macron / overline / macron glyph
+    [/\\overset\{[\u0303\u02dc\u007e]\}/g, '\\tilde'], // combining tilde / small tilde / ~
   ]
   for (const [re, cmd] of ACCENTS) out = out.replace(re, cmd)
+
+  // 1b. Width-aware accents. An arrow/hat/tilde over a MULTI-token base is a
+  //     wide (stretchy) accent — `\overrightarrow` / `\widehat` / `\widetilde`;
+  //     over a single token it is the narrow `\vec` / `\hat`. `mathml-to-latex`
+  //     collapses both to `\overset{arrow|^}{base}`, so pick the command by the
+  //     base width (a base with a space or >1 char token is "wide").
+  const widthAware: Array<[RegExp, string, string]> = [
+    // arrow (\rightarrow, \to, combining/standalone →) → \overrightarrow | \vec
+    [/\\overset\{(?:\\rightarrow|\\to|[\u20d7\u2192])\}\{((?:[^{}]|\{[^{}]*\})*)\}/g, '\\overrightarrow', '\\vec'],
+    // circumflex (^, combining) → \widehat | \hat
+    [/\\overset\{[\u0302\u005e\^]\}\{((?:[^{}]|\{[^{}]*\})*)\}/g, '\\widehat', '\\hat'],
+  ]
+  for (const [re, wide, narrow] of widthAware) {
+    out = out.replace(re, (_m, base: string) => {
+      const b = base.trim()
+      // "Wide" when the base is more than a single character/token (contains a
+      // space, or has length > 1 after stripping a single \command).
+      const isWide = /\s/.test(b) || b.replace(/^\\[a-zA-Z]+/, '').length > 1 || b.length > 1
+      return `${isWide ? wide : narrow}{${base}}`
+    })
+  }
+
+  // 1c. Overline of a multi-char base comes back as \overset{―|‾}{…}; the
+  //     correct construct is \overline{…} (KaTeX cannot render the bar glyph).
+  out = out.replace(/\\overset\{[\u2015\u2014\u203e]\}/g, '\\overline')
 
   // 2. Multi-letter operator/function names that the library space-separates
   //    (`l i m`, `s i n`, `m o d`) → the dedicated command. This covers both a
@@ -155,12 +187,51 @@ export function normalizeRecoveredLatex(latex: string): string {
   out = out.replace(/\\right(?![a-zA-Z])(?=\s*$)/g, '\\right.')
   out = out.replace(/\\right(?![a-zA-Z])(\s*)(?![)\]}|.\\])/g, '\\right.$1')
 
+  // 4. Multi-line n-ary limits. A stacked subscript/superscript on a big operator
+  //    (\sum_{i=1 \\ j=1}) comes back from OMML as `_{\begin{matrix}…\end{matrix}}`,
+  //    which renders the limits at full body size and misaligned. The correct
+  //    construct is `\substack{…}`, which typesets small, centered, stacked
+  //    limits. Rewrite a matrix that is the DIRECT argument of a `_`/`^` script.
+  out = out.replace(
+    /([_^])\{\s*\\begin\{matrix\}([\s\S]*?)\\end\{matrix\}\s*\}/g,
+    (_m, script: string, body: string) => `${script}{\\substack{${body.trim()}}}`,
+  )
+
+  // 5. `\pmod` round-trips through OMML as a parenthesised delimiter wrapping a
+  //    `mod` operator: `\left(\bmod n\right)`. In that form the leading spacing
+  //    of `\bmod` collapses against `(`, rendering `(modn)`. Restore the proper
+  //    `\pmod{n}` (which typesets `(mod n)` with correct spacing).
+  out = out.replace(
+    /\\left\(\s*\\bmod\s+([^()]*?)\s*\\right\)/g,
+    (_m, operand: string) => `\\pmod{${operand.trim()}}`,
+  )
+
   return out.trim()
 }
 
 /** Escape a string for use inside a RegExp. */
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Restore the default parenthesis fence on `<mfenced>` elements that omml2mathml
+ * left without `open`/`close` attributes.
+ *
+ * OMML delimiters (`<m:d>` with `<m:begChr>`/`<m:endChr>`) always carry explicit
+ * characters, but omml2mathml emits `<mfenced>` WITHOUT open/close when the
+ * delimiter is the MathML default — which is the parenthesis `(`/`)`. Downstream,
+ * `mathml-to-latex` then renders a bare `<mfenced>` around a matrix as
+ * `\begin{bmatrix}` (its own default), silently turning `\begin{pmatrix}` into
+ * square brackets on round-trip. Injecting the explicit `(`/`)` restores the
+ * intended parentheses (→ `\begin{pmatrix}`) without affecting `[`/`{`/`|`
+ * fences, which omml2mathml already annotates.
+ */
+function restoreDefaultFences(mml: string): string {
+  return mml.replace(/<mfenced\b([^>]*)>/g, (whole, attrs: string) => {
+    if (/\bopen\s*=/.test(attrs)) return whole // explicit fence already present
+    return `<mfenced open="(" close=")"${attrs}>`
+  })
 }
 
 /** Ensure the m: prefix is bound; wrap/inject the namespace when missing. */

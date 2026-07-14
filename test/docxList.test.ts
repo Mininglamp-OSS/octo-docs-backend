@@ -123,6 +123,50 @@ describe('parseNumbering', () => {
     expect(parseNumbering(undefined).kindOf('99', 0)).toBe('bullet')
     expect(parseNumbering(xml).kindOf('99', 0)).toBe('bullet')
   })
+
+  it('reads an ordered list first number from w:start / w:startOverride', () => {
+    // A list beginning at 20/41 must keep its numbering on import (not reset to
+    // 1). w:start lives on the abstract level; w:startOverride on the instance.
+    const startXml = Buffer.from(
+      `<?xml version="1.0"?><w:numbering xmlns:w="http://x">
+        <w:abstractNum w:abstractNumId="1">
+          <w:lvl w:ilvl="0"><w:start w:val="20"/><w:numFmt w:val="decimal"/></w:lvl>
+        </w:abstractNum>
+        <w:abstractNum w:abstractNumId="2">
+          <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/></w:lvl>
+        </w:abstractNum>
+        <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
+        <w:num w:numId="3"><w:abstractNumId w:val="2"/>
+          <w:lvlOverride w:ilvl="0"><w:startOverride w:val="41"/></w:lvlOverride>
+        </w:num>
+      </w:numbering>`,
+      'utf8',
+    )
+    const n = parseNumbering(startXml)
+    expect(n.startOf('2', 0)).toBe(20) // from the abstract level's w:start
+    expect(n.startOf('3', 0)).toBe(41) // instance startOverride wins
+    expect(n.startOf('99', 0)).toBe(1) // unknown → default 1
+  })
+})
+
+describe('buildList — ordered list start', () => {
+  const oline = (ilvl: number, text: string, start?: number): ListLine => ({
+    ilvl,
+    kind: 'ordered',
+    inline: [{ type: 'text', text }],
+    start,
+  })
+
+  it('sets orderedList.attrs.start from the first line when > 1', () => {
+    const list = buildList([oline(0, 'x', 20), oline(0, 'y', 20)])[0]!
+    expect(list.type).toBe('orderedList')
+    expect(list.attrs?.start).toBe(20)
+  })
+
+  it('omits start for a default (1) ordered list', () => {
+    const list = buildList([oline(0, 'x', 1), oline(0, 'y')])[0]!
+    expect(list.attrs?.start).toBeUndefined()
+  })
 })
 
 describe('walkDocument — list integration', () => {
@@ -160,5 +204,29 @@ describe('walkDocument — list integration', () => {
     const out = walkDocument(doc(inner), new Map(), numbering)
     expect(out.content[0]!.type).toBe('taskList')
     expect((out.content[0]!.content![0] as any).attrs.checked).toBe(true)
+  })
+
+  it('keeps a numbered paragraph that holds a formula as a list item, not a bare blockMath', () => {
+    // Regression ("12345 都没了"): a numbered list item whose only content is a
+    // display formula was routed to a standalone blockMath, dropping the list
+    // and its number. It must stay an orderedList item with the math inline.
+    const mdoc = (inner: string): Buffer =>
+      Buffer.from(
+        `<?xml version="1.0"?><w:document xmlns:w="http://x" xmlns:w14="http://14" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><w:body>${inner}</w:body></w:document>`,
+        'utf8',
+      )
+    const mathRun =
+      '<m:oMath><m:sSup><m:e><m:r><m:t>x</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup></m:oMath>'
+    const inner =
+      `<w:p><w:pPr><w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>${mathRun}</w:p>` +
+      `<w:p><w:pPr><w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>${mathRun}</w:p>`
+    const out = walkDocument(mdoc(inner), new Map(), numbering)
+    expect(out.content[0]!.type).toBe('orderedList')
+    expect(out.content[0]!.content).toHaveLength(2)
+    const para = (out.content[0]!.content![0] as any).content[0]
+    expect(para.type).toBe('paragraph')
+    expect(para.content[0].type).toBe('inlineMath')
+    // No standalone blockMath leaked out of the list.
+    expect(out.content.some((n: any) => n.type === 'blockMath')).toBe(false)
   })
 })

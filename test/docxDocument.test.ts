@@ -86,6 +86,38 @@ describe('walkDocument — run marks', () => {
     expect(walkDocument(auto, new Map()).content[0]!.content![0]!.marks).toBeUndefined()
   })
 
+  it('maps a named w:highlight to a highlight mark with a CSS colour', () => {
+    const xml = docXml('<w:p><w:r><w:rPr><w:highlight w:val="yellow"/></w:rPr><w:t>h</w:t></w:r></w:p>')
+    expect(walkDocument(xml, new Map()).content[0]!.content![0]!.marks![0]).toEqual({
+      type: 'highlight',
+      attrs: { color: 'yellow' },
+    })
+  })
+
+  it('maps a w:shd fill to a highlight mark (exporter emits arbitrary highlight colours as shading)', () => {
+    const xml = docXml(
+      '<w:p><w:r><w:rPr><w:shd w:val="clear" w:color="auto" w:fill="00FFCC"/></w:rPr><w:t>h</w:t></w:r></w:p>',
+    )
+    expect(walkDocument(xml, new Map()).content[0]!.content![0]!.marks![0]).toEqual({
+      type: 'highlight',
+      attrs: { color: '#00ffcc' },
+    })
+  })
+
+  it('does NOT treat the inline-code shading (F0F0F0 + code font) as a highlight', () => {
+    const xml = docXml(
+      '<w:p><w:r><w:rPr><w:rFonts w:ascii="Consolas"/><w:shd w:val="clear" w:fill="F0F0F0"/></w:rPr><w:t>c</w:t></w:r></w:p>',
+    )
+    const marks = walkDocument(xml, new Map()).content[0]!.content![0]!.marks ?? []
+    expect(marks.some((m) => m.type === 'highlight')).toBe(false)
+  })
+
+  it('ignores w:shd fill="auto" (no real background)', () => {
+    const xml = docXml('<w:p><w:r><w:rPr><w:shd w:val="clear" w:fill="auto"/></w:rPr><w:t>x</w:t></w:r></w:p>')
+    const marks = walkDocument(xml, new Map()).content[0]!.content![0]!.marks ?? []
+    expect(marks.some((m) => m.type === 'highlight')).toBe(false)
+  })
+
   it('emits a hardBreak for w:br and a tab for w:tab', () => {
     const xml = docXml('<w:p><w:r><w:t>a</w:t><w:br/><w:tab/></w:r></w:p>')
     const kinds = walkDocument(xml, new Map()).content[0]!.content!.map((n) => n.type + (n.text ?? ''))
@@ -140,6 +172,53 @@ describe('walkDocument — code blocks & callouts (styled paragraphs)', () => {
         content: [{ type: 'text', text: 'const a = 1\nconst b = 2' }],
       },
     ])
+  })
+
+  it('splits two code blocks at a CodeBlockEnd boundary (does not merge them)', () => {
+    const xml = docXml(
+      '<w:p><w:pPr><w:pStyle w:val="CodeBlock"/></w:pPr><w:r><w:t>a1</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="CodeBlockEnd"/></w:pPr></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="CodeBlock"/></w:pPr><w:r><w:t>b1</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="CodeBlockEnd"/></w:pPr></w:p>',
+    )
+    const out = walkDocument(xml, new Map())
+    expect(out.content).toEqual([
+      { type: 'codeBlock', attrs: { language: null }, content: [{ type: 'text', text: 'a1' }] },
+      { type: 'codeBlock', attrs: { language: null }, content: [{ type: 'text', text: 'b1' }] },
+    ])
+  })
+
+  it('rebuilds a blockquote from BlockQuote markers, keeping an inner (non-quote) block inside', () => {
+    // A paragraph WITHOUT the BlockQuote pStyle (e.g. a list would be like this)
+    // still stays inside the quote because the Start/End frame brackets it.
+    const xml = docXml(
+      '<w:p><w:pPr><w:pStyle w:val="BlockQuoteStart"/></w:pPr></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="BlockQuote"/></w:pPr><w:r><w:t>quote line</w:t></w:r></w:p>' +
+        '<w:p><w:r><w:t>inner non-quote block</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="BlockQuoteEnd"/></w:pPr></w:p>',
+    )
+    const out = walkDocument(xml, new Map())
+    expect(out.content).toEqual([
+      {
+        type: 'blockquote',
+        content: [
+          { type: 'paragraph', content: [{ type: 'text', text: 'quote line' }] },
+          { type: 'paragraph', content: [{ type: 'text', text: 'inner non-quote block' }] },
+        ],
+      },
+    ])
+  })
+
+  it('maps an empty paragraph with a bottom border to a horizontalRule', () => {
+    const xml = docXml(
+      '<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:color="CCCCCC"/></w:pBdr></w:pPr></w:p>',
+    )
+    expect(walkDocument(xml, new Map()).content).toEqual([{ type: 'horizontalRule' }])
+  })
+
+  it('maps a legacy dash-line paragraph to a horizontalRule (back-compat)', () => {
+    const xml = docXml('<w:p><w:r><w:t>\u2500\u2500\u2500\u2500\u2500\u2500</w:t></w:r></w:p>')
+    expect(walkDocument(xml, new Map()).content).toEqual([{ type: 'horizontalRule' }])
   })
 
   it('rebuilds a details block from Details markers + summary', () => {

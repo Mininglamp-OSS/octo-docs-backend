@@ -28,6 +28,12 @@ export interface ListLine {
   kind: 'ordered' | 'bullet' | 'task'
   /** For task lines: the checkbox state. */
   checked?: boolean
+  /**
+   * For ordered lines at ilvl 0: the list's first number (from numbering.xml's
+   * `w:start`/`w:startOverride`). Lets a list beginning at 20/41 keep its
+   * numbering instead of restarting at 1. Undefined / 1 = default start.
+   */
+  start?: number
   /** The inline content of the paragraph (text/marks/hardBreak…). */
   inline: PmNode[]
 }
@@ -123,7 +129,20 @@ export function buildList(lines: ListLine[]): PmNode[] {
     }
 
     // 4. Append the item to the current (top) frame.
-    stack[stack.length - 1]!.list.content!.push(newItem(line))
+    const frame = stack[stack.length - 1]!
+    // Preserve a non-default first number on the list itself (ordered, ilvl 0).
+    // Only set it once, from the first line that opened this list, so a list
+    // that begins at 20/41 keeps its numbering instead of restarting at 1.
+    if (
+      frame.kind === 'ordered' &&
+      frame.list.content!.length === 0 &&
+      typeof line.start === 'number' &&
+      Number.isFinite(line.start) &&
+      line.start > 1
+    ) {
+      frame.list.attrs = { ...(frame.list.attrs ?? {}), start: line.start }
+    }
+    frame.list.content!.push(newItem(line))
   }
 
   return roots

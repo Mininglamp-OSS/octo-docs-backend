@@ -125,6 +125,8 @@ describe('ommlToLatex — recovered-LaTeX normalization', () => {
     expect(ommlToLatex(acc('\u0307'))).toBe('\\dot{x}') // combining dot above
     expect(ommlToLatex(acc('\u20d7'))).toBe('\\vec{x}') // combining right arrow above
     expect(ommlToLatex(acc('~'))).toBe('\\tilde{x}')
+    expect(ommlToLatex(acc('\u0304'))).toBe('\\bar{x}') // combining macron -> \bar
+    expect(ommlToLatex(acc('\u0308'))).toBe('\\ddot{x}') // combining diaeresis -> \ddot
   })
 
   it('recovers a scripted function name from \\left(…\\right)^{…}', () => {
@@ -156,5 +158,79 @@ describe('ommlToLatex — recovered-LaTeX normalization', () => {
     const latex = ommlToLatex(mixed)
     expect(latex).not.toBeNull()
     expect(latex).not.toContain('\\textcolor')
+  })
+
+  it('rewrites stacked n-ary limits (matrix in a script) to \\substack', () => {
+    // \sum_{i=1 \\ j=1}^{n} a_{ij}: OMML nary with a 2-row matrix subscript. The
+    // converter emits `_{\begin{matrix}…\end{matrix}}`, which renders the limits
+    // full-size/misaligned; the correct construct is `_{\substack{…}}`.
+    const nary =
+      `<m:oMath ${M2}><m:nary><m:naryPr><m:chr m:val="∑"/><m:limLoc m:val="undOvr"/></m:naryPr>` +
+      `<m:sub><m:m><m:mr><m:e><m:r><m:t>i</m:t></m:r><m:r><m:t>=</m:t></m:r><m:r><m:t>1</m:t></m:r></m:e></m:mr>` +
+      `<m:mr><m:e><m:r><m:t>j</m:t></m:r><m:r><m:t>=</m:t></m:r><m:r><m:t>1</m:t></m:r></m:e></m:mr></m:m></m:sub>` +
+      `<m:sup><m:r><m:t>n</m:t></m:r></m:sup>` +
+      `<m:e><m:sSub><m:e><m:r><m:t>a</m:t></m:r></m:e><m:sub><m:r><m:t>i</m:t></m:r><m:r><m:t>j</m:t></m:r></m:sub></m:sSub></m:e></m:nary></m:oMath>`
+    const latex = ommlToLatex(nary)
+    expect(latex).not.toBeNull()
+    expect(latex).toContain('\\substack{')
+    expect(latex).not.toContain('\\begin{matrix}')
+  })
+
+  it('restores \\pmod from a parenthesised \\bmod delimiter', () => {
+    // \pmod{n} round-trips through OMML as `\left(\bmod n\right)`, where the
+    // \bmod spacing collapses to `(modn)`. Recover the proper `\pmod{n}`.
+    const pmod =
+      `<m:oMath ${M2}><m:r><m:t>a</m:t></m:r><m:r><m:t>≡</m:t></m:r><m:r><m:t>b</m:t></m:r>` +
+      `<m:d><m:dPr><m:begChr m:val="("/><m:endChr m:val=")"/></m:dPr>` +
+      `<m:e><m:r><m:t>mod</m:t></m:r><m:r><m:t>n</m:t></m:r></m:e></m:d></m:oMath>`
+    const latex = ommlToLatex(pmod)
+    expect(latex).not.toBeNull()
+    expect(latex).toContain('\\pmod{n}')
+    expect(latex).not.toContain('\\left(')
+  })
+
+  it('keeps a parenthesised matrix as \\begin{pmatrix} (round parens, not [])', () => {
+    // OMML delimiter `(` `)` around a matrix. omml2mathml drops the default
+    // paren fence, so mathml-to-latex would emit \begin{bmatrix}; restoring the
+    // fence keeps it \begin{pmatrix}.
+    const pmat =
+      `<m:oMath ${M2}><m:d><m:dPr><m:begChr m:val="("/><m:endChr m:val=")"/></m:dPr>` +
+      `<m:e><m:m><m:mr><m:e><m:r><m:t>a</m:t></m:r></m:e><m:e><m:r><m:t>b</m:t></m:r></m:e></m:mr>` +
+      `<m:mr><m:e><m:r><m:t>c</m:t></m:r></m:e><m:e><m:r><m:t>d</m:t></m:r></m:e></m:mr></m:m></m:e></m:d></m:oMath>`
+    const latex = ommlToLatex(pmat)
+    expect(latex).not.toBeNull()
+    expect(latex).toContain('\\begin{pmatrix}')
+    expect(latex).not.toContain('bmatrix')
+  })
+
+  it('keeps a bracketed matrix as \\begin{bmatrix} ([] unaffected by the fence fix)', () => {
+    const bmat =
+      `<m:oMath ${M2}><m:d><m:dPr><m:begChr m:val="["/><m:endChr m:val="]"/></m:dPr>` +
+      `<m:e><m:m><m:mr><m:e><m:r><m:t>a</m:t></m:r></m:e></m:mr></m:m></m:e></m:d></m:oMath>`
+    const latex = ommlToLatex(bmat)
+    expect(latex).not.toBeNull()
+    expect(latex).toContain('\\begin{bmatrix}')
+    expect(latex).not.toContain('pmatrix')
+  })
+
+  it('recovers a wide arrow/hat over a multi-char base as \\overrightarrow / \\widehat', () => {
+    // \overrightarrow{AB} exports as <m:groupChr chr="→">; omml2mathml gives
+    // <mover><mrow>AB</mrow><mo>→</mo></mover> -> \overset{\rightarrow}{A B}.
+    // A multi-token base must recover the WIDE command, not narrow \vec.
+    const arrow =
+      `<m:oMath ${M2}><m:groupChr><m:groupChrPr><m:chr m:val="→"/><m:pos m:val="top"/><m:vertJc m:val="bot"/></m:groupChrPr>` +
+      `<m:e><m:r><m:t>A</m:t></m:r><m:r><m:t>B</m:t></m:r></m:e></m:groupChr></m:oMath>`
+    const latex = ommlToLatex(arrow)
+    expect(latex).not.toBeNull()
+    expect(latex).toContain('\\overrightarrow{')
+    expect(latex).not.toContain('\\vec')
+  })
+
+  it('keeps a single-char accent narrow (\\vec / \\hat, not the wide form)', () => {
+    const acc = (chr: string, base: string) =>
+      `<m:oMath ${M2}><m:acc><m:accPr><m:chr m:val="${chr}"/></m:accPr><m:e><m:r><m:t>${base}</m:t></m:r></m:e></m:acc></m:oMath>`
+    expect(ommlToLatex(acc('\u20d7', 'v'))).toBe('\\vec{v}')
+    expect(ommlToLatex(acc('\u0302', 'x'))).toBe('\\hat{x}')
+    expect(ommlToLatex(acc('\u0304', 'y'))).toBe('\\bar{y}')
   })
 })
