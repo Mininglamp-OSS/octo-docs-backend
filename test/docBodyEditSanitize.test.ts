@@ -106,4 +106,46 @@ describe('JSON write-path block-attr value sanitize (§17 security invariant)', 
     expect(storedFirstBlockAttrs(newDoc)).toMatchObject({ lineHeight: '1.5' })
     expect(storedFirstBlockAttrs(newDoc)).not.toHaveProperty('spaceAfter')
   })
+
+  // textAlign is the OLDEST of the four block attrs (v5) but shares the SAME
+  // serialized `style` string as lineHeight/spaceBefore/spaceAfter. It was
+  // missing from the JSON-write sanitizer, so a hostile textAlign could still
+  // smuggle a multi-declaration value into the authoritative store through
+  // PMNode.fromJSON. It must be sanitized on this path like its style siblings.
+  it('sanitizeBlockAttrValues coerces a hostile textAlign to null, keeps legal ones', () => {
+    const json = {
+      type: 'doc',
+      content: [
+        para('evil', { textAlign: 'left; position: fixed; inset: 0' }),
+        para('ok', { textAlign: 'center' }),
+        para('bogus', { textAlign: 'middle' }),
+      ],
+    }
+    sanitizeBlockAttrValues(json)
+    expect(json.content[0].attrs).toEqual({ textAlign: null })
+    expect(json.content[1].attrs).toEqual({ textAlign: 'center' })
+    expect(json.content[2].attrs).toEqual({ textAlign: null })
+  })
+
+  it('insert op: a hostile textAlign never reaches the Y.Doc', () => {
+    const doc = docNode([para('seed', {})])
+    const ops: DocEditOp[] = [
+      {
+        type: 'insert',
+        at: { path: [0], position: 'after' },
+        content: [para('evil', { textAlign: 'right; background: url(evil)' })],
+      },
+    ]
+    const newDoc = applyIncrementalOps(doc, ops, schema)
+    // The block stored into the Y.Doc carries a sanitized (null) textAlign, not
+    // the hostile string — the null default is stripped from storage.
+    expect(newDoc.child(1).attrs.textAlign).toBeNull()
+
+    const storedBack = yDocStateToProsemirrorJSON(
+      Y.encodeStateAsUpdate(prosemirrorToYDoc(newDoc, COLLAB_FIELD)),
+    ) as { content?: Array<{ attrs?: Record<string, unknown> }> }
+    expect(storedBack.content?.[1]?.attrs ?? {}).not.toHaveProperty('textAlign')
+    expect(JSON.stringify(storedBack)).not.toContain('position: fixed')
+    expect(JSON.stringify(storedBack)).not.toContain('background: url')
+  })
 })

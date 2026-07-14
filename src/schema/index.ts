@@ -178,6 +178,12 @@ function setCellAttrs(node: { attrs: Record<string, unknown> }): Record<string, 
  */
 const VALID_TEXT_ALIGNS = new Set(['left', 'center', 'right', 'justify'])
 
+// Block text alignment: one of the four CSS text-align keywords the front-end
+// TextAlign extension emits; anything else falls back to null.
+function sanitizeTextAlign(v: unknown): string | null {
+  return typeof v === 'string' && VALID_TEXT_ALIGNS.has(v) ? v : null
+}
+
 // Unitless CSS line-height multiplier: a bare non-negative number in (0, 10].
 function sanitizeLineHeight(v: unknown): string | null {
   if (typeof v !== 'string') return null
@@ -214,7 +220,7 @@ function getBlockAttrs(dom: unknown): {
   }
   const rawAlign = el.style?.textAlign || el.getAttribute('data-text-align') || null
   return {
-    textAlign: rawAlign && VALID_TEXT_ALIGNS.has(rawAlign) ? rawAlign : null,
+    textAlign: sanitizeTextAlign(rawAlign),
     lineHeight: sanitizeLineHeight(el.style?.lineHeight),
     spaceBefore: sanitizeSpacing(el.style?.marginTop),
     spaceAfter: sanitizeSpacing(el.style?.marginBottom),
@@ -223,8 +229,8 @@ function getBlockAttrs(dom: unknown): {
 
 function setBlockAttrs(node: { attrs: Record<string, unknown> }): Record<string, string> {
   const decls: string[] = []
-  const textAlign = node.attrs.textAlign as string | null
-  if (textAlign && VALID_TEXT_ALIGNS.has(textAlign)) decls.push(`text-align: ${textAlign}`)
+  const textAlign = sanitizeTextAlign(node.attrs.textAlign)
+  if (textAlign) decls.push(`text-align: ${textAlign}`)
   const lineHeight = sanitizeLineHeight(node.attrs.lineHeight)
   if (lineHeight) decls.push(`line-height: ${lineHeight}`)
   const spaceBefore = sanitizeSpacing(node.attrs.spaceBefore)
@@ -242,10 +248,12 @@ function setBlockAttrs(node: { attrs: Record<string, unknown> }): Record<string,
 const BLOCK_SPACING_NODE_TYPES = new Set(['paragraph', 'heading'])
 
 /**
- * Sanitize the v17 block-spacing attr VALUES (lineHeight / spaceBefore /
- * spaceAfter) on every paragraph / heading in a ProseMirror-JSON tree, coercing
- * any value that fails the whitelist to `null`. Mutates the passed JSON in place
- * and returns it.
+ * Sanitize the block-spacing / alignment attr VALUES (textAlign / lineHeight /
+ * spaceBefore / spaceAfter) on every paragraph / heading in a ProseMirror-JSON
+ * tree, coercing any value that fails the whitelist to `null`. Mutates the
+ * passed JSON in place and returns it. All four attrs share a single serialized
+ * `style` string (see setBlockAttrs), so they must be sanitized together on
+ * every write path or the shared string can carry a hostile declaration.
  *
  * WHY this exists (the parse-side sanitizer is not enough): `getBlockAttrs`
  * (parseDOM getAttrs) only runs on the HTML-import path. The authoritative
@@ -254,8 +262,9 @@ const BLOCK_SPACING_NODE_TYPES = new Set(['paragraph', 'heading'])
  * json)`. `PMNode.fromJSON` reads `attrs` verbatim (via `computeAttrs`) and
  * `.check()` only validates attr SHAPE/existence, never the VALUE — neither one
  * calls parseDOM/getAttrs. So without this pass an API caller can smuggle a
- * hostile `lineHeight` / `spaceBefore` / `spaceAfter` (e.g. a multi-declaration
- * `"1.5; position: fixed; ..."`) straight into the Y.Doc, where it round-trips
+ * hostile `textAlign` / `lineHeight` / `spaceBefore` / `spaceAfter` (e.g. a
+ * multi-declaration `"1.5; position: fixed; ..."`, or a `textAlign` of
+ * `"left; position: fixed"`) straight into the Y.Doc, where it round-trips
  * through prosemirrorJSONToYDocState ↔ yDocStateToProsemirrorJSON and is handed
  * back verbatim by `GET /:docId/content`.
  *
@@ -281,6 +290,7 @@ export function sanitizeBlockAttrValues(json: unknown): unknown {
     typeof node.attrs === 'object'
   ) {
     const attrs = node.attrs
+    if ('textAlign' in attrs) attrs.textAlign = sanitizeTextAlign(attrs.textAlign)
     if ('lineHeight' in attrs) attrs.lineHeight = sanitizeLineHeight(attrs.lineHeight)
     if ('spaceBefore' in attrs) attrs.spaceBefore = sanitizeSpacing(attrs.spaceBefore)
     if ('spaceAfter' in attrs) attrs.spaceAfter = sanitizeSpacing(attrs.spaceAfter)
