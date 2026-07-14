@@ -70,4 +70,23 @@ d('typstService — real compile (integration)', () => {
     const pdf = await compileTypst(src)
     expect(pdf.subarray(0, 5).toString('latin1')).toBe('%PDF-')
   })
+
+  it('compiles CJK text styled with mapped CJK fonts (embedded OSS faces resolve)', async () => {
+    // Regression for octo-docs-backend#62: a document whose text picks CJK fonts
+    // (宋体 -> serif, 微软雅黑 -> sans) must map to the embedded OSS families and
+    // compile cleanly against the runtime font book (no missing-font failure,
+    // no silent fallback). The source is asserted to carry the mapped families.
+    const src = renderTypst(
+      doc([
+        para([text('宋体正文', [{ type: 'textStyle', attrs: { fontFamily: '宋体' } }])]),
+        para([text('黑体标题', [{ type: 'textStyle', attrs: { fontFamily: '微软雅黑' } }])]),
+      ]),
+      { title: '字体测试', attachments: new Map() },
+    )
+    expect(src).toContain('font: "Noto Serif CJK SC"')
+    expect(src).toContain('font: "Noto Sans CJK SC"')
+    const pdf = await compileTypst(src)
+    expect(pdf.subarray(0, 5).toString('latin1')).toBe('%PDF-')
+    expect(pdf.length).toBeGreaterThan(1000)
+  })
 })

@@ -218,6 +218,83 @@ describe('renderTypst — marks', () => {
     expect(ts).toContain('size: 12.00pt') // 16px * 0.75
   })
 
+  it('whitelists the v16 textStyle fontFamily into a Typst font: argument', () => {
+    // A single named family becomes a quoted string; a comma list becomes a tuple
+    // with the generic CSS keyword (sans-serif/serif/…) dropped.
+    const single = __test.wrapMark({ type: 'textStyle', attrs: { fontFamily: 'Georgia' } }, 'x')
+    expect(single).toBe('#text(font: "Georgia")[x]')
+    const list = __test.wrapMark({ type: 'textStyle', attrs: { fontFamily: 'Inter, sans-serif' } }, 'x')
+    expect(list).toBe('#text(font: "Inter")[x]')
+    const multi = __test.wrapMark({ type: 'textStyle', attrs: { fontFamily: '"Helvetica Neue", Arial, sans-serif' } }, 'x')
+    expect(multi).toBe('#text(font: ("Helvetica Neue", "Arial"))[x]')
+    // Font + size + colour compose in one #text() call.
+    const combined = __test.wrapMark(
+      { type: 'textStyle', attrs: { color: 'red', fontSize: '16px', fontFamily: 'Inter' } },
+      'x',
+    )
+    expect(combined).toBe('#text(fill: red, size: 12.00pt, font: "Inter")[x]')
+  })
+
+  it('cssFontFamilyToTypst drops unsafe/generic-only families (no injection)', () => {
+    expect(__test.cssFontFamilyToTypst('Inter')).toBe('"Inter"')
+    expect(__test.cssFontFamilyToTypst('sans-serif')).toBeNull()
+    expect(__test.cssFontFamilyToTypst('Arial"); #set page(')).toBeNull()
+    expect(__test.cssFontFamilyToTypst('')).toBeNull()
+  })
+
+  it('maps CJK font names to the embedded OSS CJK families (direction A, not passthrough)', () => {
+    // The v16 fontFamily fix: CJK names used to fail the ASCII-only whitelist,
+    // get dropped, and the text silently fell back to the preamble default
+    // (octo-docs-backend#62). They now resolve to a guaranteed-present embedded
+    // OSS family so the user's serif-vs-sans choice actually renders in the PDF.
+    // 宋体 / 仿宋 -> serif (Noto Serif CJK SC == Source Han Serif).
+    expect(__test.cssFontFamilyToTypst('宋体')).toBe('"Noto Serif CJK SC"')
+    expect(__test.cssFontFamilyToTypst('SimSun')).toBe('"Noto Serif CJK SC"')
+    expect(__test.cssFontFamilyToTypst('仿宋')).toBe('"Noto Serif CJK SC"')
+    expect(__test.cssFontFamilyToTypst('思源宋体')).toBe('"Noto Serif CJK SC"')
+    // 黑体 / 微软雅黑 / 苹方 -> sans (Noto Sans CJK SC == Source Han Sans).
+    expect(__test.cssFontFamilyToTypst('黑体')).toBe('"Noto Sans CJK SC"')
+    expect(__test.cssFontFamilyToTypst('微软雅黑')).toBe('"Noto Sans CJK SC"')
+    expect(__test.cssFontFamilyToTypst('Microsoft YaHei')).toBe('"Noto Sans CJK SC"')
+    expect(__test.cssFontFamilyToTypst('PingFang SC')).toBe('"Noto Sans CJK SC"')
+    expect(__test.cssFontFamilyToTypst('思源黑体')).toBe('"Noto Sans CJK SC"')
+    // An unmapped CJK face still honours the serif/sans intent by classifier
+    // (华文楷体 -> no serif marker -> sans; 华文中宋 -> 宋 -> serif) and never
+    // leaks the raw name into the source.
+    expect(__test.cssFontFamilyToTypst('华文中宋')).toBe('"Noto Serif CJK SC"')
+    expect(__test.cssFontFamilyToTypst('未知字体')).toBe('"Noto Sans CJK SC"')
+  })
+
+  it('maps and de-duplicates a mixed CJK + ASCII stack', () => {
+    // A real editor stack: quoted CJK primary, ASCII fallback, generic keyword.
+    // The two sans CJK names collapse onto one embedded family (de-duped), the
+    // Latin fallback survives, the generic keyword is dropped.
+    expect(__test.cssFontFamilyToTypst('"微软雅黑", "PingFang SC", sans-serif')).toBe(
+      '"Noto Sans CJK SC"',
+    )
+    expect(__test.cssFontFamilyToTypst('宋体, Georgia, serif')).toBe(
+      '("Noto Serif CJK SC", "Georgia")',
+    )
+  })
+
+  it('CJK passthrough stays injection-safe (mapping, never the raw name)', () => {
+    // A malicious CJK-bearing family name must never reach the Typst source: the
+    // name is classified (contains 宋 -> serif) and the fixed literal is emitted,
+    // so the injection payload is discarded entirely.
+    const attack = '宋体"); #import "/etc/passwd": *; ('
+    const out = __test.cssFontFamilyToTypst(attack)
+    expect(out).toBe('"Noto Serif CJK SC"')
+    expect(out).not.toContain('#import')
+    expect(out).not.toContain('passwd')
+    // Rendered into a mark it produces only the safe #text() call.
+    expect(__test.wrapMark({ type: 'textStyle', attrs: { fontFamily: attack } }, 'x')).toBe(
+      '#text(font: "Noto Serif CJK SC")[x]',
+    )
+    // A CJK name whose only ASCII is an injection attempt: the ASCII segment
+    // fails the plain-name whitelist and is dropped, the CJK segment maps.
+    expect(__test.cssFontFamilyToTypst('黑体, Arial"); #set page(')).toBe('"Noto Sans CJK SC"')
+  })
+
   it('cssColorToTypst rejects unknown/dangerous values', () => {
     expect(__test.cssColorToTypst('#abc')).toBe('rgb("#abc")')
     expect(__test.cssColorToTypst('rgb(1,2,3)')).toBe('rgb(1, 2, 3)')

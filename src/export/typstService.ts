@@ -119,10 +119,17 @@ export async function compileTypst(source: string, images: TypstImageInput[] = [
 /** Spawn the typst binary with a hard timeout; reject on non-zero / timeout. */
 function runTypst(root: string, mainPath: string, outPath: string): Promise<void> {
   const bin = config.typstExport.binaryPath || 'typst'
+  // Explicit font dir for the embedded OSS CJK faces (Noto Sans/Serif CJK SC).
+  // Prepended before the positional source so the CJK families the document maps
+  // to resolve deterministically; typst still consults its system font book too,
+  // and subset-embeds only the glyphs actually used.
+  const fontArgs = config.typstExport.fontPath
+    ? ['--font-path', config.typstExport.fontPath]
+    : []
   return new Promise<void>((resolve, reject) => {
     const child = spawn(
       bin,
-      ['compile', '--root', root, '--format', 'pdf', mainPath, outPath],
+      ['compile', '--root', root, ...fontArgs, '--format', 'pdf', mainPath, outPath],
       { stdio: ['ignore', 'ignore', 'pipe'] },
     )
     let stderr = ''

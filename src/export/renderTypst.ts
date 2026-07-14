@@ -253,6 +253,146 @@ function cssFontSizeToTypst(v: string): string | null {
   }
 }
 
+/**
+ * CSS font-family list -> Typst `font:` argument.
+ *
+ * Two paths, both injection-safe (the value emitted into Typst source is NEVER
+ * the raw user string — it is either a fixed embedded-family literal or an
+ * ASCII name that passed the plain-name whitelist, so it can carry no quote /
+ * paren / `#` that would break out of the `font:` argument):
+ *
+ *   1. CJK families. The old whitelist accepted ASCII only (`^[A-Za-z0-9 _-]+$`),
+ *      so a CJK family name (宋体 / 微软雅黑 / 思源黑体) failed the test, was
+ *      dropped, and the cell/paragraph silently fell back to the preamble
+ *      default — i.e. the user's v16 fontFamily choice was lost in PDF export
+ *      (octo-docs-backend#62). CJK names now resolve through CJK_FONT_MAP (and a
+ *      serif/sans classifier for unmapped faces) to one of the OSS CJK families
+ *      shipped in the export runtime (Noto Sans/Serif CJK SC == Source Han
+ *      Sans/Serif, SIL OFL — see Dockerfile / TYPST_EXPORT_FONT_PATH). The
+ *      chosen face is therefore GUARANTEED present at compile time and gets
+ *      subset-embedded into the PDF by Typst, so it renders on any machine even
+ *      one without the user's original (possibly proprietary) system font. We
+ *      map to a curated OSS family instead of passing the literal name through
+ *      so no proprietary/unavailable face is ever requested and no arbitrary
+ *      user text reaches the Typst source.
+ *   2. ASCII families. Trimmed of surrounding quotes and accepted only if a
+ *      plain family name (letters/digits/spaces/hyphens/underscores). Generic
+ *      CSS keywords (serif/sans-serif/…) and anything with unsafe characters are
+ *      dropped, exactly as before — no regression on the Latin path.
+ *
+ * Returns a quoted single name, a `("A", "B")` tuple, or null when no family
+ * survives.
+ */
+const GENERIC_CSS_FAMILIES = new Set([
+  'serif',
+  'sans-serif',
+  'monospace',
+  'cursive',
+  'fantasy',
+  'system-ui',
+  'ui-serif',
+  'ui-sans-serif',
+  'ui-monospace',
+  'ui-rounded',
+  'inherit',
+  'initial',
+  'unset',
+])
+
+// Embedded OSS CJK families shipped with the export runtime (SIL OFL, free to
+// embed and redistribute). Noto Sans/Serif CJK SC are the same faces as Adobe's
+// Source Han Sans/Serif. Every CJK branch below emits ONLY one of these two
+// literals, never user text, which is what keeps CJK passthrough injection-safe.
+const CJK_SANS = 'Noto Sans CJK SC' // 黑体 / 雅黑 / 苹方 (sans) family
+const CJK_SERIF = 'Noto Serif CJK SC' // 宋体 / 仿宋 (serif) family
+
+// Explicit CSS family name -> embedded OSS Typst family. Keys are lowercased and
+// cover the common Simplified-Chinese faces the editor's font picker exposes and
+// the CJK names macOS / Windows / web stacks emit. Anything not listed falls
+// through to classifyCjkFamily().
+const CJK_FONT_MAP: Record<string, string> = {
+  // ── sans / 黑体 family ──
+  黑体: CJK_SANS,
+  '黑体-简': CJK_SANS,
+  simhei: CJK_SANS,
+  微软雅黑: CJK_SANS,
+  'microsoft yahei': CJK_SANS,
+  msyh: CJK_SANS,
+  苹方: CJK_SANS,
+  '苹方-简': CJK_SANS,
+  pingfang: CJK_SANS,
+  'pingfang sc': CJK_SANS,
+  heiti: CJK_SANS,
+  'heiti sc': CJK_SANS,
+  思源黑体: CJK_SANS,
+  'source han sans': CJK_SANS,
+  'source han sans sc': CJK_SANS,
+  'noto sans cjk sc': CJK_SANS,
+  'noto sans sc': CJK_SANS,
+  // ── serif / 宋体 family ──
+  宋体: CJK_SERIF,
+  '宋体-简': CJK_SERIF,
+  simsun: CJK_SERIF,
+  nsimsun: CJK_SERIF,
+  仿宋: CJK_SERIF,
+  fangsong: CJK_SERIF,
+  仿宋_gb2312: CJK_SERIF,
+  华文宋体: CJK_SERIF,
+  stsong: CJK_SERIF,
+  华文仿宋: CJK_SERIF,
+  stfangsong: CJK_SERIF,
+  songti: CJK_SERIF,
+  'songti sc': CJK_SERIF,
+  思源宋体: CJK_SERIF,
+  'source han serif': CJK_SERIF,
+  'source han serif sc': CJK_SERIF,
+  'noto serif cjk sc': CJK_SERIF,
+  'noto serif sc': CJK_SERIF,
+}
+
+// True when the name contains a CJK ideograph (Unified + Ext-A + compatibility).
+function hasCjk(s: string): boolean {
+  return /[㐀-䶿一-鿿豈-﫿]/.test(s)
+}
+
+// Classify an unmapped CJK face into the OSS serif/sans family by common
+// substrings so the user's serif-vs-sans INTENT is honoured even for a face we
+// don't ship — and, critically, the raw (untrusted) name is discarded rather
+// than emitted into Typst source. Defaults to sans (matches the preamble).
+function classifyCjkFamily(name: string): string {
+  if (/宋|明體|明朝|仿宋|serif|song|ming|mincho/i.test(name)) return CJK_SERIF
+  return CJK_SANS
+}
+
+function cssFontFamilyToTypst(v: string): string | null {
+  const names: string[] = []
+  for (const raw of v.split(',')) {
+    const name = raw.trim().replace(/^['"]|['"]$/g, '').trim()
+    if (!name || GENERIC_CSS_FAMILIES.has(name.toLowerCase())) continue
+    // 1. CJK: resolve to a guaranteed-present embedded OSS family (lookup, then
+    //    serif/sans classifier). Emits a fixed literal, never the user string.
+    const mapped = CJK_FONT_MAP[name.toLowerCase()]
+    if (mapped) {
+      names.push(mapped)
+      continue
+    }
+    if (hasCjk(name)) {
+      names.push(classifyCjkFamily(name))
+      continue
+    }
+    // 2. ASCII: plain-name whitelist as before. Unsafe chars / generics dropped.
+    if (!/^[A-Za-z0-9 _-]+$/.test(name)) continue
+    names.push(name)
+  }
+  // Mapping can collapse several CSS names onto the same OSS family
+  // (e.g. "微软雅黑, PingFang SC" -> both Noto Sans CJK SC); drop duplicates so
+  // the emitted stack stays clean.
+  const deduped = names.filter((n, i) => names.indexOf(n) === i)
+  if (deduped.length === 0) return null
+  if (deduped.length === 1) return `"${deduped[0]}"`
+  return `(${deduped.map((n) => `"${n}"`).join(', ')})`
+}
+
 // ── LaTeX -> Typst math conversion ────────────────────────────────────
 /**
  * Convert a LaTeX math expression to Typst math syntax. Typst native math uses
@@ -910,6 +1050,10 @@ function wrapMark(mark: PMMark, inner: string): string {
         const sz = cssFontSizeToTypst(String(attrs.fontSize))
         if (sz) args.push(`size: ${sz}`)
       }
+      if (attrs.fontFamily != null) {
+        const font = cssFontFamilyToTypst(String(attrs.fontFamily))
+        if (font) args.push(`font: ${font}`)
+      }
       return args.length ? `#text(${args.join(', ')})[${inner}]` : inner
     }
     case 'link': {
@@ -1437,4 +1581,4 @@ export function renderTypst(pmJson: unknown, opts: RenderTypstOptions): string {
 }
 
 // Exposed for unit tests only.
-export const __test = { latexToTypstMath, wrapMark, cssColorToTypst, cssFontSizeToTypst, isSafeHref, renderTypstNode: renderNode, renderTextNode, escMathLiteral, escContent, insertSoftBreaks }
+export const __test = { latexToTypstMath, wrapMark, cssColorToTypst, cssFontSizeToTypst, cssFontFamilyToTypst, isSafeHref, renderTypstNode: renderNode, renderTextNode, escMathLiteral, escContent, insertSoftBreaks }
