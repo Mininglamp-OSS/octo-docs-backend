@@ -9,6 +9,15 @@
 -- Usage:
 --   mysql -u <user> -p <database> < migrations/schema.sql
 --
+-- Collation: every table pins `COLLATE=utf8mb4_0900_ai_ci` explicitly. Without
+--   an explicit COLLATE, `DEFAULT CHARSET=utf8mb4` resolves to whatever the
+--   utf8mb4 default collation is on the target server (utf8mb4_0900_ai_ci on
+--   MySQL 8, but utf8mb4_general_ci on MySQL 5.7 / MariaDB or in an old restored
+--   dump). Mixing the two across tables makes cross-table VARCHAR joins (e.g.
+--   doc_meta.doc_id = doc_member.doc_id) fail with "Illegal mix of collations"
+--   on local DBs that drifted. Pinning the MySQL 8 default keeps fresh installs
+--   deterministic regardless of the local server default.
+--
 -- Tables:
 --   doc_meta              business metadata (title/owner/space/folder/epoch)
 --   doc_member            document-autonomous membership (reader/writer/admin)
@@ -40,7 +49,7 @@ CREATE TABLE doc_meta (
   KEY idx_space (space_id, status, updated_at),
   KEY idx_folder (folder_id, status, updated_at),
   KEY idx_owner (owner_id, status, updated_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 文档自治成员（v2.0 新增，替代 v1.x 的 doc_acl —— 见下方迁移说明）
 -- 把 uid 按 role 直接授到某 doc；resolveRole 仅查此表 + owner（§4.2），不再做 octo 群继承。
@@ -56,7 +65,7 @@ CREATE TABLE doc_member (
   PRIMARY KEY (doc_id, uid),                      -- 一个 uid 对一个 doc 至多一行（role 升降走 UPDATE）
   KEY idx_uid (uid, role),                        -- 「我能访问哪些 doc」列表页/反查
   KEY idx_doc_role (doc_id, role)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 链接邀请（v2.0 新增）：一个 token 携带授予 role，仅【已注册 octo 用户】可接受（见 §4.6 接受流程）。
 CREATE TABLE doc_invite (
@@ -72,7 +81,7 @@ CREATE TABLE doc_invite (
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (invite_token),
   KEY idx_doc (doc_id, status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 可选：邀请接受流水（幂等去重 + 审计；防同一 uid 重复消耗 used_count）。
 CREATE TABLE doc_invite_redemption (
@@ -80,7 +89,7 @@ CREATE TABLE doc_invite_redemption (
   uid           VARCHAR(64)  NOT NULL,            -- 接受邀请的可信 uid
   redeemed_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (invite_token, uid)                 -- 同一 uid 对同一 token 仅计一次（再次点击不重复 +used_count）
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 访问申请（屏4c「申请访问」MVP，拉取式）：无权限接收方点开文档链接被 403 后，
 -- 提交一条访问申请；owner + admin 拉取 pending 列表并 approve/deny。approve 走与
@@ -99,7 +108,7 @@ CREATE TABLE doc_access_request (
   PRIMARY KEY (doc_id, uid),                       -- 一个 uid 对一个 doc 至多一条申请（重复申请 UPDATE 复用）
   UNIQUE KEY uk_request_id (request_id),
   KEY idx_doc_status (doc_id, status)              -- admin 拉「某文档 pending 申请」
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 【迁移说明：doc_acl → doc_member】
 -- v1.x 的 doc_acl(principal_type ∈ {1=user, 2=group}) 在 v2.0 被 doc_member 取代：
@@ -116,7 +125,7 @@ CREATE TABLE yjs_document (
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY uk_document_name (document_name)     -- 每文档单行，store 走 UPSERT + merge-on-write
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 可选：基线 snapshot（仅「增量日志」备选模型启用时建；与上表二选一作真相源，见 §3.3）
 CREATE TABLE yjs_snapshot (
@@ -126,7 +135,7 @@ CREATE TABLE yjs_snapshot (
   size_bytes    INT          NOT NULL DEFAULT 0,
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (document_name)                     -- 每文档单行基线
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 可选：增量日志（仅「增量日志」备选模型启用时建，见 §3.3）
 CREATE TABLE yjs_update_log (
@@ -136,7 +145,7 @@ CREATE TABLE yjs_update_log (
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (seq),
   KEY idx_doc_seq (document_name, seq)            -- compact 用 seq <= captured_seq 截断
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 可选：附件引用表（见 3.5）
 CREATE TABLE doc_attachment (
@@ -150,7 +159,7 @@ CREATE TABLE doc_attachment (
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (attach_id),
   KEY idx_doc (doc_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 行内评论（feature #3, inline comments）。完全独立于 Y.Doc：评论正文与定位都
 -- 落在本表，不进协同文档二进制态。一个线程由一条 root（parent_id IS NULL，携带
@@ -183,7 +192,7 @@ CREATE TABLE doc_comment (
     OR
     (parent_id IS NOT NULL AND anchor_start IS NULL AND anchor_end IS NULL)
   )
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 版本历史（快照 + 恢复，见 §4 feature #4）。每条记录是某一时刻文档的完整 Yjs
 -- 权威态（Y.encodeStateAsUpdate），gzip 压缩落 state_blob。id 由 DB 单一权威分配
@@ -207,4 +216,4 @@ CREATE TABLE doc_version (
   PRIMARY KEY (id),
   KEY idx_doc_ver (doc_id, id),                         -- 列表/游标分页（按 id 倒序）
   KEY idx_doc_kind (doc_id, kind, id)                   -- 按 kind 过滤（如排除 auto）
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
