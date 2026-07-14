@@ -77,6 +77,18 @@ export const COLLAB_FIELD = 'default'
  *         LineHeight extension byte-aligns to). Values are whitelist-sanitized
  *         at BOTH parse and render so a hostile style can neither enter the
  *         Y.Doc nor serialize back out.
+ *   - v18 indent — ATTR on heading/paragraph (no new node/mark, same shape as
+ *         v5 textAlign / v17 block-spacing): an integer indent LEVEL (default
+ *         null = no indent; a set indent is 1..8). Rides the SAME inline `style`
+ *         string as the other block attrs — the block toDOM appends
+ *         `margin-left: level*2em` after the v17 declarations — and additionally
+ *         round-trips the level as a `data-indent` attribute (the level is
+ *         authoritative on import; the margin-left em is presentational),
+ *         byte-aligned with the front-end ParagraphIndent extension.
+ *         Whitelist-sanitized (clamped to [1,8] or null) at BOTH parse and
+ *         render + on the JSON write path. SCHEMA_VERSION 18 is the shared
+ *         front/back contract for this feature — the octo-web @octo/docs-schema
+ *         half registers the SAME number; the backend does NOT self-assign.
  *
  * 14/15 land in the same lockstep as the frontend `@octo/docs-schema` /
  * SCHEMA-SPEC registration (node + attr byte alignment): the front-end Tiptap
@@ -86,7 +98,7 @@ export const COLLAB_FIELD = 'default'
  * horizontalRule + the marks above) use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization, consistent with the image/table nodes here.
  */
-export const SCHEMA_VERSION = 17
+export const SCHEMA_VERSION = 18
 
 /**
  * Shared attrs + DOM mapping for `tableCell` / `tableHeader` (SCHEMA-SPEC §4).
@@ -146,22 +158,25 @@ function setCellAttrs(node: { attrs: Record<string, unknown> }): Record<string, 
 }
 
 /**
- * Shared block-attr helpers for `paragraph` / `heading` (SCHEMA-SPEC §5 + §17).
+ * Shared block-attr helpers for `paragraph` / `heading` (SCHEMA-SPEC §5 + §16 + §17).
  *
- * These two nodes carry four global attrs that all ride the same inline
- * `style` string and all default to null:
+ * These two nodes carry global block attrs that all ride the same inline `style`
+ * string. textAlign / lineHeight / spacing default to null; indent defaults to 0:
  *   - `textAlign`   (v5)  → `text-align:…`   (@tiptap/extension-text-align)
  *   - `lineHeight`  (v17) → `line-height:…`  (unitless CSS multiplier)
  *   - `spaceBefore` (v17) → `margin-top:…`
  *   - `spaceAfter`  (v17) → `margin-bottom:…`
+ *   - `indent`      (v18) → `margin-left:…`  (level * 2em; level also on data-indent)
  *
- * CANONICAL STYLE SERIALIZATION (frontend `LineHeight` extension MUST byte-align
- * to this verbatim, or HTML import/export drifts): declarations are emitted only
- * for non-null attrs, in the FIXED order [text-align, line-height, margin-top,
- * margin-bottom], each written `prop: value` (single space after the colon) and
- * joined by `"; "` (semicolon + single space) with NO trailing semicolon.
+ * CANONICAL STYLE SERIALIZATION (frontend `LineHeight` + `ParagraphIndent` extensions MUST
+ * byte-align to this verbatim, or HTML import/export drifts): declarations are emitted only
+ * for non-null / non-zero attrs, in the FIXED order [text-align, line-height, margin-top,
+ * margin-bottom, margin-left], each written `prop: value` (single space after the colon) and
+ * joined by `"; "` (semicolon + single space) with NO trailing semicolon. The indent level
+ * additionally serializes as a `data-indent` attribute (authoritative on import).
  * Examples: `text-align: center`; `line-height: 1.5`;
- * `text-align: right; line-height: 2; margin-top: 8px; margin-bottom: 12px`.
+ * `text-align: right; line-height: 2; margin-top: 8px; margin-bottom: 12px`;
+ * `margin-left: 4em` (+ `data-indent="2"`).
  *
  * The attrs survive the Y.Doc <-> ProseMirror round-trip as node attrs
  * regardless of DOM serialization; the style mapping only governs HTML
@@ -203,11 +218,30 @@ function sanitizeSpacing(v: unknown): string | null {
   return Number.isFinite(n) && n >= 0 && n <= 1000 ? `${m[1]}${m[2]}` : null
 }
 
+// Block indent (SCHEMA-SPEC §16, v18): an integer indent LEVEL, byte-aligned with the
+// front-end ParagraphIndent extension. `null` = no indent (the default sentinel, like the
+// other block attrs — kept out of the Y.Doc so plain paragraphs stay attr-free); a set indent
+// is a positive level 1..INDENT_MAX_LEVEL, rendered as margin-left = level * INDENT_STEP_EM em.
+// MUST match the front-end INDENT_STEP_EM / INDENT_MAX_LEVEL so the toDOM margin and the
+// getSchema dump stay aligned across repos.
+const INDENT_STEP_EM = 2
+const INDENT_MAX_LEVEL = 8
+
+// Coerce any value to a set indent level in [1, INDENT_MAX_LEVEL], or `null` for "no indent"
+// (non-numbers, <= 0, and out-of-range low values all collapse to null; high values clamp).
+function sanitizeIndent(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(n)) return null
+  const level = Math.min(INDENT_MAX_LEVEL, Math.max(0, Math.round(n)))
+  return level > 0 ? level : null
+}
+
 function getBlockAttrs(dom: unknown): {
   textAlign: string | null
   lineHeight: string | null
   spaceBefore: string | null
   spaceAfter: string | null
+  indent: number | null
 } {
   const el = dom as {
     style?: {
@@ -224,6 +258,8 @@ function getBlockAttrs(dom: unknown): {
     lineHeight: sanitizeLineHeight(el.style?.lineHeight),
     spaceBefore: sanitizeSpacing(el.style?.marginTop),
     spaceAfter: sanitizeSpacing(el.style?.marginBottom),
+    // Indent round-trips via data-indent (the level), matching the front-end parseHTML.
+    indent: sanitizeIndent(el.getAttribute('data-indent')),
   }
 }
 
@@ -237,21 +273,28 @@ function setBlockAttrs(node: { attrs: Record<string, unknown> }): Record<string,
   if (spaceBefore) decls.push(`margin-top: ${spaceBefore}`)
   const spaceAfter = sanitizeSpacing(node.attrs.spaceAfter)
   if (spaceAfter) decls.push(`margin-bottom: ${spaceAfter}`)
-  return decls.length ? { style: decls.join('; ') } : {}
+  const indent = sanitizeIndent(node.attrs.indent)
+  if (indent) decls.push(`margin-left: ${indent * INDENT_STEP_EM}em`)
+  const attrs: Record<string, string> = {}
+  if (decls.length) attrs.style = decls.join('; ')
+  // data-indent carries the level so import reconstructs it exactly (the margin-left px/em
+  // is presentational); matches the front-end renderHTML.
+  if (indent) attrs['data-indent'] = String(indent)
+  return attrs
 }
 
 /**
- * The set of block node types that carry the v17 block-spacing attrs. Kept in
- * one place so the JSON-write sanitizer below stays in lockstep with the two
- * node definitions in buildSchema().
+ * The set of block node types that carry the v17 block-spacing + v18 indent attrs.
+ * Kept in one place so the JSON-write sanitizer below stays in lockstep with the
+ * two node definitions in buildSchema().
  */
 const BLOCK_SPACING_NODE_TYPES = new Set(['paragraph', 'heading'])
 
 /**
- * Sanitize the block-spacing / alignment attr VALUES (textAlign / lineHeight /
- * spaceBefore / spaceAfter) on every paragraph / heading in a ProseMirror-JSON
- * tree, coercing any value that fails the whitelist to `null`. Mutates the
- * passed JSON in place and returns it. All four attrs share a single serialized
+ * Sanitize the block-spacing / alignment / indent attr VALUES (textAlign / lineHeight /
+ * spaceBefore / spaceAfter / indent) on every paragraph / heading in a ProseMirror-JSON
+ * tree, coercing any value that fails the whitelist to `null` (indent to 0). Mutates the
+ * passed JSON in place and returns it. These attrs share a single serialized
  * `style` string (see setBlockAttrs), so they must be sanitized together on
  * every write path or the shared string can carry a hostile declaration.
  *
@@ -294,6 +337,7 @@ export function sanitizeBlockAttrValues(json: unknown): unknown {
     if ('lineHeight' in attrs) attrs.lineHeight = sanitizeLineHeight(attrs.lineHeight)
     if ('spaceBefore' in attrs) attrs.spaceBefore = sanitizeSpacing(attrs.spaceBefore)
     if ('spaceAfter' in attrs) attrs.spaceAfter = sanitizeSpacing(attrs.spaceAfter)
+    if ('indent' in attrs) attrs.indent = sanitizeIndent(attrs.indent)
   }
   // Recurse into children so nested paragraphs/headings (list items, table
   // cells, blockquotes, details, callouts) are covered too.
@@ -325,8 +369,8 @@ function sanitizeBookmarkUrl(raw: string | null | undefined): string | null {
 /**
  * Build the ProseMirror schema used for server-side Y.Doc <-> ProseMirror
  * conversion (§7.1). Mirrors the frozen `@octo/docs-schema` package at
- * SCHEMA_VERSION 17 — the FULL Tiptap node/mark set (v17 adds the block-spacing
- * attrs on heading/paragraph) — so any front-end-authored
+ * SCHEMA_VERSION 18 — the FULL Tiptap node/mark set (v17 adds the block-spacing
+ * attrs, v18 adds the indent attr, on heading/paragraph) — so any front-end-authored
  * document round-trips through y-prosemirror and `PMNode.fromJSON(...).check()`
  * without loss. The standard nodes/marks use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization; the self-built nodes (image/table/callout/
@@ -344,6 +388,7 @@ export function buildSchema(): Schema {
           lineHeight: { default: null },
           spaceBefore: { default: null },
           spaceAfter: { default: null },
+          indent: { default: null },
         },
         parseDOM: [{ tag: 'p', getAttrs: getBlockAttrs }],
         toDOM: (node) => ['p', setBlockAttrs(node), 0],
@@ -356,6 +401,7 @@ export function buildSchema(): Schema {
           lineHeight: { default: null },
           spaceBefore: { default: null },
           spaceAfter: { default: null },
+          indent: { default: null },
           level: { default: 1 },
         },
         defining: true,

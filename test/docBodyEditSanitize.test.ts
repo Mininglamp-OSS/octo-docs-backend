@@ -68,6 +68,21 @@ describe('JSON write-path block-attr value sanitize (§17 security invariant)', 
     expect(json.content[0].attrs).toEqual({ lineHeight: '1.5', spaceBefore: '8px', spaceAfter: '12px' })
   })
 
+  it('sanitizeBlockAttrValues clamps/nulls the v18 indent level in place', () => {
+    const json = {
+      type: 'doc',
+      content: [
+        para('over', { indent: 99 }),
+        para('hostile', { indent: 'evil' }),
+        para('legal', { indent: 3 }),
+      ],
+    }
+    sanitizeBlockAttrValues(json)
+    expect(json.content[0].attrs).toEqual({ indent: 8 })
+    expect(json.content[1].attrs).toEqual({ indent: null })
+    expect(json.content[2].attrs).toEqual({ indent: 3 })
+  })
+
   it('insert op: hostile values are dropped before entering the Y.Doc', () => {
     const doc = docNode([para('seed', {})])
     const ops: DocEditOp[] = [
