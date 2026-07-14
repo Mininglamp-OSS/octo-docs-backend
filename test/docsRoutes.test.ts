@@ -98,6 +98,7 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
       role: 'reader',
       createdAt: new Date(0),
       updatedAt: new Date(1000),
+      shareUrl: '/d/d_1?sp=s1',
       permissionEpoch: 7,
     })
     // snake_case columns are never leaked on the wire.
