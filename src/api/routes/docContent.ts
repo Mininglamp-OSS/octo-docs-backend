@@ -146,7 +146,7 @@ function checkOpsBounds(ops: DocEditOp[]): { status: number; error: string } | n
 docContentRouter.get('/:docId/content', getDocContentHandler)
 
 export async function getDocContentHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
   if (!guard) return
   if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 
@@ -167,7 +167,7 @@ export async function getDocContentHandler(req: Request, res: Response): Promise
 docContentRouter.patch('/:docId/content', patchDocContentHandler)
 
 export async function patchDocContentHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined })
   if (!guard) return
   if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 

@@ -218,6 +218,14 @@ export const config = {
     // the anti ghost-member existence check in members/forwardGrant works with
     // OCTO_SERVER_TOKEN empty.
     serviceToken: str('OCTO_SERVER_TOKEN', ''),
+    // Space-membership check cache TTL (#64). isSpaceMember(uid, spaceId) is
+    // resolved server-side (POST /v1/auth/space-membership) only for
+    // anyone_in_space docs; results are coalesced + cached per {uid, spaceId}
+    // for this many seconds to bound the extra octo-server QPS on hot shared
+    // docs while keeping membership-grant latency low. A membership REVOCATION
+    // is not epoch-bounded on the live socket (design §5.3 case 3); this cache
+    // only affects fresh REST/issuance checks. Default 30 s.
+    membershipCacheTtlSeconds: num('SPACE_MEMBERSHIP_CACHE_TTL_SECONDS', 30),
   },
 
   attachments: {

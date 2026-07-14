@@ -272,7 +272,7 @@ function contentDisposition(title: string): string {
 exportRouter.post('/:docId/export/pdf', exportPdfHandler)
 
 export async function exportPdfHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
   if (!guard) return
 
   // Gate the whole pipeline (prep + compile) behind the queue, matching the

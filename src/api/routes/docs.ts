@@ -10,6 +10,14 @@ import { normalizeTypeFilter } from '../../db/docType.js'
 import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
+import {
+  parseShareScope,
+  parseShareRole,
+  shareScopeName,
+  shareRoleName,
+  SHARE_SCOPE_ANYONE,
+  SHARE_ROLE_READ,
+} from '../../permission/shareScope.js'
 import { buildWhiteboardName, WhiteboardNameError } from '../../whiteboard/schema/index.js'
 import { newDocId } from '../../util/ids.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
@@ -146,7 +154,7 @@ docsRouter.post('/', createDocHandler)
 export async function getDocHandler(req: Request, res: Response) {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
   if (!guard) return
   const { meta, role } = guard
   res.status(200).json({
@@ -163,6 +171,12 @@ export async function getDocHandler(req: Request, res: Response) {
     // Canonical browser-facing link a caller can pass straight to chat. See
     // buildDocShareUrl / config.webOrigin.
     shareUrl: buildDocShareUrl(config.webOrigin, meta.doc_id, meta.space_id),
+    // #64: additive share-scope fields so the client dialog can render current
+    // state without a second round-trip to GET /:docId/share. Coerced through the
+    // fail-safe name mappers, so an unexpected stored value reads as the most
+    // restrictive (restricted / read).
+    shareScope: shareScopeName(meta.share_scope),
+    shareRole: shareRoleName(meta.share_role),
     ...(meta.permission_epoch != null ? { permissionEpoch: meta.permission_epoch } : {}),
   })
 }
@@ -302,7 +316,7 @@ docsRouter.get('/:docId', getDocHandler)
 docsRouter.patch('/:docId', async (req: Request, res: Response) => {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const { title } = req.body ?? {}
   if (typeof title !== 'string' || title === '') {
@@ -317,7 +331,7 @@ docsRouter.patch('/:docId', async (req: Request, res: Response) => {
 docsRouter.delete('/:docId', async (req: Request, res: Response) => {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const deleted = await docMetaRepo.softDelete(docId)
   // Broadcast the epoch invalidation so connected writers recheck and get cut
@@ -328,3 +342,81 @@ docsRouter.delete('/:docId', async (req: Request, res: Response) => {
   }
   res.status(200).json({ docId, status: 'deleted' })
 })
+
+/**
+ * GET /api/v1/docs/{docId}/share — read a doc's share settings (#64, needs
+ * reader). Anyone who can see the doc can see its scope, so the client dialog
+ * can render current state for any viewer. 404 (not 403) for a missing/deleted
+ * or cross-space doc (requireDocRole existence-hiding ordering); 403 when the
+ * caller has no effective role on the doc.
+ */
+export async function getShareHandler(req: Request, res: Response) {
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', {
+    isBot: req.botToken !== undefined,
+  })
+  if (!guard) return
+  res.status(200).json({
+    docId: guard.meta.doc_id,
+    shareScope: shareScopeName(guard.meta.share_scope),
+    shareRole: shareRoleName(guard.meta.share_role),
+  })
+}
+
+/**
+ * PUT /api/v1/docs/{docId}/share — change a doc's share settings (#64, needs
+ * admin; owner is implicit admin). Mirrors the members mutation shape: guard,
+ * validate, write, bump epoch.
+ *
+ *   body: { shareScope: "restricted"|"anyone_in_space", shareRole?: "read"|"edit" }
+ *   400 invalid_scope   shareScope not in enum
+ *   400 invalid_role    shareScope=anyone_in_space but shareRole missing/invalid
+ *   403 forbidden       caller is not admin/owner (requireDocRole admin gate)
+ *   404 not_found       doc missing/deleted OR cross-space
+ *   409 conflict        archived (status=2)
+ *
+ * Normalization (design §3.2): when shareScope=restricted the handler persists
+ * share_role=read regardless of any shareRole sent (the field is ignored, not
+ * rejected), so the stored row stays canonical and the read API is deterministic.
+ * The write is followed by a DOC-WIDE epoch bump (no uid) so a narrowing cuts
+ * every non-member's live session, exactly like soft-delete.
+ */
+export async function putShareHandler(req: Request, res: Response) {
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', {
+    isBot: req.botToken !== undefined,
+  })
+  if (!guard) return
+  const { shareScope, shareRole } = req.body ?? {}
+  const scopeNum = parseShareScope(shareScope)
+  if (scopeNum === null) {
+    res.status(400).json({ error: 'invalid_scope' })
+    return
+  }
+  let roleNum: number
+  if (scopeNum === SHARE_SCOPE_ANYONE) {
+    // anyone_in_space requires an explicit, valid share role.
+    const parsed = parseShareRole(shareRole)
+    if (parsed === null) {
+      res.status(400).json({ error: 'invalid_role' })
+      return
+    }
+    roleNum = parsed
+  } else {
+    // restricted: normalize+persist read, ignoring any body shareRole.
+    roleNum = SHARE_ROLE_READ
+  }
+  await docMetaRepo.setShareSettings(guard.meta.doc_id, scopeNum, roleNum)
+  // Doc-wide invalidation (no uid): a narrowing must cut every non-member's live
+  // session; live sessions re-derive access on the epoch bump (§3.2 / §5.3).
+  await bumpEpoch(guard.meta.doc_id, guard.meta.document_name)
+  res.status(200).json({
+    docId: guard.meta.doc_id,
+    shareScope: shareScopeName(scopeNum),
+    shareRole: shareRoleName(roleNum),
+  })
+}
+
+// Two-segment paths: distinct from the single-segment '/:docId' route, so
+// registration order relative to it does not matter (Express keys on segment
+// count). Registered here alongside the other single-doc routes.
+docsRouter.get('/:docId/share', getShareHandler)
+docsRouter.put('/:docId/share', putShareHandler)

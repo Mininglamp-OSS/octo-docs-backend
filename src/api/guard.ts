@@ -5,10 +5,27 @@ import type { Response } from 'express'
 import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
 import { resolveRole } from '../permission/resolveRole.js'
 import { roleAtLeast, type ResolvedRole, type Role } from '../permission/role.js'
+import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
+import { getOctoIdentity } from '../auth/octoIdentity.js'
 
 export interface DocGuard {
   meta: DocMeta
   role: ResolvedRole
+}
+
+/**
+ * Caller-principal hints the #64 share path needs. A verified BOT carries a
+ * server-resolved space on `req.spaceId` (verifyBot reverse-lookup, anti-spoof),
+ * so once the cross-space 404 gate has confirmed `req.spaceId === meta.space_id`
+ * the bot is by definition an active member of the doc's space — no octo-server
+ * membership call, no dependency on the new endpoint. HUMANS carry an unverified
+ * `X-Space-Id`, so their membership is resolved lazily via isSpaceMember. The
+ * router handlers are shared between the human and bot mounts, so this is passed
+ * per-request as `{ isBot: req.botToken !== undefined }`. Restricted docs never
+ * consult it (share path is a no-op), so omitting it is safe there.
+ */
+export interface DocRoleCaller {
+  isBot?: boolean
 }
 
 /**
@@ -47,6 +64,7 @@ export async function requireDocRole(
   docId: string,
   spaceId: string,
   minRole: Role,
+  caller: DocRoleCaller = {},
 ): Promise<DocGuard | null> {
   const meta = await docMetaRepo.getByDocId(docId)
   if (!meta || meta.status === 0) {
@@ -60,7 +78,20 @@ export async function requireDocRole(
     res.status(409).json({ error: 'conflict' })
     return null
   }
-  const role = await resolveRole(uid, docId)
+  const direct = await resolveRole(uid, docId)
+  // #64 space-scoped share (design §5.1): effectiveRole = max(directRole,
+  // share-derived). Resolved LAZILY — only when the direct role is insufficient
+  // AND the doc is anyone_in_space — so restricted docs (the default) and
+  // already-authorized callers add zero new IO. A bot's membership is implied by
+  // the cross-space gate above (req.spaceId === meta.space_id); a human's is
+  // resolved via isSpaceMember (fail-closed false on any lookup error => 403).
+  let role = direct
+  if (!roleAtLeast(direct, minRole) && meta.share_scope === SHARE_SCOPE_ANYONE) {
+    const member = caller.isBot
+      ? true
+      : await getOctoIdentity().isSpaceMember(uid, meta.space_id)
+    role = effectiveRole(direct, member, meta.share_scope, meta.share_role)
+  }
   if (role === 'none' || !roleAtLeast(role, minRole)) {
     res.status(403).json({ error: 'forbidden' })
     return null

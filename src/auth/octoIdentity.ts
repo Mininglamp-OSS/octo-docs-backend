@@ -12,6 +12,7 @@
  *     would come from octo's AuthMiddleware via c.GetLoginUID() (§4.7(a)).
  */
 import { config } from '../config/env.js'
+import { Singleflight, TtlCache } from '../util/singleflight.js'
 
 export interface OctoUser {
   uid: string
@@ -64,6 +65,21 @@ export interface OctoIdentity {
 
   /** (b) Batch profile lookup for awareness cursors (§4.7(b)). */
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>
+
+  /**
+   * (#64) Is `uid` an ACTIVE member of Space `spaceId`? Resolved server-side via
+   * octo-server's POST /v1/auth/space-membership (the internal verify group,
+   * same protection as /v1/auth/verify*), which answers the canonical predicate
+   * `COUNT(*) FROM space_member WHERE space_id AND uid AND status=1 > 0`. Used to
+   * honor the anyone_in_space share scope for HUMANS (bots derive membership from
+   * their server-verified space, so they never call this).
+   *
+   * FAIL-CLOSED: any transport failure / non-200 / malformed body / unreachable
+   * server returns `false` (treated as NOT a member), mirroring verifyToken /
+   * verifyBot returning null on failure. A transient octo-server outage therefore
+   * TIGHTENS access (denies share-derived reads/writes), never loosens it.
+   */
+  isSpaceMember(uid: string, spaceId: string): Promise<boolean>
 }
 
 /**
@@ -77,6 +93,18 @@ export interface OctoIdentity {
  */
 export class HttpOctoIdentity implements OctoIdentity {
   constructor(private readonly baseUrl: string = config.octoIdentity.serverBaseUrl) {}
+
+  /**
+   * Per-{uid,spaceId} coalescing + short-TTL cache for isSpaceMember (#64,
+   * design §4.4). Bounds the extra octo-server QPS on hot anyone_in_space docs;
+   * only positive/negative membership answers are cached, never a fail-closed
+   * transport error (so a transient outage does not pin a `false` for the whole
+   * TTL — the next call retries).
+   */
+  private readonly membershipSf = new Singleflight<boolean>()
+  private readonly membershipCache = new TtlCache<boolean>(
+    config.octoIdentity.membershipCacheTtlSeconds * 1000,
+  )
 
   async verifyToken(token: string): Promise<{ uid: string; name?: string } | null> {
     if (!token) return null
@@ -184,6 +212,52 @@ export class HttpOctoIdentity implements OctoIdentity {
     const results = await Promise.all(uids.map((u) => this.getUser(u, callerToken)))
     return results.filter((u): u is OctoUser => u !== null)
   }
+
+  async isSpaceMember(uid: string, spaceId: string): Promise<boolean> {
+    // A missing principal or space can never be a real active membership; short
+    // out before any IO (also avoids caching a degenerate key).
+    if (!uid || !spaceId) return false
+    const key = `${uid} ${spaceId}`
+    const cached = this.membershipCache.get(key)
+    if (cached !== undefined) return cached
+    return this.membershipSf.do(key, async () => {
+      const member = await this.fetchIsSpaceMember(uid, spaceId)
+      // Only cache a confirmed answer. A fail-closed `false` from a transport
+      // error (fetchIsSpaceMember returns false on throw/non-200) is NOT cached
+      // here — fetchIsSpaceMember distinguishes the two by returning null on
+      // error, which we map to an uncached false.
+      if (member !== null) this.membershipCache.set(key, member)
+      return member ?? false
+    })
+  }
+
+  /**
+   * POST /v1/auth/space-membership with the service credential. Returns the
+   * membership boolean, or null on any transport failure / non-200 / malformed
+   * body so the caller can distinguish "confirmed not-a-member" (false) from
+   * "could not confirm" (null => fail-closed, uncached). The service credential
+   * is the same OCTO_SERVER_TOKEN header used by the other internal calls; the
+   * endpoint sits in octo-server's internal verify group (network-restricted /
+   * X-Internal-Key gated), so the human's session token is not the authorization.
+   */
+  private async fetchIsSpaceMember(uid: string, spaceId: string): Promise<boolean | null> {
+    const token = config.octoIdentity.serviceToken || ''
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/auth/space-membership`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { token } : {}) },
+        body: JSON.stringify({ space_id: spaceId, uid }),
+      })
+    } catch {
+      // Authoritative source unreachable => cannot confirm => fail-closed.
+      return null
+    }
+    if (!res.ok) return null
+    const body = (await res.json().catch(() => null)) as { is_member?: unknown } | null
+    if (!body || typeof body.is_member !== 'boolean') return null
+    return body.is_member
+  }
 }
 
 /**
@@ -221,6 +295,10 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
     return this.delegate.getUsers(uids, callerToken)
+  }
+
+  isSpaceMember(uid: string, spaceId: string): Promise<boolean> {
+    return this.delegate.isSpaceMember(uid, spaceId)
   }
 }
 

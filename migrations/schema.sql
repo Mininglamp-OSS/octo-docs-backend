@@ -31,6 +31,8 @@ CREATE TABLE doc_meta (
   doc_type      VARCHAR(32)  NOT NULL DEFAULT 'doc', -- doc / template ...
   status        TINYINT      NOT NULL DEFAULT 1,  -- 1=正常 0=已删除(软删) 2=归档
   permission_epoch BIGINT    NOT NULL DEFAULT 0,   -- 权限版本号（单调递增，权威落 DB；v2.0 按 doc_member 变更 +1，见 §4.5）
+  share_scope   TINYINT      NOT NULL DEFAULT 0,   -- 分享范围：0=restricted(默认) 1=anyone_in_space（#64 空间级分享，见 §4/§5）
+  share_role    TINYINT      NOT NULL DEFAULT 1,   -- anyone_in_space 生效时的角色：1=read 2=edit；restricted 时忽略（#64）
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   created_by    VARCHAR(64)  NOT NULL,
