@@ -224,7 +224,10 @@ docsRouter.get('/', async (req: Request, res: Response) => {
 export async function recordDocViewHandler(req: Request, res: Response) {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader', {
+    isBot: req.botToken !== undefined,
+    token: req.octoToken,
+  })
   if (!guard) return
   const viewedAt = await docViewHistoryRepo.upsertViewWithPrune({
     uid,
