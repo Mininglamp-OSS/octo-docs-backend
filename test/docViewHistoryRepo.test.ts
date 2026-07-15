@@ -210,6 +210,40 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     expect(sql).not.toContain('IN ()')
     expect(sql).not.toContain('owner_id IN')
   })
+
+  it('type multi-select becomes doc_type IN (?, ?) — OR between kinds, AND with q/creator (XIN-1188)', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
+    mockQuery.mockResolvedValueOnce([] as never)
+    await docViewHistoryRepo.listRecent({
+      uid: 'u_1', spaceId: 's1', q: 'spec', creators: ['u_a'], types: ['doc', 'sheet'], pageSize: 20,
+    })
+    const call = mockQuery.mock.calls.at(-1)!
+    const sql = call[0] as string
+    const params = call[1] as unknown[]
+    expect(sql).toContain('m.doc_type IN (?, ?)')
+    expect(sql).toContain('m.owner_id IN (?)') // AND-ed with creator
+    expect(sql).toContain("LIKE ? ESCAPE '\\\\'") // AND-ed with q
+    expect(params).toContain('doc')
+    expect(params).toContain('sheet')
+  })
+
+  it('the type filter narrows the COUNT too (before pagination — page and total agree)', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
+    mockQuery.mockResolvedValueOnce([] as never)
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', types: ['board'], pageSize: 20 })
+    // first call is the COUNT(*) query; it must carry the same doc_type predicate + bind.
+    const countCall = mockQuery.mock.calls[0]!
+    expect(countCall[0] as string).toContain('m.doc_type IN (?)')
+    expect(countCall[1] as unknown[]).toContain('board')
+  })
+
+  it('an empty types array short-circuits to no doc_type clause (backward compatible)', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
+    mockQuery.mockResolvedValueOnce([] as never)
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', types: [], pageSize: 20 })
+    const sql = mockQuery.mock.calls.at(-1)![0] as string
+    expect(sql).not.toContain('doc_type IN')
+  })
 })
 
 describe('docViewHistoryRepo.listCreators — pre-facet distinct owners', () => {

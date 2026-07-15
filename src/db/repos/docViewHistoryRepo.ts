@@ -154,6 +154,7 @@ export const docViewHistoryRepo = {
     spaceId: string
     q?: string
     creators?: string[]
+    types?: string[]
     cursor?: string
     pageSize: number
   }): Promise<{ items: RecentViewItem[]; nextCursor: string | null; total: number }> {
@@ -175,6 +176,15 @@ export const docViewHistoryRepo = {
     if (creators.length > 0) {
       where.push(`m.owner_id IN (${creators.map(() => '?').join(', ')})`)
       filterArgs.push(...creators)
+    }
+    // FEAT-B/XIN-1188 kind filter: multi-value OR on doc_type, applied at the same
+    // layer as `q`/`creator` — narrows the keyset window BEFORE pagination, so the
+    // page and the total COUNT agree. Values are pre-validated by the route; empty
+    // => no predicate (backward compatible, no behavior change for old clients).
+    const types = (params.types ?? []).filter((t) => typeof t === 'string' && t !== '')
+    if (types.length > 0) {
+      where.push(`m.doc_type IN (${types.map(() => '?').join(', ')})`)
+      filterArgs.push(...types)
     }
 
     // base binds: role CASE `m.owner_id = ?` is only in the SELECT list (items

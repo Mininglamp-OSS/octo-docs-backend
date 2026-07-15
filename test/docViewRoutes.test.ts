@@ -114,6 +114,24 @@ describe('GET /docs/recent — listRecentHandler', () => {
     expect(res.statusCode).toBe(400)
     expect(res.body).toEqual({ error: 'invalid_cursor' })
   })
+
+  it('normalizes the repeated ?type= param and forwards a validated types[] to the repo (XIN-1188)', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({ total: 0, nextCursor: null, items: [] } as never)
+    const res = mockRes()
+    // a stray unknown value is dropped; known kinds pass through as a multi-value OR set.
+    await listRecentHandler(req({ query: { type: ['doc', 'sheet', 'slides'] } }), res as never)
+    expect(res.statusCode).toBe(200)
+    const arg = vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0]
+    expect(arg.types).toEqual(['doc', 'sheet'])
+  })
+
+  it('forwards no type filter (empty array) when the param is absent — backward compatible', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({ total: 0, nextCursor: null, items: [] } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    const arg = vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0]
+    expect(arg.types).toEqual([])
+  })
 })
 
 describe('GET /docs/recent/creators — listRecentCreatorsHandler', () => {

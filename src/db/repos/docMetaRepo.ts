@@ -113,7 +113,10 @@ export const docMetaRepo = {
    * docs the caller owns (owner_id == uid) and drops the shared-with-me branch —
    * role is then always admin(3). `q` (FEAT-B filename search) adds a
    * case-insensitive substring match on title with LIKE wildcards escaped so a
-   * user-typed `%`/`_`/`\` matches literally.
+   * user-typed `%`/`_`/`\` matches literally. `types` (FEAT-B/XIN-1188 kind
+   * filter) narrows to a multi-value OR set of `doc_type`s at the same layer as
+   * `q` — BEFORE pagination, so count and page agree. Empty `types` applies no
+   * predicate (backward compatible).
    */
   async listForUser(params: {
     uid: string
@@ -121,6 +124,7 @@ export const docMetaRepo = {
     folderId?: string
     owner?: 'me'
     q?: string
+    types?: string[]
     page: number
     pageSize: number
     sort: 'updatedAt:desc' | 'updatedAt:asc'
@@ -148,6 +152,14 @@ export const docMetaRepo = {
       const qEsc = q.replace(/[\\%_]/g, (c) => `\\${c}`)
       where.push(`m.title LIKE ? ESCAPE '\\\\'`)
       filterArgs.push(`%${qEsc}%`)
+    }
+    // FEAT-B/XIN-1188 kind filter: multi-value OR on doc_type, same layer as `q`
+    // (before pagination). Values are pre-validated by the route; empty => no
+    // predicate (pre-FEAT-B behavior unchanged).
+    const types = (params.types ?? []).filter((t) => typeof t === 'string' && t !== '')
+    if (types.length > 0) {
+      where.push(`m.doc_type IN (${types.map(() => '?').join(', ')})`)
+      filterArgs.push(...types)
     }
     // Visibility predicate. Default: owner OR member. owner='me': strictly owner,
     // excluding shared-with-me (FEAT-B Q7). Both bind a single trailing uid.

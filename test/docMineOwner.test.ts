@@ -59,4 +59,30 @@ describe('docMetaRepo.listForUser — owner=me / q (FEAT-B)', () => {
     expect(sql).not.toMatch(/LIMIT \?/)
     expect(params).not.toContain(20)
   })
+
+  it('types multi-select becomes doc_type IN (?, ?) — OR between kinds, AND with q (XIN-1188)', async () => {
+    await docMetaRepo.listForUser({
+      uid: 'u_1', spaceId: 's1', owner: 'me', q: 'plan', types: ['doc', 'board'], page: 1, pageSize: 20, sort: 'updatedAt:desc',
+    })
+    const { sql, params } = itemsCall()
+    expect(sql).toContain('m.doc_type IN (?, ?)')
+    expect(sql).toContain("m.title LIKE ? ESCAPE '\\\\'") // AND-ed with q
+    expect(params).toContain('doc')
+    expect(params).toContain('board')
+  })
+
+  it('the type filter narrows the COUNT too (before pagination)', async () => {
+    await docMetaRepo.listForUser({
+      uid: 'u_1', spaceId: 's1', types: ['sheet'], page: 1, pageSize: 20, sort: 'updatedAt:desc',
+    })
+    // count query is the first of the two calls.
+    const countCall = mockQuery.mock.calls[0]!
+    expect(countCall[0] as string).toContain('m.doc_type IN (?)')
+    expect(countCall[1] as unknown[]).toContain('sheet')
+  })
+
+  it('empty types array adds no doc_type clause (backward compatible)', async () => {
+    await docMetaRepo.listForUser({ uid: 'u_1', spaceId: 's1', types: [], page: 1, pageSize: 20, sort: 'updatedAt:desc' })
+    expect(itemsCall().sql).not.toContain('doc_type IN')
+  })
 })

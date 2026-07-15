@@ -6,6 +6,7 @@ import { Router, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
+import { normalizeTypeFilter } from '../../db/docType.js'
 import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
@@ -179,11 +180,14 @@ docsRouter.get('/', async (req: Request, res: Response) => {
   // additive — omitting them preserves the pre-FEAT-B behavior verbatim.
   const owner = req.query.owner === 'me' ? 'me' : undefined
   const q = typeof req.query.q === 'string' ? req.query.q : undefined
+  // FEAT-B/XIN-1188: optional multi-value `?type=` kind filter (repeated param,
+  // never CSV). Validated against the fixed enum; unknown/absent => no filter.
+  const types = normalizeTypeFilter(req.query.type)
   const page = Math.max(1, Number(req.query.page ?? 1) || 1)
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
   const sort = req.query.sort === 'updatedAt:asc' ? 'updatedAt:asc' : 'updatedAt:desc'
 
-  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, folderId, owner, q, page, pageSize, sort })
+  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, folderId, owner, q, types, page, pageSize, sort })
   res.status(200).json({
     total,
     items: items.map((d) => ({
@@ -230,11 +234,14 @@ export async function listRecentHandler(req: Request, res: Response) {
   const spaceId = req.spaceId!
   const q = typeof req.query.q === 'string' ? req.query.q : undefined
   const creators = toStringArray(req.query.creator)
+  // FEAT-B/XIN-1188: optional multi-value `?type=` kind filter (same convention
+  // as `creator`). Validated against the fixed enum; unknown/absent => no filter.
+  const types = normalizeTypeFilter(req.query.type)
   const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
   let result
   try {
-    result = await docViewHistoryRepo.listRecent({ uid, spaceId, q, creators, cursor, pageSize })
+    result = await docViewHistoryRepo.listRecent({ uid, spaceId, q, creators, types, cursor, pageSize })
   } catch (err) {
     if (err instanceof Error && err.message === 'invalid_cursor') {
       res.status(400).json({ error: 'invalid_cursor' })
