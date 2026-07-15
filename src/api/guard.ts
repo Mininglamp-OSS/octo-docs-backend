@@ -25,6 +25,13 @@ export interface DocGuard {
  */
 export interface DocRoleCaller {
   isBot?: boolean
+  /**
+   * The human caller's octo session token, threaded to resolveEffectiveRole so a
+   * human's anyone_in_space membership resolves via verify?include=context. The
+   * bot mount carries no session token and short-circuits on isBot, so it is
+   * omitted there.
+   */
+  token?: string
 }
 
 /**

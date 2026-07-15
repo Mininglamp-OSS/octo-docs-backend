@@ -38,6 +38,13 @@ export interface ShareResolvable {
 /** Caller-principal hint: a verified bot derives membership from its space. */
 export interface ShareCaller {
   isBot?: boolean
+  /**
+   * The human caller's octo session token. Used to resolve their OWN space
+   * membership via verify?include=context (isSpaceMember). Never read for a bot
+   * (isBot short-circuits before any membership call), so the bot path — which
+   * carries no session token — passes it as undefined.
+   */
+  token?: string
 }
 
 export async function resolveEffectiveRole(
@@ -49,6 +56,8 @@ export async function resolveEffectiveRole(
   if (meta.share_scope !== SHARE_SCOPE_ANYONE || roleAtLeast(direct, 'writer')) {
     return direct
   }
-  const member = caller.isBot ? true : await getOctoIdentity().isSpaceMember(uid, meta.space_id)
+  const member = caller.isBot
+    ? true
+    : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
   return effectiveRole(direct, member, meta.share_scope, meta.share_role)
 }

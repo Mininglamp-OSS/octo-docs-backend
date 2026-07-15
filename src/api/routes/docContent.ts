@@ -146,7 +146,7 @@ function checkOpsBounds(ops: DocEditOp[]): { status: number; error: string } | n
 docContentRouter.get('/:docId/content', getDocContentHandler)
 
 export async function getDocContentHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 
@@ -167,7 +167,7 @@ export async function getDocContentHandler(req: Request, res: Response): Promise
 docContentRouter.patch('/:docId/content', patchDocContentHandler)
 
 export async function patchDocContentHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 
@@ -197,6 +197,7 @@ export async function patchDocContentHandler(req: Request, res: Response): Promi
       ops,
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
+      token: req.octoToken,
     })
     if (result.ok) {
       res.status(200).json({

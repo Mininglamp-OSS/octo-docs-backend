@@ -92,7 +92,7 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   // access on a scope narrowing without a fresh membership call.
   let spaceMember = false
   if (meta.share_scope === SHARE_SCOPE_ANYONE) {
-    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id)
+    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
   }
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }

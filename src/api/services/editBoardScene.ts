@@ -56,6 +56,13 @@ export interface EditBoardSceneInput {
    * via isSpaceMember. Defaults to false so an omitted flag never over-grants.
    */
   isBot?: boolean
+  /**
+   * The human caller's octo session token (#64). Threaded to the under-lock
+   * effective-role recheck so a human's anyone_in_space membership resolves via
+   * verify?include=context, exactly as the route guard does. The bot path
+   * short-circuits on isBot and carries no token, so it is omitted there.
+   */
+  token?: string
 }
 
 export type EditBoardSceneResult =
@@ -87,14 +94,14 @@ interface LockedMetaRow {
  * space-share-derived role, so an `anyone_in_space`/edit space member is not
  * 403'd here after passing the route guard.
  */
-async function hasWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaRow, isBot: boolean): Promise<boolean> {
+async function hasWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<boolean> {
   const direct: ResolvedRole =
     uid === meta.owner_id ? 'admin' : ((await docMemberRepo.getRoleTx(tx, docId, uid)) ?? 'none')
   const role = await resolveEffectiveRole(uid, direct, {
     space_id: meta.space_id,
     share_scope: Number(meta.share_scope),
     share_role: Number(meta.share_role),
-  }, { isBot })
+  }, { isBot, token })
   return roleAtLeast(role, 'writer')
 }
 
@@ -148,7 +155,7 @@ export async function editBoardScene(input: EditBoardSceneInput): Promise<EditBo
     if (!meta || Number(meta.status) === 0) return { ok: false as const, status: 404, error: 'not_found' }
     if (Number(meta.status) === 2) return { ok: false as const, status: 409, error: 'conflict' }
 
-    if (!(await hasWriterTx(tx, input.docId, input.uid, meta, input.isBot ?? false))) {
+    if (!(await hasWriterTx(tx, input.docId, input.uid, meta, input.isBot ?? false, input.token ?? ''))) {
       return { ok: false as const, status: 403, error: 'forbidden' }
     }
     if (Number(meta.permission_epoch) !== input.authorizedEpoch) {

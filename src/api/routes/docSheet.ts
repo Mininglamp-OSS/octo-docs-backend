@@ -84,7 +84,7 @@ function parsePageLimit(raw: string | undefined): { limit: number } | { error: s
 }
 
 export async function getDocSheetHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireSheetDocType(res, guard.meta.doc_type)) return
 
@@ -409,7 +409,7 @@ function checkHyperlinksBounds(
 docSheetRouter.patch('/:docId/sheet', patchDocSheetHandler)
 
 export async function patchDocSheetHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   // gate b: only a 'sheet' doc_type is writable here; the doc-body hard door
   // (docContent rejects 'sheet') is deliberately the mirror image — a sheet is
@@ -474,6 +474,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       hyperlinks,
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
+      token: req.octoToken,
     })
     if (result.ok) {
       res.status(200).json({
