@@ -2,7 +2,7 @@
  * Inline-comment endpoints (feature #3 — doc_comment).
  *   GET    /api/v1/docs/{docId}/comments        (reader)  list thread roots + replies
  *   POST   /api/v1/docs/{docId}/comments        (reader)  create root or reply
- *   PATCH  /api/v1/docs/{docId}/comments/{id}    body edit -> author; resolve -> writer
+ *   PATCH  /api/v1/docs/{docId}/comments/{id}    body edit -> author; status -> writer
  *   DELETE /api/v1/docs/{docId}/comments/{id}    soft -> author; hard -> admin
  *
  * Comments live entirely out-of-band from the Y.Doc. Anchors are opaque encoded
@@ -19,13 +19,16 @@
  *
  * Product decision: commenting requires the commenter role or higher — a plain
  * read-only reader can view but NOT comment. Viewing comments (list/get) stays
- * at reader. Resolving/reopening a thread needs writer; deleting your own
- * comment (soft) needs to be its author; hard delete needs admin.
+ * at reader. Adjudicating a thread (open/approved/rejected/committed) needs
+ * writer; deleting your own comment (soft) needs to be its author; hard delete
+ * needs admin. Comment VISIBILITY is never gated by status — a reader sees
+ * rejected/committed roots too; approval is only an execution-list FILTER.
  */
 import { Router, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { roleAtLeast } from '../../permission/role.js'
 import { docCommentRepo, type DocComment } from '../../db/repos/docCommentRepo.js'
+import { isStatus, InvalidTransitionError, type Status } from '../../comments/status.js'
 import {
   resolveAnchorFromLiveDoc,
   AmbiguousAnchorError,
@@ -169,6 +172,11 @@ function serialize(c: DocComment) {
     anchorStart: c.anchorStart ? c.anchorStart.toString('base64') : null,
     anchorEnd: c.anchorEnd ? c.anchorEnd.toString('base64') : null,
     anchorText: c.anchorText,
+    status: c.status,
+    adjudicatedBy: c.adjudicatedBy,
+    adjudicatedAt: c.adjudicatedAt,
+    adjudicationNote: c.adjudicationNote,
+    // Legacy fields kept for old clients: resolved is derived (status !== 'open').
     resolved: c.resolved,
     resolvedBy: c.resolvedBy,
     resolvedAt: c.resolvedAt,
@@ -184,11 +192,16 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
   if (!guard) return
 
   const includeResolved = req.query.includeResolved === '1'
+  // Optional lifecycle filter (agent pulls its execution list with ?status=approved).
+  // Visibility is NOT gated: any reader may filter to any status, including
+  // rejected/committed. An unknown value is ignored (falls back to the default).
+  const statusRaw = req.query.status
+  const status = isStatus(statusRaw) ? statusRaw : undefined
   const cursor = parseId(req.query.cursor)
   const limitRaw = Number(req.query.limit ?? DEFAULT_LIMIT)
   const limit = Math.min(MAX_LIMIT, Math.max(1, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : DEFAULT_LIMIT))
 
-  const roots = await docCommentRepo.listRoots(guard.meta.doc_id, { includeResolved, cursor, limit })
+  const roots = await docCommentRepo.listRoots(guard.meta.doc_id, { includeResolved, status, cursor, limit })
   // Batch all replies for this page of roots in ONE query, then group by
   // parent in memory — avoids an N+1 (one listReplies per root, up to ~101).
   const replies = await docCommentRepo.listRepliesForRoots(roots.map((r) => r.id))
@@ -355,23 +368,55 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
     return
   }
 
-  const { body, resolved } = req.body ?? {}
+  const { body, status, resolved, note } = req.body ?? {}
 
-  // Resolve / reopen a thread root — requires writer (elevated above the floor).
-  if (resolved !== undefined) {
+  // Adjudicate a thread root — requires writer (elevated above the reader floor).
+  // Accepts either the new `status` field or the legacy `resolved` boolean; both
+  // route through the same transition-validated path.
+  //   { status: 'open'|'approved'|'rejected'|'committed', note?: string }
+  //   { resolved: true }  -> status:'approved'   (legacy compat)
+  //   { resolved: false } -> status:'open'       (legacy compat)
+  // `committed` may be set by a writer too (the agent acts through a writer/bot
+  // identity on the commit-confirm path).
+  if (status !== undefined || resolved !== undefined) {
     if (!roleAtLeast(guard.role, 'writer')) {
       res.status(403).json({ error: 'forbidden' })
       return
     }
     if (comment.parentId !== null) {
-      res.status(400).json({ error: 'only a thread root can be resolved' })
+      res.status(400).json({ error: 'only a thread root can be adjudicated' })
       return
     }
-    if (typeof resolved !== 'boolean') {
-      res.status(400).json({ error: 'resolved must be a boolean' })
+    // Resolve the target status from whichever field was supplied.
+    let toStatus: Status
+    if (status !== undefined) {
+      if (!isStatus(status)) {
+        res.status(400).json({ error: 'invalid status' })
+        return
+      }
+      toStatus = status
+    } else {
+      if (typeof resolved !== 'boolean') {
+        res.status(400).json({ error: 'resolved must be a boolean' })
+        return
+      }
+      toStatus = resolved ? 'approved' : 'open'
+    }
+    if (note !== undefined && typeof note !== 'string') {
+      res.status(400).json({ error: 'note must be a string' })
       return
     }
-    await docCommentRepo.setResolved(id, resolved, req.uid!)
+    try {
+      await docCommentRepo.setStatus(id, toStatus, req.uid!, note ?? '')
+    } catch (err) {
+      // A disallowed lifecycle move (e.g. committed->open, open->committed) is a
+      // client error, not a 500 — surface it as 400 invalid_transition.
+      if (err instanceof InvalidTransitionError) {
+        res.status(400).json({ error: 'invalid_transition' })
+        return
+      }
+      throw err
+    }
     res.status(200).json({ id })
     return
   }

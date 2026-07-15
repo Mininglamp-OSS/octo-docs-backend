@@ -157,6 +157,12 @@ CREATE TABLE doc_attachment (
 -- 锚点）加若干 reply（parent_id 指向 root；单层嵌套，reply 不再有子级、不带锚点）
 -- 组成。锚点是编码后的 Yjs RelativePosition 字节（不透明），服务端只存取不解析；
 -- anchor_text 是创建时的文本快照，仅供展示/审计，绝不据此派生权限或定位。
+-- 裁决（adjudication）为 4 态生命周期，仅 root 有意义：
+--   open(0) --approve(writer)--> approved(1) --agent commit--> committed(3)
+--     └-------reject(writer)---> rejected(2)
+-- committed 为终态；approved/rejected 可 reopen 回 open。status 为唯一权威，
+-- resolved 退化为派生镜像（resolved = status!=open）以兼容旧客户端。裁决全程留痕
+-- （adjudicated_by/at/note）。
 CREATE TABLE doc_comment (
   id            BIGINT       NOT NULL AUTO_INCREMENT, -- 单一权威分配（DB 自增），禁止应用层 MAX+1
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id（权限以此为准）
@@ -167,14 +173,19 @@ CREATE TABLE doc_comment (
   anchor_start  BLOB         NULL,                -- 编码后的 Yjs RelativePosition 字节（不透明）
   anchor_end    BLOB         NULL,                -- 同上，区间末端
   anchor_text   VARCHAR(512) NOT NULL DEFAULT '', -- 创建时文本快照，仅展示/审计
-  resolved      TINYINT      NOT NULL DEFAULT 0,  -- 仅线程根有意义：0=open 1=resolved
-  resolved_by   VARCHAR(64)  NULL,                -- 解决人 uid
-  resolved_at   DATETIME(3)  NULL,                -- 解决时间
+  status        TINYINT      NOT NULL DEFAULT 0,  -- 仅线程根有意义（4 态裁决生命周期）：0=open 1=approved 2=rejected 3=committed
+  adjudicated_by   VARCHAR(64)   NULL,            -- 裁决人 uid（approve/reject/commit/reopen 均留痕）
+  adjudicated_at   DATETIME(3)   NULL,            -- 裁决时间
+  adjudication_note VARCHAR(1024) NOT NULL DEFAULT '', -- 裁决备注（可空串）
+  resolved      TINYINT      NOT NULL DEFAULT 0,  -- 遗留派生镜像（供旧客户端）：resolved = (status != open)
+  resolved_by   VARCHAR(64)  NULL,                -- 解决人 uid（遗留）
+  resolved_at   DATETIME(3)  NULL,                -- 解决时间（遗留）
   deleted       TINYINT      NOT NULL DEFAULT 0,  -- 软删
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
-  KEY idx_doc_open (doc_id, resolved, deleted, id), -- 「某文档的未解决评论」列表/分页
+  KEY idx_doc_open (doc_id, resolved, deleted, id), -- 「某文档的未解决评论」列表/分页（遗留）
+  KEY idx_doc_status (doc_id, status, deleted, id), -- 按裁决状态过滤的列表/分页（如 agent 拉取 approved 执行清单）
   KEY idx_thread (parent_id, id),                   -- 拉取某 root 的回复
   -- 不变式：root（parent_id IS NULL）必须带两端锚点；reply（parent_id NOT NULL）两端锚点必须为 NULL。
   -- 代码层也强制此规则（见 docCommentRepo / comments 路由），CHECK 作为最后一道防线。

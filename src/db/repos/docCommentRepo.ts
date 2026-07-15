@@ -10,6 +10,13 @@
  * snake_case -> camelCase in the typed return (see DocComment).
  */
 import { query, transaction } from '../pool.js'
+import {
+  type Status,
+  statusFromNumber,
+  statusToNumber,
+  canTransition,
+  InvalidTransitionError,
+} from '../../comments/status.js'
 
 export interface DocComment {
   id: number
@@ -21,6 +28,12 @@ export interface DocComment {
   anchorStart: Buffer | null
   anchorEnd: Buffer | null
   anchorText: string
+  /** Adjudication lifecycle state; root-only (open|approved|rejected|committed). */
+  status: Status
+  adjudicatedBy: string | null
+  adjudicatedAt: Date | null
+  adjudicationNote: string
+  /** Legacy DERIVED mirror for old clients: resolved = status !== 'open'. */
   resolved: boolean
   resolvedBy: string | null
   resolvedAt: Date | null
@@ -39,6 +52,10 @@ interface DocCommentRow {
   anchor_start: Buffer | null
   anchor_end: Buffer | null
   anchor_text: string
+  status: number
+  adjudicated_by: string | null
+  adjudicated_at: Date | null
+  adjudication_note: string
   resolved: number
   resolved_by: string | null
   resolved_at: Date | null
@@ -48,6 +65,9 @@ interface DocCommentRow {
 }
 
 function mapRow(row: DocCommentRow): DocComment {
+  // status is the single source of truth; resolved is derived from it so old
+  // clients keep working even if a legacy row's stored `resolved` drifts.
+  const status = statusFromNumber(row.status) ?? 'open'
   return {
     id: Number(row.id),
     docId: row.doc_id,
@@ -58,7 +78,11 @@ function mapRow(row: DocCommentRow): DocComment {
     anchorStart: row.anchor_start ?? null,
     anchorEnd: row.anchor_end ?? null,
     anchorText: row.anchor_text,
-    resolved: row.resolved === 1,
+    status,
+    adjudicatedBy: row.adjudicated_by ?? null,
+    adjudicatedAt: row.adjudicated_at ?? null,
+    adjudicationNote: row.adjudication_note ?? '',
+    resolved: status !== 'open',
     resolvedBy: row.resolved_by ?? null,
     resolvedAt: row.resolved_at ?? null,
     deleted: row.deleted === 1,
@@ -81,6 +105,13 @@ export interface CreateCommentInput {
 
 export interface ListRootsOptions {
   includeResolved: boolean
+  /**
+   * Optional lifecycle filter. When set, roots are filtered to exactly this
+   * status (overrides `includeResolved`); the agent uses status='approved' to
+   * pull its execution list. When unset, `includeResolved` controls whether
+   * non-open roots are included (false => open only, matching legacy behavior).
+   */
+  status?: Status
   /** Return roots with id strictly greater than this cursor (ascending paging). */
   cursor: number | null
   limit: number
@@ -131,8 +162,15 @@ export const docCommentRepo = {
   async listRoots(docId: string, opts: ListRootsOptions): Promise<DocComment[]> {
     const where = ['doc_id = ?', 'parent_id IS NULL', 'deleted = 0']
     const args: unknown[] = [docId]
-    if (!opts.includeResolved) {
-      where.push('resolved = 0')
+    if (opts.status !== undefined) {
+      // Explicit lifecycle filter wins over includeResolved (agent execution list).
+      where.push('status = ?')
+      args.push(statusToNumber(opts.status))
+    } else if (!opts.includeResolved) {
+      // Legacy default: only open (unadjudicated) roots. status is the source of
+      // truth; status=0 is exactly the old `resolved = 0` set.
+      where.push('status = ?')
+      args.push(statusToNumber('open'))
     }
     if (opts.cursor != null) {
       where.push('id > ?')
@@ -186,19 +224,57 @@ export const docCommentRepo = {
     await query('UPDATE doc_comment SET body = ? WHERE id = ?', [body, id])
   },
 
-  /** Resolve / reopen a thread root; stamps resolved_by/resolved_at when set. */
-  async setResolved(id: number, resolved: boolean, byUid: string): Promise<void> {
+  /**
+   * Adjudicate a thread root: move it to `toStatus`, enforcing the allowed
+   * transition table (see comments/status.ts). Reads the current status first
+   * and throws InvalidTransitionError on a disallowed move so the route can
+   * 400 invalid_transition instead of silently writing.
+   *
+   * Stamps adjudicated_by/at (留痕 audit trail) and, for backward-compat, keeps
+   * the legacy resolved mirror in sync: resolved = (toStatus !== 'open'), with
+   * resolved_by/at cleared on reopen. Returns void; throws only on an invalid
+   * transition or a missing root.
+   */
+  async setStatus(id: number, toStatus: Status, byUid: string, note = ''): Promise<void> {
+    const current = await this.getById(id)
+    if (!current) throw new InvalidTransitionError('open', toStatus)
+    if (current.status === toStatus) {
+      // No-op transition: not in the allowed table, but harmless. Treat setting a
+      // root to its current status as invalid to keep the state machine strict.
+      throw new InvalidTransitionError(current.status, toStatus)
+    }
+    if (!canTransition(current.status, toStatus)) {
+      throw new InvalidTransitionError(current.status, toStatus)
+    }
+    const resolved = toStatus !== 'open'
     if (resolved) {
       await query(
-        'UPDATE doc_comment SET resolved = 1, resolved_by = ?, resolved_at = CURRENT_TIMESTAMP(3) WHERE id = ?',
-        [byUid, id],
+        `UPDATE doc_comment
+           SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
+               adjudication_note = ?, resolved = 1, resolved_by = ?, resolved_at = CURRENT_TIMESTAMP(3)
+         WHERE id = ?`,
+        [statusToNumber(toStatus), byUid, note, byUid, id],
       )
     } else {
+      // Reopen: clear the legacy resolved mirror, but keep the adjudication
+      // stamp as the audit trail of who last acted (留痕).
       await query(
-        'UPDATE doc_comment SET resolved = 0, resolved_by = NULL, resolved_at = NULL WHERE id = ?',
-        [id],
+        `UPDATE doc_comment
+           SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
+               adjudication_note = ?, resolved = 0, resolved_by = NULL, resolved_at = NULL
+         WHERE id = ?`,
+        [statusToNumber(toStatus), byUid, note, id],
       )
     }
+  },
+
+  /**
+   * Legacy compatibility shim: map the old boolean resolve/reopen onto the
+   * lifecycle. resolved:true -> approved, resolved:false -> open. Kept so old
+   * callers/tests keep working; new code should call setStatus directly.
+   */
+  async setResolved(id: number, resolved: boolean, byUid: string): Promise<void> {
+    await this.setStatus(id, resolved ? 'approved' : 'open', byUid)
   },
 
   async softDelete(id: number): Promise<void> {

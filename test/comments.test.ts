@@ -28,6 +28,7 @@ import {
 import { requireDocRole } from '../src/api/guard.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { query, transaction } from '../src/db/pool.js'
+import { InvalidTransitionError } from '../src/comments/status.js'
 import {
   resolveAnchorFromLiveDoc,
   AmbiguousAnchorError,
@@ -113,6 +114,10 @@ function rootRow(over: Record<string, unknown> = {}) {
     anchor_start: Buffer.from('start'),
     anchor_end: Buffer.from('end'),
     anchor_text: 'snap',
+    status: 0,
+    adjudicated_by: null,
+    adjudicated_at: null,
+    adjudication_note: '',
     resolved: 0,
     resolved_by: null,
     resolved_at: null,
@@ -511,14 +516,14 @@ describe('POST create — anchorText resolution guards (P1-2)', () => {
   })
 })
 
-describe('PATCH resolve / body edit', () => {
-  it('requires writer to resolve a thread (reader blocked above the floor)', async () => {
-    // Caller clears the reader floor but lacks writer for the resolve branch.
+describe('PATCH adjudicate / body edit', () => {
+  it('requires writer to adjudicate a thread (reader blocked above the floor)', async () => {
+    // Caller clears the reader floor but lacks writer for the adjudicate branch.
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow()] as never)
     const res = mockRes()
     await patchCommentHandler(
-      req({ uid: 'u_reader', params: { docId: 'd_1', id: '10' }, body: { resolved: true } }),
+      req({ uid: 'u_reader', params: { docId: 'd_1', id: '10' }, body: { status: 'approved' } }),
       res as never,
     )
     expect(res.statusCode).toBe(403)
@@ -528,8 +533,37 @@ describe('PATCH resolve / body edit', () => {
     expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
   })
 
-  it('resolves a thread for a writer and stamps resolved_by', async () => {
+  it('rejects a commenter adjudicating (403) — needs writer', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(commenterGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow()] as never)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_commenter', params: { docId: 'd_1', id: '10' }, body: { status: 'approved' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(403)
+  })
+
+  it('approves a thread for a writer, stamps adjudicated_by + status, and mirrors resolved', async () => {
+    // getById is read twice on this path: once by the handler, once inside
+    // setStatus to validate the transition. Return the open root for both reads.
+    vi.mocked(query).mockResolvedValue([rootRow({ status: 0 })] as never)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '10' }, body: { status: 'approved', note: 'lgtm' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
+    expect(update).toBeTruthy()
+    // status=approved(1), adjudicated_by=uid, note threaded, resolved mirror set.
+    expect(String(update![0])).toContain('resolved = 1')
+    expect(update![1]).toEqual([1, 'u_writer', 'lgtm', 'u_writer', 10])
+  })
+
+  it('legacy { resolved: true } still works -> status becomes approved', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ status: 0 })] as never)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     const res = mockRes()
     await patchCommentHandler(
@@ -537,8 +571,87 @@ describe('PATCH resolve / body edit', () => {
       res as never,
     )
     expect(res.statusCode).toBe(200)
-    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('resolved = 1'))
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
     expect(update).toBeTruthy()
+    expect(update![1]![0]).toBe(1) // approved
+  })
+
+  it('legacy { resolved: false } reopens -> status becomes open (clears resolved mirror)', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ status: 1 })] as never)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '10' }, body: { resolved: false } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
+    expect(String(update![0])).toContain('resolved = 0')
+    expect(update![1]![0]).toBe(0) // open
+  })
+
+  it('rejects an unknown status string with 400', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ status: 0 })] as never)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '10' }, body: { status: 'bogus' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid status')
+  })
+
+  it('400s only-a-thread-root when adjudicating a reply', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ id: 11, parent_id: 10 })] as never)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '11' }, body: { status: 'approved' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('only a thread root can be adjudicated')
+  })
+
+  // ── transition matrix: valid transitions succeed ──────────────────────────
+  it.each([
+    ['open', 'approved'],
+    ['open', 'rejected'],
+    ['approved', 'committed'],
+    ['approved', 'open'],
+    ['rejected', 'open'],
+  ] as const)('allows valid transition %s -> %s', async (from, to) => {
+    const fromNum = { open: 0, approved: 1, rejected: 2, committed: 3 }[from]
+    vi.mocked(query).mockResolvedValue([rootRow({ status: fromNum })] as never)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '10' }, body: { status: to } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+  })
+
+  // ── transition matrix: invalid transitions -> 400 invalid_transition ──────
+  it.each([
+    ['committed', 'open'],
+    ['committed', 'approved'],
+    ['open', 'committed'],
+    ['rejected', 'approved'],
+    ['approved', 'rejected'],
+    ['open', 'open'],
+  ] as const)('rejects invalid transition %s -> %s with 400 invalid_transition', async (from, to) => {
+    const fromNum = { open: 0, approved: 1, rejected: 2, committed: 3 }[from]
+    vi.mocked(query).mockResolvedValue([rootRow({ status: fromNum })] as never)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '10' }, body: { status: to } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_transition')
   })
 
   it('requires the author to edit the body', async () => {
@@ -780,6 +893,69 @@ describe('GET list', () => {
     // No roots => listRepliesForRoots short-circuits without a second query.
     expect(vi.mocked(query).mock.calls).toHaveLength(1)
   })
+
+  it('?status=approved filters roots to approved (agent execution list)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 10, status: 1 })] as never)
+    const res = mockRes()
+    await listCommentsHandler(
+      req({ params: { docId: 'd_1' }, query: { status: 'approved', limit: '50' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    const sql = String(vi.mocked(query).mock.calls[0]![0])
+    expect(sql).toContain('status = ?')
+    expect(vi.mocked(query).mock.calls[0]![1]).toContain(1) // approved
+    const body = res.body as { items: Array<{ status: string }> }
+    expect(body.items[0]!.status).toBe('approved')
+  })
+
+  it('a plain reader can GET rejected/committed roots (status is not a visibility gate)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 10, status: 2 })] as never)
+    const res = mockRes()
+    await listCommentsHandler(
+      req({ params: { docId: 'd_1' }, query: { status: 'rejected', limit: '50' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    // Gate was reader-only; no elevated role required to see rejected/committed.
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    const body = res.body as { items: Array<{ status: string }> }
+    expect(body.items[0]!.status).toBe('rejected')
+  })
+
+  it('an unknown ?status value is ignored (falls back to default open list)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([] as never)
+    const res = mockRes()
+    await listCommentsHandler(
+      req({ params: { docId: 'd_1' }, query: { status: 'bogus', limit: '50' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    // No explicit status => default open filter (status bound to 0).
+    expect(vi.mocked(query).mock.calls[0]![1]).toContain(0)
+  })
+
+  it('serialize emits both new lifecycle fields and legacy resolved fields', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce(
+      [rootRow({ id: 10, status: 1, adjudicated_by: 'u_w', adjudication_note: 'ok', resolved: 1, resolved_by: 'u_w' })] as never,
+    )
+    const res = mockRes()
+    await listCommentsHandler(
+      req({ params: { docId: 'd_1' }, query: { includeResolved: '1', limit: '50' } }),
+      res as never,
+    )
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    const item = body.items[0]!
+    expect(item.status).toBe('approved')
+    expect(item.adjudicatedBy).toBe('u_w')
+    expect(item.adjudicationNote).toBe('ok')
+    expect(item.resolved).toBe(true) // legacy field still emitted
+    expect(item.resolvedBy).toBe('u_w')
+  })
 })
 
 describe('docCommentRepo (§3.4)', () => {
@@ -800,18 +976,57 @@ describe('docCommentRepo (§3.4)', () => {
     expect((insert[1] as unknown[])[0]).toBe('d_1')
   })
 
-  it('getById maps snake_case columns to camelCase', async () => {
-    vi.mocked(query).mockResolvedValue([rootRow({ id: 10, resolved: 1, resolved_by: 'u_w' })] as never)
+  it('getById maps snake_case columns to camelCase (resolved derived from status)', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ id: 10, status: 1, adjudicated_by: 'u_w', resolved: 1, resolved_by: 'u_w' })] as never)
     const got = await docCommentRepo.getById(10)
-    expect(got).toMatchObject({ id: 10, docId: 'd_1', parentId: null, resolved: true, resolvedBy: 'u_w', deleted: false })
+    expect(got).toMatchObject({ id: 10, docId: 'd_1', parentId: null, status: 'approved', adjudicatedBy: 'u_w', resolved: true, resolvedBy: 'u_w', deleted: false })
   })
 
-  it('listRoots filters out resolved threads unless includeResolved', async () => {
+  it('resolved is DERIVED from status, not the stored resolved column', async () => {
+    // Stored resolved drifted to 0 but status says approved => derived resolved is true.
+    vi.mocked(query).mockResolvedValue([rootRow({ id: 10, status: 1, resolved: 0 })] as never)
+    const got = await docCommentRepo.getById(10)
+    expect(got!.status).toBe('approved')
+    expect(got!.resolved).toBe(true)
+  })
+
+  it('listRoots filters to open status unless includeResolved', async () => {
     vi.mocked(query).mockResolvedValue([] as never)
     await docCommentRepo.listRoots('d_1', { includeResolved: false, cursor: null, limit: 50 })
     const sql = String(vi.mocked(query).mock.calls[0]![0])
     expect(sql).toContain('parent_id IS NULL')
-    expect(sql).toContain('resolved = 0')
+    expect(sql).toContain('status = ?')
+    // Default (no explicit status, includeResolved=false) => open (0).
+    expect(vi.mocked(query).mock.calls[0]![1]).toContain(0)
+  })
+
+  it('listRoots with an explicit status filter binds that status (agent execution list)', async () => {
+    vi.mocked(query).mockResolvedValue([] as never)
+    await docCommentRepo.listRoots('d_1', { includeResolved: false, status: 'approved', cursor: null, limit: 50 })
+    const sql = String(vi.mocked(query).mock.calls[0]![0])
+    expect(sql).toContain('status = ?')
+    expect(vi.mocked(query).mock.calls[0]![1]).toContain(1) // approved
+  })
+
+  it('listRoots with includeResolved does not filter by status', async () => {
+    vi.mocked(query).mockResolvedValue([] as never)
+    await docCommentRepo.listRoots('d_1', { includeResolved: true, cursor: null, limit: 50 })
+    const sql = String(vi.mocked(query).mock.calls[0]![0])
+    expect(sql).not.toContain('status = ?')
+  })
+
+  it('setStatus enforces the transition table and throws on an invalid move', async () => {
+    // committed is terminal: committed -> open must throw (no UPDATE issued).
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 10, status: 3 })] as never)
+    await expect(docCommentRepo.setStatus(10, 'open', 'u_w')).rejects.toThrow(InvalidTransitionError)
+  })
+
+  it('setResolved shim maps true->approved / false->open through setStatus', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ id: 10, status: 0 })] as never)
+    await docCommentRepo.setResolved(10, true, 'u_w')
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
+    expect(update).toBeTruthy()
+    expect(update![1]![0]).toBe(1) // approved
   })
 
   it('listRepliesForRoots expands one placeholder per id with FLAT params', async () => {
