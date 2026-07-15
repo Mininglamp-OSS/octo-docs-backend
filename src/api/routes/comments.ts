@@ -406,6 +406,13 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
       res.status(400).json({ error: 'note must be a string' })
       return
     }
+    // adjudication_note is VARCHAR(1024); a longer note would truncate silently
+    // (or error under STRICT sql_mode) at write time. Reject up front so the
+    // limit is explicit rather than mode-dependent.
+    if (note !== undefined && note.length > 1024) {
+      res.status(400).json({ error: 'note too long (max 1024)' })
+      return
+    }
     try {
       await docCommentRepo.setStatus(id, toStatus, req.uid!, note ?? '')
     } catch (err) {
@@ -440,7 +447,16 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
       res.status(400).json({ error: 'body required' })
       return
     }
-    await docCommentRepo.updateBody(id, body)
+    // The status check above is off a non-locking read, so it closes only the
+    // sequential bypass. updateBody does the authoritative compare-and-swap on
+    // `status = open AND deleted = 0`; if a reviewer adjudicated (or the row was
+    // removed) between the read and the write, it lands 0 rows -> 409, so a
+    // concurrent adjudication can't be silently overwritten.
+    const edited = await docCommentRepo.updateBody(id, body)
+    if (!edited) {
+      res.status(409).json({ error: 'comment_not_editable' })
+      return
+    }
     res.status(200).json({ id })
     return
   }
@@ -497,6 +513,15 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
     res.status(409).json({ error: 'comment_not_deletable' })
     return
   }
-  await docCommentRepo.softDelete(id)
+  // The status check above is a non-locking read (sequential guard only); the
+  // authoritative check is softDelete's compare-and-swap on `status = open AND
+  // deleted = 0`. If the root was adjudicated (or already removed) between the
+  // read and the write, it lands 0 rows -> 409, so a concurrent commit can't be
+  // erased out from under the audit trail.
+  const removed = await docCommentRepo.softDelete(id)
+  if (!removed) {
+    res.status(409).json({ error: 'comment_not_deletable' })
+    return
+  }
   res.status(200).json({ id })
 }

@@ -629,6 +629,28 @@ describe('PATCH adjudicate / body edit', () => {
     expect((res.body as { error: string }).error).toBe('invalid status')
   })
 
+  // adjudication_note is VARCHAR(1024); an oversized note would truncate silently
+  // or error depending on sql_mode. Reject it up front with a documented limit.
+  it('400s an adjudication note longer than 1024 chars', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ status: 0 })] as never)
+    mockSetStatusTx(0)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({
+        uid: 'u_writer',
+        params: { docId: 'd_1', id: '10' },
+        body: { status: 'approved', note: 'x'.repeat(1025) },
+      }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('note too long (max 1024)')
+    // No status write happened.
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
+    expect(update).toBeFalsy()
+  })
+
   it('400s only-a-thread-root when adjudicating a reply', async () => {
     vi.mocked(query).mockResolvedValue([rootRow({ id: 11, parent_id: 10 })] as never)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
@@ -739,6 +761,8 @@ describe('PATCH adjudicate / body edit', () => {
   it('lets the author edit the body of an OPEN comment', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
+    // updateBody's compare-and-swap lands 1 row (root still open at write time).
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
     const res = mockRes()
     await patchCommentHandler(
       req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'edited' } }),
@@ -747,6 +771,27 @@ describe('PATCH adjudicate / body edit', () => {
     expect(res.statusCode).toBe(200)
     const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET body = ?'))
     expect(update).toBeTruthy()
+    // The write is a compare-and-swap: guarded on status = open AND not deleted.
+    expect(String(update![0])).toContain('AND status = ?')
+    expect(String(update![0])).toContain('AND deleted = 0')
+  })
+
+  // Concurrent TOCTOU: the route's status check is a non-locking read. If a
+  // reviewer adjudicates the root (open->approved/committed) between that read
+  // and the write, the compare-and-swap lands 0 rows. The route must 409, not
+  // silently no-op, so a reviewer-approved body can never be overwritten.
+  it('409s a body edit that loses the race to a concurrent adjudication (0 rows)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
+    // Root was open at read, but adjudicated before the CAS UPDATE -> 0 rows.
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 0 } as never)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'edited' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('comment_not_editable')
   })
 
   // Body of an adjudicated comment is part of the audit trail (留痕): a reviewer
@@ -788,6 +833,8 @@ describe('DELETE soft / hard', () => {
   it('lets the author soft-delete their own OPEN comment', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
+    // softDelete's compare-and-swap lands 1 row (root still open at write time).
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
     const res = mockRes()
     await deleteCommentHandler(
       req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
@@ -796,6 +843,25 @@ describe('DELETE soft / hard', () => {
     expect(res.statusCode).toBe(200)
     const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET deleted = 1'))
     expect(update).toBeTruthy()
+    // Compare-and-swap: only a still-open, live row is removable by the author.
+    expect(String(update![0])).toContain('AND status = ?')
+    expect(String(update![0])).toContain('AND deleted = 0')
+  })
+
+  // Concurrent TOCTOU mirror of the body-edit race: a reviewer commits the root
+  // between the route's non-locking read and softDelete's write. The CAS lands
+  // 0 rows and the route must 409 so a committed audit row can't be erased.
+  it('409s a soft delete that loses the race to a concurrent adjudication (0 rows)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 0 } as never)
+    const res = mockRes()
+    await deleteCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('comment_not_deletable')
   })
 
   // An adjudicated root belongs to the audit trail (留痕), not the author: letting
@@ -901,6 +967,7 @@ describe('reader floor gate on body-edit / soft-delete (revoked author + doc sta
   it('still lets a current reader author edit their own comment (200)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
     const res = mockRes()
     await patchCommentHandler(
       req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'still allowed' } }),
@@ -912,6 +979,7 @@ describe('reader floor gate on body-edit / soft-delete (revoked author + doc sta
   it('still lets a current reader author soft-delete their own comment (200)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
     const res = mockRes()
     await deleteCommentHandler(
       req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
