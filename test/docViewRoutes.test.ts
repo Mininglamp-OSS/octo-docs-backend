@@ -107,6 +107,28 @@ describe('GET /docs/recent — listRecentHandler', () => {
     expect(arg.cursor).toBe('X')
   })
 
+  it('renders a stored role 4 as commenter (not reader) in the /recent payload', async () => {
+    // Regression: the stored role value 4 (commenter) is not the rank ordinal,
+    // so a hand-rolled ternary without a commenter branch silently degrades it
+    // to 'reader' and hides the comment affordance on the recent feed. The
+    // serializer must defer to the shared roleFromNumber map so a commenter
+    // stays a commenter here, exactly as on the docs-list route.
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 1,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_c', title: 'C', owner_id: 'u_o', doc_type: 'doc', role: 4,
+          updated_at: new Date('2026-07-12T00:00:00.000Z'),
+          viewed_at: new Date('2026-07-15T04:00:00.000Z') },
+      ],
+    } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    expect(body.items[0]!.role).toBe('commenter')
+  })
+
   it('answers 400 invalid_cursor when the repo rejects a malformed cursor', async () => {
     vi.mocked(docViewHistoryRepo.listRecent).mockRejectedValue(new Error('invalid_cursor'))
     const res = mockRes()
