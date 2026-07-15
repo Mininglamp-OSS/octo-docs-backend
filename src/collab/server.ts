@@ -319,6 +319,8 @@ export function createServer() {
 
       // Stale: recheck this uid's CURRENT role (singleflight + short-TTL cache).
       const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id)
+      // commenter is intentionally rejected here: rank(commenter) < rank(writer),
+      // so a commenter can comment via REST but never write the doc body.
       if (role === 'none' || !roleAtLeast(role, 'writer')) {
         // role actually dropped / revoked => reject this write & flip the conn.
         data.connection.readOnly = true

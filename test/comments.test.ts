@@ -73,6 +73,7 @@ function req(opts: {
 }
 
 const readerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'reader' } as never
+const commenterGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'commenter' } as never
 const writerGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'writer' } as never
 const adminGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'doc' }, role: 'admin' } as never
 
@@ -130,14 +131,14 @@ beforeEach(() => {
   vi.mocked(resolveAnchorFromLiveDoc).mockReset()
 })
 
-describe('POST create (reader can comment)', () => {
-  it('creates a root comment as a reader and returns the new id', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+describe('POST create (commenter can comment, reader cannot)', () => {
+  it('creates a root comment as a commenter and returns the new id', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(commenterGuard)
     mockInsertId(123)
     const res = mockRes()
     await createCommentHandler(
       req({
-        uid: 'u_reader',
+        uid: 'u_commenter',
         params: { docId: 'd_1' },
         body: { body: 'a note', anchorStart: Buffer.from('s').toString('base64'), anchorEnd: Buffer.from('e').toString('base64'), anchorText: 'sel' },
       }),
@@ -145,14 +146,50 @@ describe('POST create (reader can comment)', () => {
     )
     expect(res.statusCode).toBe(201)
     expect((res.body as { id: number }).id).toBe(123)
-    // reader role is sufficient (product decision read => can comment).
+    // Creating a comment now requires the commenter role (read-only cannot comment).
     // The space (4th arg) is threaded from req.spaceId; minRole is the 5th arg.
     expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
+  })
+
+  it('rejects a plain reader (403) — read-only can no longer comment', async () => {
+    // The real guard returns null + writes 403 when the caller is below the
+    // required commenter role; the handler must short-circuit before any INSERT.
+    forbidGuard()
+    mockInsertId(1)
+    const res = mockRes()
+    await createCommentHandler(
+      req({
+        uid: 'u_reader',
+        params: { docId: 'd_1' },
+        body: { body: 'a note', anchorStart: 'AA==', anchorEnd: 'AA==' },
+      }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(403)
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
+    expect(vi.mocked(transaction)).not.toHaveBeenCalled()
+  })
+
+  it('allows a writer and an admin to comment', async () => {
+    for (const guard of [writerGuard, adminGuard]) {
+      vi.mocked(requireDocRole).mockReset()
+      vi.mocked(requireDocRole).mockResolvedValue(guard)
+      mockInsertId(9)
+      const res = mockRes()
+      await createCommentHandler(
+        req({
+          params: { docId: 'd_1' },
+          body: { body: 'note', anchorStart: 'AA==', anchorEnd: 'AA==' },
+        }),
+        res as never,
+      )
+      expect(res.statusCode).toBe(201)
+    }
   })
 
   it('rejects a root comment with no anchors (root/reply anchor invariant)', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(requireDocRole).mockResolvedValue(commenterGuard)
     mockInsertId(1)
     const res = mockRes()
     await createCommentHandler(

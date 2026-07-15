@@ -15,10 +15,11 @@ import { extractOctoToken } from '../middleware/auth.js'
 
 export const invitesRouter = Router()
 
-const roleName = (n: number): string => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
+const roleName = (n: number): string =>
+  n === 3 ? 'admin' : n === 2 ? 'writer' : n === 4 ? 'commenter' : 'reader'
 
 function parseRole(v: unknown): Role {
-  return v === 'reader' || v === 'admin' ? v : 'writer' // default writer (§4.6)
+  return v === 'reader' || v === 'commenter' || v === 'admin' ? v : 'writer' // default writer (§4.6)
 }
 
 const DEFAULT_EXPIRES_IN_DAYS = 3
