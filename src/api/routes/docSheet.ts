@@ -26,8 +26,8 @@ import { requireDocRole } from '../guard.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { editDocSheet } from '../services/editDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
-import { decodeSheetSnapshot, decodeSheetDimsSnapshot } from '../../collab/versionRestore.js'
-import { SheetSnapshotInvalidError, type SheetCell, type StoredDrawing } from '../../agent/sheetConversion.js'
+import { decodeSheetSnapshot, decodeSheetDimsSnapshot, decodeSheetHyperLinksSnapshot } from '../../collab/versionRestore.js'
+import { SheetSnapshotInvalidError, type SheetCell, type StoredDrawing, type StoredHyperLink } from '../../agent/sheetConversion.js'
 import {
   decodeSheetCursor,
   encodeSheetCursor,
@@ -102,6 +102,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     const { state, baseSV } = await readLiveSheet(guard.meta.document_name)
     const sheetCells = decodeSheetSnapshot(state) as Record<string, SheetCell>
     const sheetDims = decodeSheetDimsSnapshot(state)
+    const sheetHyperLinks = decodeSheetHyperLinksSnapshot(state) as Record<string, StoredHyperLink>
     const baseVersion = encodeBaseVersion(baseSV)
 
     if (paginated) {
@@ -109,6 +110,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
         docId: guard.meta.doc_id,
         sheetCells,
         sheetDims,
+        sheetHyperLinks,
         baseVersion,
         limitRaw,
         cursorRaw,
@@ -129,7 +131,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     // dimension (maxDocBytes / doc_too_large) — lets a caller see at a glance which
     // dimension tripped and how far it sits from the cap. See README "Sheet size
     // dimensions" for why the two dimensions differ.
-    const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))
+    const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks }))
     if (payloadBytes > config.sheetRead.maxCellBytes) {
       res.status(413).json({
         error: 'sheet_too_large',
@@ -144,6 +146,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       docId: guard.meta.doc_id,
       sheetCells,
       sheetDims,
+      sheetHyperLinks,
       // The live state vector, base64. Carried so a later write can guard on it
       // for optimistic concurrency (Stage2); this read does not reuse a historic
       // versions snapshot.
@@ -177,11 +180,16 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
  * guarantee), so even a pathologically large dims map still makes forward
  * progress rather than returning an empty, non-advancing page.
  */
-function firstPageCellBudget(isFirstPage: boolean, sheetDims: Record<string, number>): number {
+function firstPageCellBudget(
+  isFirstPage: boolean,
+  sheetDims: Record<string, number>,
+  sheetHyperLinks: Record<string, StoredHyperLink>,
+): number {
   if (!isFirstPage) return config.sheetRead.maxCellBytes
-  // Envelope = the grid payload with an empty cell map: the dims plus the object
-  // framing that will wrap the cells. Reserving it keeps cells + dims ≤ the cap.
-  const envelopeBytes = Buffer.byteLength(JSON.stringify({ sheetCells: {}, sheetDims }))
+  // Envelope = the grid payload with an empty cell map: the dims + hyperlinks plus
+  // the object framing that will wrap the cells. Reserving it keeps cells + dims +
+  // hyperlinks ≤ the cap on the first page.
+  const envelopeBytes = Buffer.byteLength(JSON.stringify({ sheetCells: {}, sheetDims, sheetHyperLinks }))
   return Math.max(0, config.sheetRead.maxCellBytes - envelopeBytes)
 }
 
@@ -205,6 +213,7 @@ async function respondPaginatedSheet(
     docId: string
     sheetCells: Record<string, SheetCell>
     sheetDims: Record<string, number>
+    sheetHyperLinks: Record<string, StoredHyperLink>
     baseVersion: string
     limitRaw: string | undefined
     cursorRaw: string | undefined
@@ -243,7 +252,7 @@ async function respondPaginatedSheet(
     args.sheetCells,
     afterKey,
     parsedLimit.limit,
-    firstPageCellBudget(isFirstPage, args.sheetDims),
+    firstPageCellBudget(isFirstPage, args.sheetDims, args.sheetHyperLinks),
   )
   const nextCursor =
     page.hasMore && page.lastKey !== null
@@ -259,6 +268,8 @@ async function respondPaginatedSheet(
   }
   // Dims belong to the whole grid; return them once, on the first page.
   if (isFirstPage) body.sheetDims = args.sheetDims
+  // Hyperlinks likewise describe the whole grid; return once, on the first page.
+  if (isFirstPage) body.sheetHyperLinks = args.sheetHyperLinks
   res.status(200).json(body)
 }
 
@@ -371,6 +382,29 @@ function checkDrawingsBounds(
   return null
 }
 
+/**
+ * A hyperlinks-edit batch: `{ "${sheetId}!${linkId}": {id,row,column,payload,display?} | null }`
+ * (null = delete). Shape-only: a non-object or array batch is a 400; each value must
+ * be null or a plain object. Contract validation (key shape, id match, safe-scheme
+ * payload) is deferred to validateSheetHyperLinkBatch in the service → 422.
+ */
+function validateHyperlinksShape(links: unknown): links is Record<string, StoredHyperLink | null> {
+  if (!links || typeof links !== 'object' || Array.isArray(links)) return false
+  return Object.values(links as Record<string, unknown>).every(
+    (v) => v === null || (typeof v === 'object' && !Array.isArray(v)),
+  )
+}
+
+/** Fail-fast hyperlinks count bound (DoS gate), mirroring checkDrawingsBounds. */
+function checkHyperlinksBounds(
+  links: Record<string, StoredHyperLink | null>,
+): { status: number; error: string } | null {
+  if (Object.keys(links).length > config.sheetWrite.maxCells) {
+    return { status: 413, error: 'too_many_cells' }
+  }
+  return null
+}
+
 // ── PATCH /:docId/sheet — batch cell edit (writer) ────────────────────────────
 docSheetRouter.patch('/:docId/sheet', patchDocSheetHandler)
 
@@ -395,22 +429,34 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
   const cells = body.cells === undefined ? {} : body.cells
   const dims = body.dims === undefined ? {} : body.dims
   const drawings = body.drawings === undefined ? {} : body.drawings
-  if (!validateCellsShape(cells) || !validateDimsShape(dims) || !validateDrawingsShape(drawings)) {
+  const hyperlinks = body.hyperlinks === undefined ? {} : body.hyperlinks
+  if (
+    !validateCellsShape(cells) ||
+    !validateDimsShape(dims) ||
+    !validateDrawingsShape(drawings) ||
+    !validateHyperlinksShape(hyperlinks)
+  ) {
     res.status(400).json({ error: 'invalid_body' })
     return
   }
   // An edit that changes nothing is a no-op — reject ALL-empty as invalid_body
-  // (a cells-only / dims-only / drawings-only edit is fine; surfaces are independent).
+  // (a cells-only / dims-only / drawings-only / hyperlinks-only edit is fine;
+  // surfaces are independent).
   if (
     Object.keys(cells).length === 0 &&
     Object.keys(dims).length === 0 &&
-    Object.keys(drawings).length === 0
+    Object.keys(drawings).length === 0 &&
+    Object.keys(hyperlinks).length === 0
   ) {
     res.status(400).json({ error: 'invalid_body' })
     return
   }
   // Fail-fast request-shape bounds (DoS gate) before any batch validation.
-  const bounds = checkCellsBounds(cells) ?? checkDimsBounds(dims) ?? checkDrawingsBounds(drawings)
+  const bounds =
+    checkCellsBounds(cells) ??
+    checkDimsBounds(dims) ??
+    checkDrawingsBounds(drawings) ??
+    checkHyperlinksBounds(hyperlinks)
   if (bounds) {
     res.status(bounds.status).json({ error: bounds.error })
     return
@@ -425,6 +471,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       cells,
       dims,
       drawings,
+      hyperlinks,
       authorizedEpoch: guard.meta.permission_epoch,
     })
     if (result.ok) {
