@@ -38,6 +38,7 @@ import { docSheetRouter } from './routes/docSheet.js'
 import { docSceneRouter } from './routes/docScene.js'
 import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
+import { importRouter } from './routes/import.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
   const app = express()
@@ -123,6 +124,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   api.use(docSceneRouter) // /:docId/scene (live board/Excalidraw scene read + edit)
   api.use(exportRouter) // /:docId/export/pdf (server-side Typst render)
   api.use(boardExportRouter) // /:docId/export (server-side whiteboard PNG/SVG, W3)
+  api.use(importRouter) // /:docId/import/docx (server-side .docx -> ProseMirror JSON)
 
   app.use('/api/v1/docs', api)
 
