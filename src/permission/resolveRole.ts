@@ -13,6 +13,7 @@
 import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../db/repos/docMemberRepo.js'
 import { parseDocumentName } from './documentName.js'
+import { effectiveRole } from './shareScope.js'
 import type { ResolvedRole } from './role.js'
 
 export async function resolveRole(uid: string, docId: string): Promise<ResolvedRole> {
@@ -50,23 +51,35 @@ export async function resolveDocMetaByName(documentName: string): Promise<DocMet
 }
 
 /**
- * recheckCurrentRole(documentName, uid) — §4.1 stale branch.
+ * recheckCurrentRole(documentName, uid, spaceMember) — §4.1 stale branch.
  *
- * Resolves the doc by document_name then applies resolveRole. Validates the
- * key shape & that the parsed folder matches doc_meta.folder_id (§4.1/§8.1
- * non-empty invariant). Returns 'none' if the doc does not exist.
+ * Resolves the doc by document_name then applies resolveRole, and — for #64 —
+ * merges in the space-share-derived role via `effectiveRole`. The doc's share
+ * settings are read FRESH from the row (`resolveDocMetaByName` is `SELECT *`, so
+ * share_scope/share_role ride along), because a scope narrowing can only tighten
+ * access and must take effect immediately. The requester's space membership is
+ * NOT re-derived here (no service credential on the socket hot path); it is the
+ * token-carried `space_member` claim passed in by the caller (absent => false,
+ * fail-closed, design §5.2f/O1). Validates the key shape & that the parsed
+ * folder matches doc_meta.folder_id (§4.1/§8.1). Returns 'none' if the doc does
+ * not exist.
  *
  * NOTE: callers wrap this with singleflight + short-TTL cache (§4.1 thundering
  * herd protection); this function itself is the authoritative DB read.
  */
-export async function recheckCurrentRole(documentName: string, uid: string): Promise<ResolvedRole> {
+export async function recheckCurrentRole(
+  documentName: string,
+  uid: string,
+  spaceMember = false,
+): Promise<ResolvedRole> {
   // M2: both document (4-seg) and whiteboard (5-seg `:wb:`) keys are served, via
   // the shared document_name resolver. The permission subject is meta.doc_id
   // either way; a malformed / absent / inconsistent key resolves to null and we
   // fail closed with 'none'.
   const meta = await resolveDocMetaByName(documentName)
   if (!meta) return 'none'
-  if (uid === meta.owner_id) return 'admin'
-  const memberRole = await docMemberRepo.getRole(meta.doc_id, uid)
-  return memberRole ?? 'none'
+  const direct = uid === meta.owner_id ? 'admin' : ((await docMemberRepo.getRole(meta.doc_id, uid)) ?? 'none')
+  // #64: max(directRole, share-derived). restricted docs (default) yield
+  // shareDerived='none', so this is byte-identical to the pre-feature result.
+  return effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
 }

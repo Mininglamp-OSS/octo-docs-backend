@@ -22,6 +22,7 @@ import { parseDocumentName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
 import { config } from '../config/env.js'
+import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -80,7 +81,20 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   }
 
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).
-  const role = await resolveRole(uid, meta.doc_id)
+  const direct = await resolveRole(uid, meta.doc_id)
+
+  // #64: space-scoped share. Only when the doc is anyone_in_space do we resolve
+  // the requester's Space membership — restricted docs (the default/common case)
+  // add ZERO new IO here. collab-token issuance is human-only, so this is the
+  // human isSpaceMember path (fail-closed false on any lookup error). The result
+  // is both merged into the effective role and baked into the token as the
+  // space_member claim, so the live-socket write recheck (§5.3) can re-derive
+  // access on a scope narrowing without a fresh membership call.
+  let spaceMember = false
+  if (meta.share_scope === SHARE_SCOPE_ANYONE) {
+    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
+  }
+  const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
   // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
@@ -112,6 +126,7 @@ export async function issueCollabToken(octoToken: string, documentName: string):
     role,
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
+    ...(spaceMember ? { space_member: true } : {}),
   })
   return { ok: true, result }
 }

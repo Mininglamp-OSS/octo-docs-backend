@@ -99,6 +99,10 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
       createdAt: new Date(0),
       updatedAt: new Date(1000),
       shareUrl: '/d/d_1?sp=s1',
+      // #64 additive share-scope fields; a doc with no share settings set reads
+      // as the fail-safe default (restricted / read).
+      shareScope: 'restricted',
+      shareRole: 'read',
       permissionEpoch: 7,
     })
     // snake_case columns are never leaked on the wire.

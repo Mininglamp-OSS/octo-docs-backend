@@ -5,10 +5,33 @@ import type { Response } from 'express'
 import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
 import { resolveRole } from '../permission/resolveRole.js'
 import { roleAtLeast, type ResolvedRole, type Role } from '../permission/role.js'
+import { resolveEffectiveRole } from '../permission/resolveEffectiveRole.js'
 
 export interface DocGuard {
   meta: DocMeta
   role: ResolvedRole
+}
+
+/**
+ * Caller-principal hints the #64 share path needs. A verified BOT carries a
+ * server-resolved space on `req.spaceId` (verifyBot reverse-lookup, anti-spoof),
+ * so once the cross-space 404 gate has confirmed `req.spaceId === meta.space_id`
+ * the bot is by definition an active member of the doc's space — no octo-server
+ * membership call, no dependency on the new endpoint. HUMANS carry an unverified
+ * `X-Space-Id`, so their membership is resolved lazily via isSpaceMember. The
+ * router handlers are shared between the human and bot mounts, so this is passed
+ * per-request as `{ isBot: req.botToken !== undefined }`. Restricted docs never
+ * consult it (share path is a no-op), so omitting it is safe there.
+ */
+export interface DocRoleCaller {
+  isBot?: boolean
+  /**
+   * The human caller's octo session token, threaded to resolveEffectiveRole so a
+   * human's anyone_in_space membership resolves via verify?include=context. The
+   * bot mount carries no session token and short-circuits on isBot, so it is
+   * omitted there.
+   */
+  token?: string
 }
 
 /**
@@ -47,6 +70,7 @@ export async function requireDocRole(
   docId: string,
   spaceId: string,
   minRole: Role,
+  caller: DocRoleCaller = {},
 ): Promise<DocGuard | null> {
   const meta = await docMetaRepo.getByDocId(docId)
   if (!meta || meta.status === 0) {
@@ -60,7 +84,15 @@ export async function requireDocRole(
     res.status(409).json({ error: 'conflict' })
     return null
   }
-  const role = await resolveRole(uid, docId)
+  const direct = await resolveRole(uid, docId)
+  // #64 space-scoped share (design §5.1): effectiveRole = max(directRole,
+  // share-derived). Resolved through the shared seam so the returned role is the
+  // caller's TRUE effective role — not merely "enough to pass minRole". A direct
+  // reader of an anyone_in_space/edit doc must be reported as `writer` here (the
+  // read/load responses echo guard.role to the client), so the resolution is NOT
+  // gated on minRole; resolveEffectiveRole still short-circuits (zero IO) for
+  // restricted docs and callers already at writer/admin.
+  const role = await resolveEffectiveRole(uid, direct, meta, caller)
   if (role === 'none' || !roleAtLeast(role, minRole)) {
     res.status(403).json({ error: 'forbidden' })
     return null

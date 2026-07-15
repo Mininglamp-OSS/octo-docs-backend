@@ -179,7 +179,7 @@ function serialize(c: DocComment) {
 commentsRouter.get('/:docId/comments', listCommentsHandler)
 
 export async function listCommentsHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const includeResolved = req.query.includeResolved === '1'
@@ -210,7 +210,7 @@ commentsRouter.post('/:docId/comments', createCommentHandler)
 
 export async function createCommentHandler(req: Request, res: Response): Promise<void> {
   // Product decision: read => can comment.
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const { body, anchorStart, anchorEnd, anchorText, parentId } = req.body ?? {}
@@ -338,7 +338,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
   // This runs FIRST so it 404s on missing/deleted docs, 409s on archived ones,
   // and 403s a caller whose role is 'none' (e.g. revoked author) — before the
   // author check below ever gets a chance to allow a write.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const id = parseId(req.params.id)
@@ -398,7 +398,7 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
   const docId = req.params.docId!
   // Doc-access floor (see patchCommentHandler): blocks revoked authors and
   // enforces doc-status 404/409 semantics before the author check below.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const id = parseId(req.params.id)
