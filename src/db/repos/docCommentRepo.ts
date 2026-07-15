@@ -222,22 +222,38 @@ export const docCommentRepo = {
   },
 
   /**
-   * Edit a comment's body, but ONLY while it is still `open` and live. The route
-   * pre-checks `status === 'open'` off a non-locking read, which closes the
-   * sequential bypass but not the concurrent one: between that read and this
+   * Edit a comment's body, but ONLY while the thread is still `open` and live.
+   * The route pre-checks `status === 'open'` off a non-locking read, which closes
+   * the sequential bypass but not the concurrent one: between that read and this
    * write a reviewer can adjudicate the root (open->approved/committed), and an
    * unconditional `WHERE id = ?` UPDATE would then rewrite the body a reviewer
    * just approved — the exact audit-immutability (留痕) invariant this lifecycle
    * exists to protect, via the same TOCTOU class `setStatus` already closes.
    *
-   * So the write is a compare-and-swap guarded on `status = 0 (open) AND
-   * deleted = 0`. A 0-row result means the row was adjudicated or removed under
-   * us; we return false so the route can 409 instead of silently no-op'ing.
+   * The catch: only a ROOT carries a lifecycle status; a reply's own status is
+   * always `open` (replies are never adjudicated). So a per-row `status = 0`
+   * guard would let a reply author keep editing AFTER the parent thread was
+   * adjudicated — mutating the discussion behind an already-recorded decision.
+   * The compare-and-swap therefore gates on the whole thread: for a root, its
+   * OWN status must be open; for a reply, the PARENT ROOT must still be open (and
+   * live). Done atomically via a self-join so it stays race-free like the root
+   * CAS. A 0-row result means the thread was adjudicated or removed under us; we
+   * return false so the route can 409 instead of silently no-op'ing.
    */
   async updateBody(id: number, body: string): Promise<boolean> {
+    const open = statusToNumber('open')
     const result = await query<ResultSetHeader>(
-      `UPDATE doc_comment SET body = ? WHERE id = ? AND status = ? AND deleted = 0`,
-      [body, id, statusToNumber('open')],
+      `UPDATE doc_comment c
+         LEFT JOIN doc_comment root ON c.parent_id = root.id
+       SET c.body = ?
+       WHERE c.id = ?
+         AND c.deleted = 0
+         AND (
+           (c.parent_id IS NULL AND c.status = ?)
+           OR
+           (c.parent_id IS NOT NULL AND root.status = ? AND root.deleted = 0)
+         )`,
+      [body, id, open, open],
     )
     return (result as unknown as ResultSetHeader).affectedRows > 0
   },
@@ -318,20 +334,34 @@ export const docCommentRepo = {
   },
 
   /**
-   * Author soft-delete, but ONLY while the root is still `open` and live. Same
+   * Author soft-delete, but ONLY while the thread is still `open` and live. Same
    * concurrent-TOCTOU shape as updateBody: the route's `status === 'open'` guard
    * is a non-locking read, so a reviewer can commit the root between that read
    * and this write; an unconditional `WHERE id = ?` would then hide a
    * `committed` audit row (all reads filter deleted = 0) with no writer/admin
-   * involvement. Compare-and-swap on `status = 0 (open) AND deleted = 0`; a
-   * 0-row result (adjudicated or already gone under us) returns false so the
-   * route can 409. The `deleted = 0` guard also makes a double soft-delete a
+   * involvement. And, as in updateBody, a per-row `status = 0` guard would miss
+   * replies (a reply's own status is always open): a reply author could soft-
+   * delete their reply after the parent thread was adjudicated. So the compare-
+   * and-swap gates on the whole thread via the same self-join — for a root, its
+   * OWN status must be open; for a reply, the PARENT ROOT must still be open (and
+   * live). A 0-row result (adjudicated or already gone under us) returns false so
+   * the route can 409. The `deleted = 0` guard also makes a double soft-delete a
    * no-op rather than a spurious success.
    */
   async softDelete(id: number): Promise<boolean> {
+    const open = statusToNumber('open')
     const result = await query<ResultSetHeader>(
-      `UPDATE doc_comment SET deleted = 1 WHERE id = ? AND status = ? AND deleted = 0`,
-      [id, statusToNumber('open')],
+      `UPDATE doc_comment c
+         LEFT JOIN doc_comment root ON c.parent_id = root.id
+       SET c.deleted = 1
+       WHERE c.id = ?
+         AND c.deleted = 0
+         AND (
+           (c.parent_id IS NULL AND c.status = ?)
+           OR
+           (c.parent_id IS NOT NULL AND root.status = ? AND root.deleted = 0)
+         )`,
+      [id, open, open],
     )
     return (result as unknown as ResultSetHeader).affectedRows > 0
   },

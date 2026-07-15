@@ -769,11 +769,14 @@ describe('PATCH adjudicate / body edit', () => {
       res as never,
     )
     expect(res.statusCode).toBe(200)
-    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET body = ?'))
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET c.body = ?'))
     expect(update).toBeTruthy()
-    // The write is a compare-and-swap: guarded on status = open AND not deleted.
-    expect(String(update![0])).toContain('AND status = ?')
-    expect(String(update![0])).toContain('AND deleted = 0')
+    // The write is a thread-scoped compare-and-swap: a root guards its OWN open
+    // status; a reply joins its parent root and guards the ROOT's open status.
+    expect(String(update![0])).toContain('LEFT JOIN doc_comment root')
+    expect(String(update![0])).toContain('c.status = ?')
+    expect(String(update![0])).toContain('root.status = ?')
+    expect(String(update![0])).toContain('root.deleted = 0')
   })
 
   // Concurrent TOCTOU: the route's status check is a non-locking read. If a
@@ -813,8 +816,44 @@ describe('PATCH adjudicate / body edit', () => {
     expect(res.statusCode).toBe(409)
     expect((res.body as { error: string }).error).toBe('comment_not_editable')
     // No body write happened.
-    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET body = ?'))
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET c.body = ?'))
     expect(update).toBeFalsy()
+  })
+
+  // A reply's OWN status is always `open` (only roots are adjudicated), so the
+  // route pre-check can't catch it — the authoritative gate is updateBody's CAS,
+  // which joins to the parent root and lands 0 rows once the root is decided.
+  it('409s the author editing a reply after the parent ROOT is adjudicated (0 rows)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    // getById returns the reply (own status is open, parent_id -> root 10).
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10, author_uid: 'u_author', status: 0 })] as never)
+    // updateBody's thread-scoped CAS lands 0 rows: the parent root is not open.
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 0 } as never)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '11' }, body: { body: 'edit reply' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('comment_not_editable')
+    // The write is a thread-scoped CAS: joins the parent root and guards its status.
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET c.body = ?'))
+    expect(update).toBeTruthy()
+    expect(String(update![0])).toContain('LEFT JOIN doc_comment root')
+    expect(String(update![0])).toContain('root.status = ?')
+  })
+
+  it('lets the author edit a reply while the parent ROOT is still open (200)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10, author_uid: 'u_author', status: 0 })] as never)
+    // Parent root still open => CAS lands 1 row.
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '11' }, body: { body: 'edit reply' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
   })
 
   it('404s a cross-doc comment id (no leak)', async () => {
@@ -841,11 +880,14 @@ describe('DELETE soft / hard', () => {
       res as never,
     )
     expect(res.statusCode).toBe(200)
-    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET deleted = 1'))
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET c.deleted = 1'))
     expect(update).toBeTruthy()
-    // Compare-and-swap: only a still-open, live row is removable by the author.
-    expect(String(update![0])).toContain('AND status = ?')
-    expect(String(update![0])).toContain('AND deleted = 0')
+    // Thread-scoped compare-and-swap: a root guards its OWN open status; a reply
+    // joins its parent root and guards the ROOT's open, live status.
+    expect(String(update![0])).toContain('LEFT JOIN doc_comment root')
+    expect(String(update![0])).toContain('c.status = ?')
+    expect(String(update![0])).toContain('root.status = ?')
+    expect(String(update![0])).toContain('root.deleted = 0')
   })
 
   // Concurrent TOCTOU mirror of the body-edit race: a reviewer commits the root
@@ -883,8 +925,40 @@ describe('DELETE soft / hard', () => {
     )
     expect(res.statusCode).toBe(409)
     expect((res.body as { error: string }).error).toBe('comment_not_deletable')
-    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET deleted = 1'))
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET c.deleted = 1'))
     expect(update).toBeFalsy()
+  })
+
+  // A reply is never adjudicated, so its own status stays open and the route
+  // pre-check can't block it — softDelete's thread-scoped CAS is authoritative:
+  // it joins the parent root and lands 0 rows once the root is decided.
+  it('409s the author soft-deleting a reply after the parent ROOT is adjudicated (0 rows)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10, author_uid: 'u_author', status: 0 })] as never)
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 0 } as never)
+    const res = mockRes()
+    await deleteCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '11' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('comment_not_deletable')
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET c.deleted = 1'))
+    expect(update).toBeTruthy()
+    expect(String(update![0])).toContain('LEFT JOIN doc_comment root')
+    expect(String(update![0])).toContain('root.status = ?')
+  })
+
+  it('lets the author soft-delete a reply while the parent ROOT is still open (200)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10, author_uid: 'u_author', status: 0 })] as never)
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
+    const res = mockRes()
+    await deleteCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '11' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
   })
 
   it('rejects a soft delete by a non-author', async () => {
@@ -1110,12 +1184,25 @@ describe('GET list', () => {
     expect(body.items[0]!.status).toBe('rejected')
   })
 
-  it('an unknown ?status value is ignored (falls back to default open list)', async () => {
+  it('a present-but-unknown ?status value is a 400 (surfaces API misuse)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    const res = mockRes()
+    await listCommentsHandler(
+      req({ params: { docId: 'd_1' }, query: { status: 'bogus', limit: '50' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid status')
+    // Rejected before any DB read — the bad filter never reaches listRoots.
+    expect(vi.mocked(query)).not.toHaveBeenCalled()
+  })
+
+  it('an ABSENT status param still returns the default open list (200)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
     vi.mocked(query).mockResolvedValueOnce([] as never)
     const res = mockRes()
     await listCommentsHandler(
-      req({ params: { docId: 'd_1' }, query: { status: 'bogus', limit: '50' } }),
+      req({ params: { docId: 'd_1' }, query: { limit: '50' } }),
       res as never,
     )
     expect(res.statusCode).toBe(200)
@@ -1213,6 +1300,40 @@ describe('docCommentRepo (§3.4)', () => {
     const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
     expect(update).toBeTruthy()
     expect(update![1]![0]).toBe(1) // approved
+  })
+
+  // The body/soft-delete CAS is thread-scoped: it self-joins the parent root so a
+  // reply is gated on the ROOT's status, not its own (a reply is never
+  // adjudicated). Assert both the SQL shape and the affectedRows -> boolean map.
+  it('updateBody CAS joins the parent root and returns true only on a row write', async () => {
+    // Parent root still open => 1 row => true.
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
+    expect(await docCommentRepo.updateBody(11, 'edited')).toBe(true)
+    const sql = String(vi.mocked(query).mock.calls[0]![0])
+    expect(sql).toContain('LEFT JOIN doc_comment root ON c.parent_id = root.id')
+    expect(sql).toContain('SET c.body = ?')
+    // Root arm: own status open. Reply arm: parent root open AND live.
+    expect(sql).toContain('c.parent_id IS NULL AND c.status = ?')
+    expect(sql).toContain('c.parent_id IS NOT NULL AND root.status = ? AND root.deleted = 0')
+
+    // Thread adjudicated (or gone) => 0 rows => false.
+    vi.mocked(query).mockReset()
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 0 } as never)
+    expect(await docCommentRepo.updateBody(11, 'edited')).toBe(false)
+  })
+
+  it('softDelete CAS joins the parent root and returns true only on a row write', async () => {
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 1 } as never)
+    expect(await docCommentRepo.softDelete(11)).toBe(true)
+    const sql = String(vi.mocked(query).mock.calls[0]![0])
+    expect(sql).toContain('LEFT JOIN doc_comment root ON c.parent_id = root.id')
+    expect(sql).toContain('SET c.deleted = 1')
+    expect(sql).toContain('c.parent_id IS NULL AND c.status = ?')
+    expect(sql).toContain('c.parent_id IS NOT NULL AND root.status = ? AND root.deleted = 0')
+
+    vi.mocked(query).mockReset()
+    vi.mocked(query).mockResolvedValueOnce({ affectedRows: 0 } as never)
+    expect(await docCommentRepo.softDelete(11)).toBe(false)
   })
 
   it('listRepliesForRoots expands one placeholder per id with FLAT params', async () => {

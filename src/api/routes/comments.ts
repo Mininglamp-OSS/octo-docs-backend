@@ -194,9 +194,18 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
   const includeResolved = req.query.includeResolved === '1'
   // Optional lifecycle filter (agent pulls its execution list with ?status=approved).
   // Visibility is NOT gated: any reader may filter to any status, including
-  // rejected/committed. An unknown value is ignored (falls back to the default).
+  // rejected/committed. When the param is PRESENT but not a valid Status, 400 —
+  // silently falling back to the default open list would mask API misuse (esp.
+  // the agent execution-list path). An ABSENT param keeps the default behavior.
   const statusRaw = req.query.status
-  const status = isStatus(statusRaw) ? statusRaw : undefined
+  let status: Status | undefined
+  if (statusRaw !== undefined) {
+    if (!isStatus(statusRaw)) {
+      res.status(400).json({ error: 'invalid status' })
+      return
+    }
+    status = statusRaw
+  }
   const cursor = parseId(req.query.cursor)
   const limitRaw = Number(req.query.limit ?? DEFAULT_LIMIT)
   const limit = Math.min(MAX_LIMIT, Math.max(1, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : DEFAULT_LIMIT))
