@@ -9,14 +9,15 @@ import { Router, type Request, type Response } from 'express'
 import { docInviteRepo } from '../../db/repos/docInviteRepo.js'
 import { requireDocRole } from '../guard.js'
 import { newInviteToken } from '../../util/ids.js'
-import { roleToNumber, type Role } from '../../permission/role.js'
+import { roleToNumber, roleFromNumber, type Role } from '../../permission/role.js'
 import { acceptInvite, acceptInviteForUid } from '../services/acceptInvite.js'
 import { extractOctoToken } from '../middleware/auth.js'
 
 export const invitesRouter = Router()
 
-const roleName = (n: number): string =>
-  n === 3 ? 'admin' : n === 2 ? 'writer' : n === 4 ? 'commenter' : 'reader'
+// Canonical stored-number -> role name (shared serializer; covers commenter=4).
+// Stored value != rank ordinal, so never open-code the mapping per-file.
+const roleName = (n: number): string => roleFromNumber(n) ?? 'reader'
 
 function parseRole(v: unknown): Role {
   return v === 'reader' || v === 'commenter' || v === 'admin' ? v : 'writer' // default writer (§4.6)

@@ -27,11 +27,11 @@ import {
 import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
-import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
+import { roleAtLeast, roleToNumber, roleFromNumber, type Role } from '../../permission/role.js'
 
 export const accessRequestsRouter = Router()
 
-const roleName = (n: number): string => (n === 2 ? 'writer' : 'reader')
+const roleName = (n: number): string => roleFromNumber(n) ?? 'reader'
 
 /** Only reader|writer can be requested / approved (no commenter/admin). */
 function parseReqRole(v: unknown, fallback: 'reader' | 'writer' = 'reader'): 'reader' | 'writer' {

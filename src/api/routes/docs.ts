@@ -7,7 +7,7 @@ import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
-import { ROLE_ADMIN } from '../../permission/role.js'
+import { ROLE_ADMIN, roleFromNumber } from '../../permission/role.js'
 import { buildWhiteboardName, WhiteboardNameError } from '../../whiteboard/schema/index.js'
 import { newDocId } from '../../util/ids.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
@@ -166,7 +166,10 @@ docsRouter.get('/', async (req: Request, res: Response) => {
   const sort = req.query.sort === 'updatedAt:asc' ? 'updatedAt:asc' : 'updatedAt:desc'
 
   const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, folderId, page, pageSize, sort })
-  const roleName = (n: number) => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
+  // Canonical stored-number -> role name (covers commenter=4; stored value != rank
+  // ordinal, so use the shared map rather than a hand-rolled ternary). Falls back
+  // to 'reader' only for an unknown/corrupt stored value.
+  const roleName = (n: number): string => roleFromNumber(n) ?? 'reader'
   res.status(200).json({
     total,
     items: items.map((d) => ({
