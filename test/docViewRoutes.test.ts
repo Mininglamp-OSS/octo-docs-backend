@@ -76,6 +76,19 @@ describe('POST /docs/:docId/view — recordDocViewHandler', () => {
     expect(arg.docId).toBe('d_1')
     expect(arg.spaceId).toBe('s1')
   })
+
+  it('threads { isBot, token } into requireDocRole so share-scoped (anyone_in_space) readers resolve, not fail-closed', async () => {
+    // Once share resolution is live, a token-less reader guard fail-closes an
+    // anyone_in_space reader (no doc_member row) with a wrongful 403. The /view
+    // handler must pass the caller token/isBot just like the doc-read path.
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: {}, role: 'reader' } as never)
+    vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mockResolvedValue(
+      new Date('2026-07-15T06:20:48.123Z'),
+    )
+    await recordDocViewHandler(req({ params: { docId: 'd_1' } }), mockRes() as never)
+    const opts = vi.mocked(requireDocRole).mock.calls[0]![5]
+    expect(opts).toEqual({ isBot: false, token: 'tok' })
+  })
 })
 
 describe('GET /docs/recent — listRecentHandler', () => {
