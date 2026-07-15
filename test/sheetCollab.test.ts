@@ -25,18 +25,23 @@ import {
   validateSheetDim,
   validateSheetDims,
   validateSheetDrawing,
+  validateSheetHyperLink,
+  SHEET_HYPERLINKS_FIELD,
   SheetSnapshotInvalidError,
   type SheetCell,
   type StoredDrawing,
+  type StoredHyperLink,
 } from '../src/agent/sheetConversion.js'
 import {
   decodeSheetSnapshot,
   decodeSheetDimsSnapshot,
+  decodeSheetHyperLinksSnapshot,
   reconcileSheetMap,
   decodeTargetSnapshot,
   SHEET_YMAP_FIELD as RESTORE_SHEET_FIELD,
   SHEET_DIMS_FIELD as RESTORE_DIMS_FIELD,
   SHEET_DRAWINGS_FIELD as RESTORE_DRAWINGS_FIELD,
+  SHEET_HYPERLINKS_FIELD as RESTORE_HYPERLINKS_FIELD,
 } from '../src/collab/versionRestore.js'
 import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
 import { advanceEditVersion } from '../src/collab/liveDocWrite.js'
@@ -589,6 +594,114 @@ describe('versionRestore — sheetDrawings restore (floating images roll back wi
     // fail-closed: live drawings + cells unchanged (no half-restore)
     expect(live.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD).has('default!keep')).toBe(true)
     expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'safe' })
+  })
+})
+
+/** A well-formed hyperlink whose id matches what the key will carry. */
+function hyperlink(id: string, payload = 'https://example.com'): StoredHyperLink {
+  return { id, row: 1, column: 2, payload, display: 'link' }
+}
+
+/** Build a Y.Doc state carrying sheetHyperLinks (+ optional cells). */
+function hyperlinksState(
+  links: Record<string, StoredHyperLink>,
+  cells: Record<string, SheetCell> = {},
+): Uint8Array {
+  const doc = new Y.Doc()
+  doc.transact(() => {
+    const cellMap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    for (const [k, v] of Object.entries(cells)) cellMap.set(k, v)
+    const linkMap = doc.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
+    for (const [k, v] of Object.entries(links)) linkMap.set(k, v)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+describe('sheetConversion — validateSheetHyperLink (fail-closed key + id + payload contract)', () => {
+  it('accepts a well-formed hyperlink whose id equals the key segment', () => {
+    const h = hyperlink('lnk1')
+    expect(validateSheetHyperLink('default!lnk1', h)).toBe(h)
+  })
+
+  it('accepts http/https/mailto and an internal #jump payload', () => {
+    expect(validateSheetHyperLink('default!a', { id: 'a', row: 0, column: 0, payload: 'http://x.io' })).toBeTruthy()
+    expect(validateSheetHyperLink('default!b', { id: 'b', row: 0, column: 0, payload: 'mailto:x@y.io' })).toBeTruthy()
+    expect(validateSheetHyperLink('default!c', { id: 'c', row: 0, column: 0, payload: '#gid=s1&range=A1' })).toBeTruthy()
+  })
+
+  it('rejects a bad key shape (no sheetId! prefix, or colon in linkId)', () => {
+    expect(() => validateSheetHyperLink('lnk1', hyperlink('lnk1'))).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetHyperLink('default!0:0', hyperlink('0:0'))).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects an id that does not match the key segment (anti-spoof)', () => {
+    expect(() => validateSheetHyperLink('default!lnk1', hyperlink('OTHER'))).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects an unsafe payload scheme (javascript:/data:) — stored-XSS guard', () => {
+    expect(() =>
+      validateSheetHyperLink('default!x', { id: 'x', row: 0, column: 0, payload: 'javascript:alert(1)' }),
+    ).toThrow(SheetSnapshotInvalidError)
+    expect(() =>
+      validateSheetHyperLink('default!x', { id: 'x', row: 0, column: 0, payload: 'data:text/html,x' }),
+    ).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a negative / non-integer row or column, and a non-string payload', () => {
+    expect(() =>
+      validateSheetHyperLink('default!x', { id: 'x', row: -1, column: 0, payload: 'https://x.io' }),
+    ).toThrow(SheetSnapshotInvalidError)
+    expect(() =>
+      validateSheetHyperLink('default!x', { id: 'x', row: 1.5, column: 0, payload: 'https://x.io' }),
+    ).toThrow(SheetSnapshotInvalidError)
+    expect(() =>
+      validateSheetHyperLink('default!x', { id: 'x', row: 0, column: 0, payload: 123 as never }),
+    ).toThrow(SheetSnapshotInvalidError)
+  })
+})
+
+describe('versionRestore — sheetHyperLinks restore + decode', () => {
+  it('SHEET_HYPERLINKS_FIELD is the single shared constant across modules', () => {
+    expect(SHEET_HYPERLINKS_FIELD).toBe('sheetHyperLinks')
+    expect(RESTORE_HYPERLINKS_FIELD).toBe(SHEET_HYPERLINKS_FIELD)
+  })
+
+  it('decodeSheetHyperLinksSnapshot extracts + validates the links', () => {
+    const state = hyperlinksState({ 'default!lnk1': hyperlink('lnk1') })
+    expect(decodeSheetHyperLinksSnapshot(state)).toEqual({ 'default!lnk1': hyperlink('lnk1') })
+  })
+
+  it('reconcileSheetMap restores hyperlinks alongside cells (removes live-only link, rolls back changed one)', () => {
+    const k = sheetCellKey('default', 0, 0)
+    const target = hyperlinksState(
+      { 'default!lnk1': { id: 'lnk1', row: 1, column: 2, payload: 'https://old.io' } },
+      { [k]: { v: 'old' } },
+    )
+    const live = liveDocFrom(
+      hyperlinksState(
+        {
+          'default!lnk1': { id: 'lnk1', row: 1, column: 2, payload: 'https://new.io' },
+          'default!lnk2': { id: 'lnk2', row: 3, column: 4, payload: 'https://stray.io' },
+        },
+        { [k]: { v: 'new' } },
+      ),
+    )
+    live.transact(() => reconcileSheetMap(live, target))
+    const links = live.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
+    expect(links.has('default!lnk2')).toBe(false) // live-only link removed
+    expect((links.get('default!lnk1') as StoredHyperLink).payload).toBe('https://old.io') // rolled back
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'old' })
+  })
+
+  it('reconcileSheetMap fires (returns true) when only hyperlinks differ, cells+dims empty', () => {
+    const target = hyperlinksState({ 'default!lnk1': hyperlink('lnk1') })
+    const live = liveDocFrom()
+    let touched = false
+    live.transact(() => {
+      touched = reconcileSheetMap(live, target)
+    })
+    expect(touched).toBe(true)
+    expect(live.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD).has('default!lnk1')).toBe(true)
   })
 })
 
