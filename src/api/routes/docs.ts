@@ -21,9 +21,15 @@ export const docsRouter = Router()
 
 const DEFAULT_FOLDER = 'f_default'
 
-/** Serialize the numeric doc_member role to the wire string enum (§3 wire). */
-const roleName = (n: number): 'admin' | 'writer' | 'reader' =>
-  n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader'
+/**
+ * Serialize the numeric doc_member role to the wire string enum (§3 wire).
+ * The stored value is not the rank ordinal (commenter is stored as 4), so this
+ * defers to the shared `roleFromNumber` map rather than a hand-rolled ternary.
+ * Falls back to 'reader' only for an unknown/corrupt stored value. Shared by all
+ * doc-list serializers (list + recent) so commenter=4 renders as 'commenter'
+ * everywhere instead of silently degrading to 'reader'.
+ */
+const roleName = (n: number): string => roleFromNumber(n) ?? 'reader'
 
 /** Normalize a repeated query param (`?creator=a&creator=b`) to a string[]. */
 function toStringArray(v: unknown): string[] {
@@ -188,10 +194,6 @@ docsRouter.get('/', async (req: Request, res: Response) => {
   const sort = req.query.sort === 'updatedAt:asc' ? 'updatedAt:asc' : 'updatedAt:desc'
 
   const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, folderId, owner, q, types, page, pageSize, sort })
-  // Canonical stored-number -> role name (covers commenter=4; stored value != rank
-  // ordinal, so use the shared map rather than a hand-rolled ternary). Falls back
-  // to 'reader' only for an unknown/corrupt stored value.
-  const roleName = (n: number): string => roleFromNumber(n) ?? 'reader'
   res.status(200).json({
     total,
     items: items.map((d) => ({
