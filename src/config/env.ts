@@ -524,4 +524,18 @@ export const config = {
     // retention: drop auto rows older than this many days.
     retainDays: num('AUTO_RETAIN_DAYS', 7),
   },
+
+  // FEAT-B recent-view retention. doc_view_history rows are pruned synchronously
+  // (piggyback) inside the same transaction as each ingest UPSERT, per uid, so a
+  // returned ingest leaves the window already trimmed (deterministic for tests).
+  // Pruning is capacity maintenance ONLY — query-time visibility filtering
+  // (status=1 + permission predicate) is what makes revoked/deleted docs vanish;
+  // correctness never depends on pruning. Test envs can lower these to build a
+  // prune scenario without inserting hundreds of rows.
+  docView: {
+    // retention: keep at most the most-recent N view rows per user (0 = unbounded).
+    retainCount: num('DOC_VIEW_RETAIN_COUNT', 200),
+    // retention: drop view rows older than this many days (0 = unbounded).
+    retainDays: num('DOC_VIEW_RETAIN_DAYS', 90),
+  },
 } as const

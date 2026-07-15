@@ -39,6 +39,17 @@ export const SHEET_DIMS_FIELD = 'sheetDims'
 export const SHEET_DRAWINGS_FIELD = 'sheetDrawings'
 
 /**
+ * Y.Map field for cell hyperlinks, keyed `${sheetId}!${linkId}` (matches
+ * octo-web binding.ts SHEET_HYPERLINKS_FIELD). Each value is a StoredHyperLink
+ * `{ id, row, column, payload(url), display? }` managed by Univer's
+ * SHEET_HYPER_LINK_PLUGIN — a link lives OUTSIDE cell data and points back at a
+ * cell by row/column (the cell's visible text stays in `cell.v`). Two-way synced
+ * + persisted (like dims), so version-restore reconciles it alongside the rest,
+ * and unlike drawings it IS small/structured enough to ride the GET read surface.
+ */
+export const SHEET_HYPERLINKS_FIELD = 'sheetHyperLinks'
+
+/**
  * Cell shape synced in V1: value, optional formula, optional resolved style, and
  * the two rich-cell fields the live editor also syncs.
  *
@@ -421,6 +432,133 @@ export function applySheetDrawingsToYMap(
   for (const [key, d] of toSet) ymap.set(key, d)
 }
 
+/** A cell hyperlink (Univer ISheetHyperLink). Lives in the sheetHyperLinks map,
+ * NOT in cell data; points at a cell by row/column. `payload` is the URL, `display`
+ * an optional label. Extra fields are kept verbatim (opaque), like a drawing. */
+export interface StoredHyperLink {
+  id: string
+  row: number
+  column: number
+  payload: string
+  display?: string
+  [k: string]: unknown
+}
+
+export interface SheetHyperLinkBatch {
+  toDelete: string[]
+  toSet: Array<[string, StoredHyperLink]>
+}
+
+/** Canonical hyperlink-key shape: `${sheetId}!${linkId}` (linkId alnum/-/_). */
+const HYPERLINK_KEY_RE = /^[^!]{1,64}![A-Za-z0-9_-]{1,64}$/
+
+/**
+ * URL schemes a stored hyperlink payload may use. Mirrors the frontend's
+ * sanitizeLinkHref: http/https/mailto, or an internal in-sheet jump (`#…`).
+ * Fail-closed rejects javascript:/data: etc. so a stored link can't smuggle a
+ * script URL to every client that later renders it.
+ */
+function isSafeHyperlinkPayload(payload: string): boolean {
+  if (payload.startsWith('#')) return true // internal jump, e.g. #gid=sheet1&range=A1
+  return /^(https?:|mailto:)/i.test(payload)
+}
+
+/**
+ * Validate a single raw hyperlink key + value. Fail-closed. `id` must equal the
+ * key's linkId segment (a hostile key can't point at a different id); `row`/`column`
+ * are non-negative integers (the anchored cell); `payload` is a safe-scheme URL;
+ * `display` is optional string. Extra fields round-trip verbatim (opaque), matching
+ * the drawing validator, so a forward-compatible field is preserved.
+ */
+export function validateSheetHyperLink(key: unknown, value: unknown): StoredHyperLink {
+  if (typeof key !== 'string' || !HYPERLINK_KEY_RE.test(key)) {
+    throw new SheetSnapshotInvalidError(
+      `hyperlink key does not match ${'${sheetId}!${linkId}'}: ${String(key).slice(0, 64)}`,
+    )
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new SheetSnapshotInvalidError(`hyperlink ${key}: value is not a plain object`)
+  }
+  const rec = value as Record<string, unknown>
+  const keyLinkId = key.slice(key.indexOf('!') + 1)
+  if (typeof rec.id !== 'string' || rec.id !== keyLinkId) {
+    throw new SheetSnapshotInvalidError(
+      `hyperlink ${key}: id must be the string "${keyLinkId}" (key segment)`,
+    )
+  }
+  for (const f of ['row', 'column'] as const) {
+    const n = rec[f]
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) {
+      throw new SheetSnapshotInvalidError(`hyperlink ${key}: ${f} must be a non-negative integer`)
+    }
+  }
+  if (typeof rec.payload !== 'string' || rec.payload.length === 0) {
+    throw new SheetSnapshotInvalidError(`hyperlink ${key}: payload (url) must be a non-empty string`)
+  }
+  if (!isSafeHyperlinkPayload(rec.payload)) {
+    throw new SheetSnapshotInvalidError(
+      `hyperlink ${key}: payload must be http/https/mailto or an internal #jump`,
+    )
+  }
+  if ('display' in rec && rec.display !== undefined && typeof rec.display !== 'string') {
+    throw new SheetSnapshotInvalidError(`hyperlink ${key}: display must be a string`)
+  }
+  return rec as StoredHyperLink
+}
+
+/**
+ * Validate a whole `{ key: hyperlink|null }` batch WITHOUT mutating, fail-closed.
+ * null = delete (key-shape-checked); else validated via validateSheetHyperLink.
+ * The hyperlinks counterpart of validateSheetDrawingBatch.
+ */
+export function validateSheetHyperLinkBatch(
+  links: Record<string, StoredHyperLink | null>,
+): SheetHyperLinkBatch {
+  const toDelete: string[] = []
+  const toSet: Array<[string, StoredHyperLink]> = []
+  for (const [key, val] of Object.entries(links)) {
+    if (val == null) {
+      if (typeof key === 'string' && HYPERLINK_KEY_RE.test(key)) toDelete.push(key)
+      else throw new SheetSnapshotInvalidError(`delete: invalid hyperlink key ${String(key).slice(0, 64)}`)
+    } else {
+      toSet.push([key, validateSheetHyperLink(key, val)])
+    }
+  }
+  return { toDelete, toSet }
+}
+
+/**
+ * Pure mutation applied INSIDE a Yjs transaction. A null value deletes the link;
+ * otherwise it is set. Validate-all-then-apply (mirrors the other appliers).
+ */
+export function applySheetHyperLinksToYMap(
+  ymap: Y.Map<StoredHyperLink>,
+  links: Record<string, StoredHyperLink | null>,
+): void {
+  const { toDelete, toSet } = validateSheetHyperLinkBatch(links)
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, link] of toSet) ymap.set(key, link)
+}
+
+/** Read: Y.Doc state -> plain `{ key: hyperlink }` map (part of the GET surface). */
+export function yDocStateToSheetHyperLinks(state: Uint8Array): Record<string, StoredHyperLink> {
+  const ydoc = new Y.Doc()
+  Y.applyUpdate(ydoc, state)
+  const ymap = ydoc.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
+  const out: Record<string, StoredHyperLink> = {}
+  for (const [key, link] of ymap.entries()) out[key] = link
+  return out
+}
+
+/** Validate a whole `{ key: hyperlink }` map (read/restore path). */
+export function validateSheetHyperLinks(
+  links: Record<string, unknown>,
+): Record<string, StoredHyperLink> {
+  const out: Record<string, StoredHyperLink> = {}
+  for (const [key, val] of Object.entries(links)) out[key] = validateSheetHyperLink(key, val)
+  return out
+}
+
 /**
  * Measure the sheet AFTER applying an edit batch, the two ways its downstream
  * caps are enforced, so the write path can reject an oversized result in its
@@ -447,30 +585,37 @@ export function measureSheetAfterEdit(
   cells: Record<string, SheetCell | null>,
   dims: Record<string, number | null> = {},
   drawings: Record<string, StoredDrawing | null> = {},
+  hyperlinks: Record<string, StoredHyperLink | null> = {},
 ): { docBytes: number; payloadBytes: number } {
   const scratch = new Y.Doc()
   Y.applyUpdate(scratch, preEditState)
   const ymap = scratch.getMap<SheetCell>(SHEET_YMAP_FIELD)
   const dimsMap = scratch.getMap<number>(SHEET_DIMS_FIELD)
   const drawingMap = scratch.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD)
+  const linkMap = scratch.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
   // Apply the batch exactly as the live commit will (validate-all-then-apply), so
   // the measured post-edit doc matches what commitLiveSheetEdit would persist.
   scratch.transact(() => {
     applySheetCellsToYMap(ymap, cells)
     applySheetDimsToYMap(dimsMap, dims)
     applySheetDrawingsToYMap(drawingMap, drawings)
+    applySheetHyperLinksToYMap(linkMap, hyperlinks)
   })
   const docBytes = Y.encodeStateAsUpdate(scratch).length
   // Decode + validate the READ maps exactly as GET does (decodeSheetSnapshot /
-  // decodeSheetDimsSnapshot) so payloadBytes is byte-identical to the read body.
-  // NOTE: drawings are NOT part of the GET payload (their inline base64 would blow
-  // the read cap); they only grow docBytes, which the maxDocBytes gate bounds.
+  // decodeSheetDimsSnapshot / hyperlinks) so payloadBytes is byte-identical to the
+  // read body. NOTE: drawings are NOT part of the GET payload (their inline base64
+  // would blow the read cap); they only grow docBytes. Hyperlinks ARE small and
+  // structured, so they ride the GET surface and count toward payloadBytes.
   const rawCells: Record<string, unknown> = {}
   for (const [key, val] of scratch.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
   const rawDims: Record<string, unknown> = {}
   for (const [key, val] of scratch.getMap(SHEET_DIMS_FIELD).entries()) rawDims[key] = val
+  const rawLinks: Record<string, unknown> = {}
+  for (const [key, val] of scratch.getMap(SHEET_HYPERLINKS_FIELD).entries()) rawLinks[key] = val
   const sheetCells = validateSheetCells(rawCells)
   const sheetDims = validateSheetDims(rawDims)
-  const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))
+  const sheetHyperLinks = validateSheetHyperLinks(rawLinks)
+  const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks }))
   return { docBytes, payloadBytes }
 }

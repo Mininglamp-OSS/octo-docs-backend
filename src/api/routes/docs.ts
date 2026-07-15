@@ -5,6 +5,8 @@
 import { Router, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
+import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
+import { normalizeTypeFilter } from '../../db/docType.js'
 import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
 import { ROLE_ADMIN, roleFromNumber } from '../../permission/role.js'
@@ -12,11 +14,23 @@ import { buildWhiteboardName, WhiteboardNameError } from '../../whiteboard/schem
 import { newDocId } from '../../util/ids.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
 import { config } from '../../config/env.js'
+import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
 
 export const docsRouter = Router()
 
 const DEFAULT_FOLDER = 'f_default'
+
+/** Serialize the numeric doc_member role to the wire string enum (§3 wire). */
+const roleName = (n: number): 'admin' | 'writer' | 'reader' =>
+  n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader'
+
+/** Normalize a repeated query param (`?creator=a&creator=b`) to a string[]. */
+function toStringArray(v: unknown): string[] {
+  if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string')
+  if (typeof v === 'string') return [v]
+  return []
+}
 
 /**
  * docType value the front-end stamps on whiteboards (DocsHome create menu /
@@ -161,11 +175,19 @@ docsRouter.get('/', async (req: Request, res: Response) => {
   // param. Listing is hard-scoped to that space.
   const spaceId = req.spaceId!
   const folderId = typeof req.query.folderId === 'string' ? req.query.folderId : undefined
+  // FEAT-B: `owner=me` narrows to strictly the caller's own docs (excludes
+  // shared-with-me); `q` is a filename substring search. Both are optional and
+  // additive — omitting them preserves the pre-FEAT-B behavior verbatim.
+  const owner = req.query.owner === 'me' ? 'me' : undefined
+  const q = typeof req.query.q === 'string' ? req.query.q : undefined
+  // FEAT-B/XIN-1188: optional multi-value `?type=` kind filter (repeated param,
+  // never CSV). Validated against the fixed enum; unknown/absent => no filter.
+  const types = normalizeTypeFilter(req.query.type)
   const page = Math.max(1, Number(req.query.page ?? 1) || 1)
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
   const sort = req.query.sort === 'updatedAt:asc' ? 'updatedAt:asc' : 'updatedAt:desc'
 
-  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, folderId, page, pageSize, sort })
+  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, folderId, owner, q, types, page, pageSize, sort })
   // Canonical stored-number -> role name (covers commenter=4; stored value != rank
   // ordinal, so use the shared map rather than a hand-rolled ternary). Falls back
   // to 'reader' only for an unknown/corrupt stored value.
@@ -182,6 +204,99 @@ docsRouter.get('/', async (req: Request, res: Response) => {
     })),
   })
 })
+
+/**
+ * POST /api/v1/docs/{docId}/view — record that the caller opened this doc
+ * (FEAT-B ingest, §3.1). Idempotent UPSERT on (uid, doc_id): a re-open only
+ * refreshes viewed_at, never adds a row. uid is derived server-side; any uid /
+ * viewedBy in the body is ignored. Needs reader (reuses requireDocRole guard).
+ */
+export async function recordDocViewHandler(req: Request, res: Response) {
+  const uid = req.uid!
+  const docId = req.params.docId!
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader')
+  if (!guard) return
+  const viewedAt = await docViewHistoryRepo.upsertViewWithPrune({
+    uid,
+    docId,
+    spaceId: req.spaceId!,
+    retainCount: config.docView.retainCount,
+    retainDays: config.docView.retainDays,
+  })
+  res.status(200).json({ ok: true, viewedAt: new Date(viewedAt).toISOString() })
+}
+
+docsRouter.post('/:docId/view', recordDocViewHandler)
+
+/**
+ * GET /api/v1/docs/recent — the caller's recently-viewed docs (FEAT-B, §3.2).
+ * keyset-paginated, viewed_at DESC. Query-time filtering (status + permission)
+ * lives in the repo, so revoked / deleted / archived docs drop out immediately.
+ */
+export async function listRecentHandler(req: Request, res: Response) {
+  const uid = req.uid!
+  const spaceId = req.spaceId!
+  const q = typeof req.query.q === 'string' ? req.query.q : undefined
+  const creators = toStringArray(req.query.creator)
+  // FEAT-B/XIN-1188: optional multi-value `?type=` kind filter (same convention
+  // as `creator`). Validated against the fixed enum; unknown/absent => no filter.
+  const types = normalizeTypeFilter(req.query.type)
+  const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
+  let result
+  try {
+    result = await docViewHistoryRepo.listRecent({ uid, spaceId, q, creators, types, cursor, pageSize })
+  } catch (err) {
+    if (err instanceof Error && err.message === 'invalid_cursor') {
+      res.status(400).json({ error: 'invalid_cursor' })
+      return
+    }
+    throw err
+  }
+  res.status(200).json({
+    total: result.total,
+    items: result.items.map((d) => ({
+      docId: d.doc_id,
+      title: d.title,
+      ownerId: d.owner_id,
+      docType: d.doc_type,
+      role: roleName(Number(d.role)),
+      updatedAt: d.updated_at,
+      viewedAt: new Date(d.viewed_at).toISOString(),
+    })),
+    nextCursor: result.nextCursor,
+  })
+}
+
+docsRouter.get('/recent', listRecentHandler)
+
+/**
+ * GET /api/v1/docs/recent/creators — distinct creators of the caller's
+ * recently-viewed docs for the CreatorFilter dropdown (FEAT-B, §3.4). Scope:
+ * q-filtered, creator-NOT-filtered, pre-pagination, permission-filtered — the
+ * full distinct owner set. Display names are resolved server-side so the
+ * front-end needs no per-uid lookups; a uid that fails to resolve falls back to
+ * its own value as the name (a directory hiccup never drops a candidate).
+ */
+export async function listRecentCreatorsHandler(req: Request, res: Response) {
+  const uid = req.uid!
+  const spaceId = req.spaceId!
+  const q = typeof req.query.q === 'string' ? req.query.q : undefined
+  const ownerIds = await docViewHistoryRepo.listCreators({ uid, spaceId, q })
+  const nameByUid = new Map<string, string>()
+  if (ownerIds.length > 0) {
+    const users = await getOctoIdentity().getUsers(ownerIds, req.octoToken)
+    for (const u of users) {
+      const name = typeof u.name === 'string' ? u.name.trim() : ''
+      if (name !== '') nameByUid.set(u.uid, name)
+    }
+  }
+  res.status(200).json({
+    creators: ownerIds.map((id) => ({ uid: id, name: nameByUid.get(id) ?? id })),
+  })
+}
+
+docsRouter.get('/recent/creators', listRecentCreatorsHandler)
 
 // Registered after GET '/' so the collection route is matched distinctly from
 // the single-doc route (Express treats '/' and '/:docId' as separate paths).
