@@ -106,21 +106,34 @@ export const docMetaRepo = {
 
   /**
    * List documents the caller can see in a space/folder.
-   * For this round, listing is scoped to docs the uid owns or is a member of
-   * (joined with doc_member), with the resolved role surfaced per row.
+   * By default listing is scoped to docs the uid owns OR is a member of (joined
+   * with doc_member), with the resolved role surfaced per row.
+   *
+   * `owner: 'me'` (FEAT-B "my documents") tightens visibility to STRICTLY the
+   * docs the caller owns (owner_id == uid) and drops the shared-with-me branch —
+   * role is then always admin(3). `q` (FEAT-B filename search) adds a
+   * case-insensitive substring match on title with LIKE wildcards escaped so a
+   * user-typed `%`/`_`/`\` matches literally. `types` (FEAT-B/XIN-1188 kind
+   * filter) narrows to a multi-value OR set of `doc_type`s at the same layer as
+   * `q` — BEFORE pagination, so count and page agree. Empty `types` applies no
+   * predicate (backward compatible).
    */
   async listForUser(params: {
     uid: string
     spaceId: string
     folderId?: string
+    owner?: 'me'
+    q?: string
+    types?: string[]
     page: number
     pageSize: number
     sort: 'updatedAt:desc' | 'updatedAt:asc'
   }): Promise<{ total: number; items: Array<DocMeta & { role: number }> }> {
     const where: string[] = ['m.status <> 0']
-    // Optional space/folder filters appear in the WHERE clause between the JOIN's
-    // `dm.uid = ?` and the trailing `m.owner_id = ?`. Collect their bind values in
-    // clause order so the full args array lines up positionally with the SQL.
+    // Optional space/folder/q filters appear in the WHERE clause between the
+    // JOIN's `dm.uid = ?` and the trailing owner/visibility predicate. Collect
+    // their bind values in clause order so the full args array lines up
+    // positionally with the SQL.
     const filterArgs: unknown[] = []
     // role: owner => admin(3), else doc_member.role
     // Space isolation (P1): listing is always scoped to the caller's space; the
@@ -132,9 +145,29 @@ export const docMetaRepo = {
       where.push('m.folder_id = ?')
       filterArgs.push(params.folderId)
     }
+    const q = (params.q ?? '').trim()
+    if (q !== '') {
+      // utf8mb4 default collation is case-insensitive, so LIKE is CI without
+      // LOWER(). Escape `%`/`_`/`\` so they match literally; ESCAPE '\\'.
+      const qEsc = q.replace(/[\\%_]/g, (c) => `\\${c}`)
+      where.push(`m.title LIKE ? ESCAPE '\\\\'`)
+      filterArgs.push(`%${qEsc}%`)
+    }
+    // FEAT-B/XIN-1188 kind filter: multi-value OR on doc_type, same layer as `q`
+    // (before pagination). Values are pre-validated by the route; empty => no
+    // predicate (pre-FEAT-B behavior unchanged).
+    const types = (params.types ?? []).filter((t) => typeof t === 'string' && t !== '')
+    if (types.length > 0) {
+      where.push(`m.doc_type IN (${types.map(() => '?').join(', ')})`)
+      filterArgs.push(...types)
+    }
+    // Visibility predicate. Default: owner OR member. owner='me': strictly owner,
+    // excluding shared-with-me (FEAT-B Q7). Both bind a single trailing uid.
+    const visibility =
+      params.owner === 'me' ? 'm.owner_id = ?' : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
-    // space/folder filters, then WHERE `m.owner_id = ?`. The join uid leads and
-    // the owner uid trails — they are not interchangeable with the filters.
+    // space/folder/q filters, then the trailing visibility `m.owner_id = ?`. The
+    // join uid leads and the owner uid trails — they are not interchangeable.
     const args: unknown[] = [params.uid, ...filterArgs, params.uid]
     const whereSql = where.join(' AND ')
     const order = params.sort === 'updatedAt:asc' ? 'ASC' : 'DESC'
@@ -150,15 +183,16 @@ export const docMetaRepo = {
     const base = `
       FROM doc_meta m
       LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ?
-      WHERE ${whereSql} AND (m.owner_id = ? OR dm.uid IS NOT NULL)
+      WHERE ${whereSql} AND ${visibility}
     `
     const countRows = await query<{ cnt: number }>(`SELECT COUNT(*) AS cnt ${base}`, args)
     const total = Number(countRows[0]?.cnt ?? 0)
 
+    // tie-break on doc_id keeps offset paging stable when rows share updated_at.
     const items = await query<DocMeta & { role: number }>(
       `SELECT m.*, CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END AS role
        ${base}
-       ORDER BY m.updated_at ${order}
+       ORDER BY m.updated_at ${order}, m.doc_id ${order}
        LIMIT ${pageSize} OFFSET ${offset}`,
       [params.uid, ...args],
     )

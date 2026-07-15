@@ -32,10 +32,12 @@ import {
   validateSheetCellBatch,
   validateSheetDimBatch,
   validateSheetDrawingBatch,
+  validateSheetHyperLinkBatch,
   measureSheetAfterEdit,
   SheetSnapshotInvalidError,
   type SheetCell,
   type StoredDrawing,
+  type StoredHyperLink,
 } from '../../agent/sheetConversion.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
@@ -53,6 +55,8 @@ export interface EditDocSheetInput {
   dims: Record<string, number | null>
   /** Keyed drawings (`${sheetId}!${drawingId}` -> ISheetImage) to set; null deletes. */
   drawings: Record<string, StoredDrawing | null>
+  /** Keyed hyperlinks (`${sheetId}!${linkId}` -> {id,row,column,payload,display?}); null deletes. */
+  hyperlinks: Record<string, StoredHyperLink | null>
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
 }
@@ -108,6 +112,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     validateSheetCellBatch(input.cells)
     validateSheetDimBatch(input.dims)
     validateSheetDrawingBatch(input.drawings)
+    validateSheetHyperLinkBatch(input.hyperlinks)
   } catch (err) {
     const mapped = mapEditError(err)
     if (mapped) return { ok: false, ...mapped }
@@ -124,7 +129,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
   // chained PATCH→PATCH could grow the sheet past the read cap into a
   // write-but-not-readable state (GET permanently 413s). No lock is held yet, so a
   // rejection here leaves no snapshot row and no live side effect.
-  const { docBytes, payloadBytes } = measureSheetAfterEdit(preEditState, input.cells, input.dims, input.drawings)
+  const { docBytes, payloadBytes } = measureSheetAfterEdit(preEditState, input.cells, input.dims, input.drawings, input.hyperlinks)
   // Align the write cap to the read cap so a written sheet is always GET-readable.
   // Report payloadBytes/limit (the read-payload dimension) so the write-gate 413
   // carries the SAME observability field the read gate emits (docSheet.ts).
@@ -193,6 +198,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       input.cells,
       input.dims,
       input.drawings,
+      input.hyperlinks,
     )
     bytes = committed.bytes
     newSV = committed.newSV

@@ -15,7 +15,7 @@ import * as Y from 'yjs'
 import { prosemirrorToYXmlFragment, yDocToProsemirrorJSON } from 'y-prosemirror'
 import { Node as PMNode } from 'prosemirror-model'
 import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../schema/index.js'
-import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, validateSheetCells, validateSheetCell, validateSheetDims, validateSheetDim, validateSheetDrawing, type StoredDrawing } from '../agent/sheetConversion.js'
+import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, validateSheetCells, validateSheetCell, validateSheetDims, validateSheetDim, validateSheetDrawing, validateSheetHyperLink, validateSheetHyperLinks, type StoredDrawing, type StoredHyperLink } from '../agent/sheetConversion.js'
 import { WB_SCHEMA_VERSION } from '../whiteboard/schema/index.js'
 import { getElementsMap, getFilesMap, readEntry, readElements, type YElements } from '../whiteboard/ydoc.js'
 export { SheetSnapshotInvalidError } from '../agent/sheetConversion.js'
@@ -55,7 +55,7 @@ export function currentSchemaVersionFor(kind: VersionContentKind): number {
 // SHEET_YMAP_FIELD is the single shared constant (defined in agent/sheetConversion.ts,
 // the cross-repo contract anchor). A text document never creates this map, so all
 // sheet-aware helpers below are strict no-ops for docs.
-export { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD }
+export { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD }
 
 /**
  * Read the spreadsheet cells out of a snapshot's binary state. Returns a plain
@@ -100,6 +100,23 @@ export function decodeSheetDimsSnapshot(targetState: Uint8Array): Record<string,
 }
 
 /**
+ * Read the spreadsheet hyperlinks out of a snapshot's binary state. Returns a
+ * plain `{ ${sheetId}!${linkId}: {id,row,column,payload,display?} }` object (empty
+ * for a text document). Fail-closed like the other sheet decoders: every link is
+ * validated (key shape, id match, safe payload scheme) before it leaves this
+ * function; a violation throws SheetSnapshotInvalidError, which the route maps to
+ * 409. Hyperlinks are part of the GET read surface (unlike drawings).
+ */
+export function decodeSheetHyperLinksSnapshot(targetState: Uint8Array): Record<string, unknown> {
+  const doc = new Y.Doc()
+  Y.applyUpdate(doc, targetState)
+  const links = doc.getMap(SHEET_HYPERLINKS_FIELD)
+  const raw: Record<string, unknown> = {}
+  for (const [key, val] of links.entries()) raw[key] = val
+  return validateSheetHyperLinks(raw)
+}
+
+/**
  * Reconcile a snapshot's 'sheet' cell map INTO a live doc's 'sheet' map, in place.
  * MUST be called inside a Yjs transaction. Makes the live cells equal the target's:
  * live-only cells are deleted, target cells are set/overwritten. Returns true if a
@@ -127,22 +144,27 @@ export function reconcileSheetMap(liveDoc: Y.Doc, targetState: Uint8Array): bool
   const liveDims = liveDoc.getMap(SHEET_DIMS_FIELD)
   const targetDrawings = targetYDoc.getMap(SHEET_DRAWINGS_FIELD)
   const liveDrawings = liveDoc.getMap(SHEET_DRAWINGS_FIELD)
+  const targetHyper = targetYDoc.getMap(SHEET_HYPERLINKS_FIELD)
+  const liveHyper = liveDoc.getMap(SHEET_HYPERLINKS_FIELD)
   if (
     targetSheet.size === 0 && liveSheet.size === 0 &&
     targetDims.size === 0 && liveDims.size === 0 &&
-    targetDrawings.size === 0 && liveDrawings.size === 0
+    targetDrawings.size === 0 && liveDrawings.size === 0 &&
+    targetHyper.size === 0 && liveHyper.size === 0
   ) {
     return false // pure text doc — untouched
   }
-  // Validate the ENTIRE target of ALL THREE maps first (fail-closed) so a bad
-  // cell / dimension / drawing aborts before we mutate anything — no partial,
-  // half-restored state.
+  // Validate the ENTIRE target of ALL FOUR maps first (fail-closed) so a bad
+  // cell / dimension / drawing / hyperlink aborts before we mutate anything — no
+  // partial, half-restored state.
   const validatedCells: Record<string, import('../agent/sheetConversion.js').SheetCell> = {}
   for (const [key, val] of targetSheet.entries()) validatedCells[key] = validateSheetCell(key, val)
   const validatedDims: Record<string, number> = {}
   for (const [key, val] of targetDims.entries()) validatedDims[key] = validateSheetDim(key, val)
   const validatedDrawings: Record<string, StoredDrawing> = {}
   for (const [key, val] of targetDrawings.entries()) validatedDrawings[key] = validateSheetDrawing(key, val)
+  const validatedHyper: Record<string, StoredHyperLink> = {}
+  for (const [key, val] of targetHyper.entries()) validatedHyper[key] = validateSheetHyperLink(key, val)
   // Cells: make live equal target (delete live-only, set/overwrite target).
   for (const key of [...liveSheet.keys()]) {
     if (!(key in validatedCells)) liveSheet.delete(key)
@@ -165,6 +187,14 @@ export function reconcileSheetMap(liveDoc: Y.Doc, targetState: Uint8Array): bool
   }
   for (const [key, val] of Object.entries(validatedDrawings)) {
     liveDrawings.set(key, val)
+  }
+  // Hyperlinks: same reconcile so a restored sheet's cell links match the target
+  // (a live-only link is removed, a target link is set/overwritten).
+  for (const key of [...liveHyper.keys()]) {
+    if (!(key in validatedHyper)) liveHyper.delete(key)
+  }
+  for (const [key, val] of Object.entries(validatedHyper)) {
+    liveHyper.set(key, val)
   }
   return true
 }
