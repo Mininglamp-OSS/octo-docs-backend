@@ -10,9 +10,21 @@ vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(async () => []),
   transaction: vi.fn(),
 }))
+vi.mock('../src/db/repos/docMetaRepo.js', () => ({
+  docMetaRepo: { getByDocId: vi.fn() },
+}))
+vi.mock('../src/permission/resolveRole.js', () => ({
+  resolveRole: vi.fn(),
+}))
+vi.mock('../src/util/fetchExternalImage.js', () => ({
+  fetchExternalImage: vi.fn(),
+}))
 
-import { presignHandler, readHandler, resolveHandler } from '../src/api/routes/attachments.js'
+import { presignHandler, readHandler, resolveHandler, copyHandler, ingestHandler } from '../src/api/routes/attachments.js'
 import { requireDocRole } from '../src/api/guard.js'
+import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
+import { resolveRole } from '../src/permission/resolveRole.js'
+import { fetchExternalImage } from '../src/util/fetchExternalImage.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { query } from '../src/db/pool.js'
 import { buildSchema, SCHEMA_VERSION } from '../src/schema/index.js'
@@ -458,5 +470,235 @@ describe('signing-secret fail-fast (§3.5 / production)', () => {
   it('keeps the dev default working outside production', () => {
     process.env.NODE_ENV = 'test'
     expect(requireSafeSigningSecret(DEV_DEFAULT)).toBe(DEV_DEFAULT)
+  })
+})
+
+describe('POST attachments/copy (markdown-import image migration)', () => {
+  // A stored source attachment the caller can read, in the same space.
+  const srcAttachment = {
+    attach_id: 'att_src',
+    doc_id: 'd_src',
+    object_key: 'd_src/att_src/222.png',
+    mime: 'image/png',
+    size_bytes: 2048,
+    file_name: '222.png',
+    created_by: 'u',
+    created_at: new Date(0),
+  }
+
+  beforeEach(() => {
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard) // writer on target d_1
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(resolveRole).mockReset()
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('rejects an empty / non-array body with 400', async () => {
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [] }), res as never)
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_body')
+  })
+
+  it('rejects a malformed source ref with 400', async () => {
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src' }] }), res as never)
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('copies a readable same-space source into the target doc and returns the new attachId + fresh url', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    // getById: source lookup, then the post-register re-read of the NEW row.
+    vi.mocked(query)
+      .mockResolvedValueOnce([srcAttachment] as never) // source getById
+      .mockResolvedValueOnce([] as never) // register INSERT
+      .mockResolvedValueOnce([
+        { ...srcAttachment, attach_id: 'att_new', doc_id: 'd_1', object_key: 'd_1/att_new/222.png' },
+      ] as never) // new-row getById
+    // Store-to-store GET then PUT both succeed; GET returns bytes.
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
+      init?.method === 'PUT'
+        ? ({ ok: true, status: 200 })
+        : ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }),
+    ))
+
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { mappings: Array<{ sourceAttachId: string; attachId: string; url: string }>; notCopied: unknown[] }
+    expect(body.notCopied).toEqual([])
+    expect(body.mappings).toHaveLength(1)
+    expect(body.mappings[0]!.sourceAttachId).toBe('att_src')
+    expect(body.mappings[0]!.attachId).toMatch(/^att_/)
+    expect(verifySignedUrl(body.mappings[0]!.url).valid).toBe(true)
+  })
+
+  it('degrades to notCopied when the source stream exceeds the size cap (never fully buffered)', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    // DB records a small size (passes the pre-check), but the ACTUAL object is
+    // larger than the image tier cap (10MB) — a wrong/understated sizeBytes.
+    vi.mocked(query).mockResolvedValueOnce([srcAttachment] as never) // source getById
+    const cap = 10 * 1024 * 1024
+    let delivered = 0
+    // A streamed GET body: yield 1MB chunks; readCapped must abort past the cap
+    // rather than materializing the whole (oversized) object in memory.
+    const stream = {
+      getReader() {
+        return {
+          async read() {
+            if (delivered > cap + 4 * 1024 * 1024) return { done: true, value: undefined }
+            delivered += 1024 * 1024
+            return { done: false, value: new Uint8Array(1024 * 1024) }
+          },
+          releaseLock() {},
+        }
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
+      init?.method === 'PUT'
+        ? ({ ok: true, status: 200 })
+        : ({ ok: true, status: 200, headers: { get: () => null }, body: stream }),
+    ))
+
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { mappings: unknown[]; notCopied: Array<{ reason: string }> }
+    expect(body.mappings).toEqual([])
+    expect(body.notCopied[0]!.reason).toBe('copy_failed')
+    // Aborted before reading the whole object: stopped once past the cap.
+    expect(delivered).toBeLessThan(cap + 4 * 1024 * 1024)
+  })
+
+  it('rejects early on a Content-Length that already exceeds the cap', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    vi.mocked(query).mockResolvedValueOnce([srcAttachment] as never)
+    let readCalled = false
+    const stream = {
+      getReader() {
+        readCalled = true
+        return { async read() { return { done: true, value: undefined } }, releaseLock() {} }
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
+      init?.method === 'PUT'
+        ? ({ ok: true, status: 200 })
+        : ({ ok: true, status: 200, headers: { get: (h: string) => (h === 'content-length' ? String(999 * 1024 * 1024) : null) }, body: stream }),
+    ))
+
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { mappings: unknown[]; notCopied: Array<{ reason: string }> }
+    expect(body.mappings).toEqual([])
+    expect(body.notCopied[0]!.reason).toBe('copy_failed')
+    expect(readCalled).toBe(false) // rejected on the header, never read the body
+  })
+
+  it('degrades to notCopied when the caller lacks read access on the source (no leak, no abort)', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none' as never)
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { mappings: unknown[]; notCopied: Array<{ reason: string }> }
+    expect(body.mappings).toEqual([])
+    expect(body.notCopied[0]!.reason).toBe('source_forbidden')
+    expect(fetchMock).not.toHaveBeenCalled() // never fetched bytes it can't read
+  })
+
+  it('degrades to notCopied for a cross-space source (404 semantics, no existence leak)', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's_OTHER', status: 1 } as never)
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { notCopied: Array<{ reason: string }> }
+    expect(body.notCopied[0]!.reason).toBe('source_not_found')
+  })
+
+  it('re-validates the stored mime against the current denylist (a now-blocked SVG is refused)', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    vi.mocked(query).mockResolvedValueOnce([
+      { ...srcAttachment, mime: 'image/svg+xml', object_key: 'd_src/att_src/x.svg', file_name: 'x.svg' },
+    ] as never)
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { notCopied: Array<{ reason: string }> }
+    expect(body.notCopied[0]!.reason).toBe('mime_not_allowed')
+  })
+
+  it('404-style notCopied when the source attachment does not belong to the claimed source doc', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    vi.mocked(query).mockResolvedValueOnce([
+      { ...srcAttachment, doc_id: 'd_DIFFERENT' },
+    ] as never)
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    const body = res.body as { notCopied: Array<{ reason: string }> }
+    expect(body.notCopied[0]!.reason).toBe('source_not_found')
+  })
+})
+
+describe('POST attachments/ingest (external-image re-hosting)', () => {
+  // A minimal valid PNG header so sniffImageMime returns image/png.
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
+
+  beforeEach(() => {
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    vi.mocked(fetchExternalImage).mockReset()
+  })
+
+  it('rejects a non-array / empty body with 400', async () => {
+    const res = mockRes()
+    await ingestHandler(req({ docId: 'd_1' }, { urls: [] }), res as never)
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('downloads an external image, validates by magic number, stores it, returns a fresh url', async () => {
+    vi.mocked(fetchExternalImage).mockResolvedValue({ bytes: PNG, declaredContentType: 'image/png' } as never)
+    // getById after register returns the new row.
+    vi.mocked(query).mockResolvedValueOnce([] as never) // register INSERT
+    vi.mocked(query).mockResolvedValueOnce([
+      { attach_id: 'att_x', doc_id: 'd_1', object_key: 'd_1/att_x/pic.png', mime: 'image/png', size_bytes: PNG.length, file_name: 'pic.png', created_by: 'u', created_at: new Date(0) },
+    ] as never)
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200 })))
+
+    const res = mockRes()
+    await ingestHandler(req({ docId: 'd_1' }, { urls: ['https://example.com/pic.png'] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { mappings: Array<{ sourceUrl: string; url: string }>; notIngested: unknown[] }
+    expect(body.notIngested).toEqual([])
+    expect(body.mappings).toHaveLength(1)
+    expect(body.mappings[0]!.sourceUrl).toBe('https://example.com/pic.png')
+    expect(verifySignedUrl(body.mappings[0]!.url).valid).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('rejects bytes that are not a real image (magic-number sniff), keeping the URL for the caller', async () => {
+    vi.mocked(fetchExternalImage).mockResolvedValue({ bytes: Buffer.from('not an image'), declaredContentType: 'image/png' } as never)
+    const res = mockRes()
+    await ingestHandler(req({ docId: 'd_1' }, { urls: ['https://example.com/x'] }), res as never)
+    const body = res.body as { mappings: unknown[]; notIngested: Array<{ reason: string }> }
+    expect(body.mappings).toEqual([])
+    expect(body.notIngested[0]!.reason).toBe('not_an_image')
+  })
+
+  it('degrades to notIngested (never throws) when the SSRF-guarded fetch is blocked', async () => {
+    const { LinkCardError } = await import('../src/util/ssrfGuard.js')
+    vi.mocked(fetchExternalImage).mockRejectedValue(new LinkCardError('ssrf_blocked', 'blocked'))
+    const res = mockRes()
+    await ingestHandler(req({ docId: 'd_1' }, { urls: ['http://169.254.169.254/latest/meta-data'] }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { notIngested: Array<{ reason: string }> }
+    expect(body.notIngested[0]!.reason).toBe('ssrf_blocked')
   })
 })
