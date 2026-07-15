@@ -154,7 +154,7 @@ docsRouter.post('/', createDocHandler)
 export async function getDocHandler(req: Request, res: Response) {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   const { meta, role } = guard
   res.status(200).json({
@@ -353,6 +353,7 @@ docsRouter.delete('/:docId', async (req: Request, res: Response) => {
 export async function getShareHandler(req: Request, res: Response) {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', {
     isBot: req.botToken !== undefined,
+    token: req.octoToken,
   })
   if (!guard) return
   res.status(200).json({

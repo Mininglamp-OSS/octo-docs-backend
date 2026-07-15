@@ -99,7 +99,7 @@ function parseVersionId(raw: string | undefined): number | null {
 versionsRouter.get('/:docId/versions', listVersionsHandler)
 
 export async function listVersionsHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const cursorRaw = req.query.cursor
@@ -138,7 +138,7 @@ export async function listVersionsHandler(req: Request, res: Response): Promise<
 versionsRouter.post('/:docId/versions', createVersionHandler)
 
 export async function createVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
 
@@ -180,7 +180,7 @@ export async function createVersionHandler(req: Request, res: Response): Promise
 versionsRouter.get('/:docId/versions/:versionId/state', getVersionStateHandler)
 
 export async function getVersionStateHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
 
@@ -269,7 +269,7 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
 versionsRouter.patch('/:docId/versions/:versionId', renameVersionHandler)
 
 export async function renameVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const versionId = parseVersionId(req.params.versionId)
