@@ -41,7 +41,8 @@ import {
 } from '../../agent/sheetConversion.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
-import { roleAtLeast } from '../../permission/role.js'
+import { roleAtLeast, type ResolvedRole } from '../../permission/role.js'
+import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 
 export interface EditDocSheetInput {
   uid: string
@@ -59,6 +60,20 @@ export interface EditDocSheetInput {
   hyperlinks: Record<string, StoredHyperLink | null>
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
+  /**
+   * Whether the caller is a verified bot (#64). Threaded through to the
+   * under-lock effective-role recheck so a bot's space membership is taken from
+   * its server-verified space, exactly as the route guard does; humans resolve
+   * via isSpaceMember. Defaults to false so an omitted flag never over-grants.
+   */
+  isBot?: boolean
+  /**
+   * The human caller's octo session token (#64). Threaded to the under-lock
+   * effective-role recheck so a human's anyone_in_space membership resolves via
+   * verify?include=context, exactly as the route guard does. The bot path
+   * short-circuits on isBot and carries no token, so it is omitted there.
+   */
+  token?: string
 }
 
 export type EditDocSheetResult =
@@ -81,13 +96,29 @@ interface LockedMetaRow {
   owner_id: string
   permission_epoch: number
   status: number
+  // #64: share seam read FRESH under the lock so the under-lock recheck resolves
+  // the same effectiveRole as the route guard / live-socket recheck.
+  space_id: string
+  share_scope: number
+  share_role: number
 }
 
-/** Re-check the caller has at least writer under the doc_meta lock (owner => admin). */
-async function hasWriterTx(tx: Tx, docId: string, uid: string, ownerId: string): Promise<boolean> {
-  if (uid === ownerId) return true
-  const role = await docMemberRepo.getRoleTx(tx, docId, uid)
-  return role !== undefined && roleAtLeast(role, 'writer')
+/**
+ * Re-check the caller has at least writer under the doc_meta lock, applying the
+ * SAME effective-role model as the route guard and the live-socket recheck
+ * (#64): direct role (owner => admin, else doc_member) merged with the
+ * space-share-derived role, so an `anyone_in_space`/edit space member is not
+ * 403'd here after passing the route guard.
+ */
+async function hasWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<boolean> {
+  const direct: ResolvedRole =
+    uid === meta.owner_id ? 'admin' : ((await docMemberRepo.getRoleTx(tx, docId, uid)) ?? 'none')
+  const role = await resolveEffectiveRole(uid, direct, {
+    space_id: meta.space_id,
+    share_scope: Number(meta.share_scope),
+    share_role: Number(meta.share_role),
+  }, { isBot, token })
+  return roleAtLeast(role, 'writer')
 }
 
 /** Map a thrown edit-core / guard error to its HTTP status + code. */
@@ -155,14 +186,14 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     await yjsDocumentRepo.selectForUpdateTx(tx, input.documentName)
 
     const metaRows = await tx.query<LockedMetaRow>(
-      'SELECT owner_id, permission_epoch, status FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+      'SELECT owner_id, permission_epoch, status, space_id, share_scope, share_role FROM doc_meta WHERE doc_id = ? FOR UPDATE',
       [input.docId],
     )
     const meta = metaRows[0]
     if (!meta || Number(meta.status) === 0) return { ok: false as const, status: 404, error: 'not_found' }
     if (Number(meta.status) === 2) return { ok: false as const, status: 409, error: 'conflict' }
 
-    if (!(await hasWriterTx(tx, input.docId, input.uid, meta.owner_id))) {
+    if (!(await hasWriterTx(tx, input.docId, input.uid, meta, input.isBot ?? false, input.token ?? ''))) {
       return { ok: false as const, status: 403, error: 'forbidden' }
     }
     if (Number(meta.permission_epoch) !== input.authorizedEpoch) {

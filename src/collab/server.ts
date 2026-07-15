@@ -318,9 +318,11 @@ export function createServer() {
       if (ctx.permission_epoch >= watermark) return // not stale => allow (no IO)
 
       // Stale: recheck this uid's CURRENT role (singleflight + short-TTL cache).
-      const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id)
-      // commenter is intentionally rejected here: rank(commenter) < rank(writer),
+      // commenter is intentionally rejected below: rank(commenter) < rank(writer),
       // so a commenter can comment via REST but never write the doc body.
+      // #64: pass the token-carried space_member claim so a narrowed
+      // anyone_in_space scope is honored on the already-connected socket.
+      const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id, ctx.space_member)
       if (role === 'none' || !roleAtLeast(role, 'writer')) {
         // role actually dropped / revoked => reject this write & flip the conn.
         data.connection.readOnly = true

@@ -39,7 +39,7 @@ function resolveExpiresInDays(v: unknown): number {
 
 /** POST create invite (needs admin). */
 invitesRouter.post('/:docId/invites', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const { role, expiresInDays, maxUses } = req.body ?? {}
   const roleVal = parseRole(role)
@@ -67,7 +67,7 @@ invitesRouter.post('/:docId/invites', async (req: Request, res: Response) => {
 
 /** GET list active invites (needs admin). */
 invitesRouter.get('/:docId/invites', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const invites = await docInviteRepo.listActive(req.params.docId!)
   res.status(200).json({
@@ -83,7 +83,7 @@ invitesRouter.get('/:docId/invites', async (req: Request, res: Response) => {
 
 /** DELETE revoke invite (needs admin). */
 invitesRouter.delete('/:docId/invites/:inviteToken', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const invite = await docInviteRepo.get(req.params.inviteToken!)
   if (!invite || invite.doc_id !== req.params.docId!) {
