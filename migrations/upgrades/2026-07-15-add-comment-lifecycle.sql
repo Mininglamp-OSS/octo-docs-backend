@@ -18,10 +18,16 @@
 --
 -- BACKFILL: `resolved` is ambiguous against the new axis, so map it forward with
 --   the least-lossy interpretation. An old "resolved" comment is one an editor
---   ACTED ON, so it maps to `approved` (keeps it out of the default open list and
---   preserves resolved=1 under the derived rule). Open rows stay open.
+--   already ACTED ON / closed out — i.e. done — which on the new axis is the
+--   terminal `committed` state, NOT `approved`. `approved` means "queued, not yet
+--   executed": mapping resolved history there would re-queue every historical
+--   resolved comment for the agent to re-execute against the live doc body (data
+--   pollution). `committed` is terminal (no outbound transitions), kept for audit,
+--   and never re-picked up by the approved-execution pull. It also preserves the
+--   derived-mirror rule (resolved = status != open) since committed != open.
+--   Open rows stay open.
 --     resolved = 0 -> status = 0 (open)
---     resolved = 1 -> status = 1 (approved); copy resolved_by/at into
+--     resolved = 1 -> status = 3 (committed); copy resolved_by/at into
 --                     adjudicated_by/at as the audit stamp.
 --
 -- WHO NEEDS THIS: EXISTING deployments upgrading across this batch. Fresh installs
@@ -59,10 +65,12 @@ ALTER TABLE doc_comment
   MODIFY COLUMN resolved TINYINT NOT NULL DEFAULT 0
   COMMENT '遗留派生镜像（供旧客户端）：resolved = (status != open)';
 
--- Backfill: forward-map the legacy resolved flag onto the lifecycle, copying the
--- resolve stamp into the new audit columns for resolved rows.
+-- Backfill: forward-map the legacy resolved flag onto the lifecycle. A resolved
+-- comment is already done, so it lands on the terminal `committed` state (kept for
+-- audit, never re-queued for execution), copying the resolve stamp into the new
+-- audit columns.
 UPDATE doc_comment
-  SET status = 1,
+  SET status = 3,
       adjudicated_by = resolved_by,
       adjudicated_at = resolved_at
   WHERE resolved = 1;

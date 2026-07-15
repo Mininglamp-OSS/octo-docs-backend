@@ -183,7 +183,7 @@ async function resolveSceneImages(
 boardExportRouter.get('/:docId/export', exportBoardHandler)
 
 export async function exportBoardHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBoardDocType(res, guard.meta.doc_type)) return
 

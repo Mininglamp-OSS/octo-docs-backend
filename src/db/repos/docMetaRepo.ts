@@ -17,6 +17,17 @@ export interface DocMeta {
   doc_type: string
   status: number // 1=active 0=deleted 2=archived
   permission_epoch: number
+  /**
+   * Share scope (#64): 0=restricted (default), 1=anyone_in_space. A `SELECT *`
+   * carries it onto every read (getByDocId / getByDocumentName), so the
+   * effective-role path and the WS recheck see it with no query edit.
+   */
+  share_scope: number
+  /**
+   * Share role (#64) applied when share_scope=anyone_in_space: 1=read, 2=edit.
+   * Ignored when restricted (the update API normalizes it to 1 in that case).
+   */
+  share_role: number
   created_at: Date
   updated_at: Date
   created_by: string
@@ -77,6 +88,33 @@ export const docMetaRepo = {
 
   async rename(docId: string, title: string): Promise<void> {
     await query('UPDATE doc_meta SET title = ? WHERE doc_id = ?', [title, docId])
+  },
+
+  /**
+   * Update a doc's share settings (#64) AND bump permission_epoch in the SAME
+   * transaction, so a narrowing (e.g. anyone_in_space -> restricted) is atomic:
+   * the row can never be observed at its new scope with a stale epoch, which
+   * would leave live non-members editing until the next unrelated bump. Mirrors
+   * softDelete's flip-status-and-bump pattern. The caller (PUT /share handler)
+   * has already validated + normalized scopeNum/roleNum (restricted forces
+   * role=1); the migration CHECK constraints are a defense-in-depth backstop.
+   * Returns the new epoch so the caller refreshes caches + publishes the
+   * invalidation event (via refreshAndPublish), exactly like softDelete.
+   */
+  async setShareSettings(docId: string, scopeNum: number, roleNum: number): Promise<number> {
+    return transaction(async (tx) => {
+      await tx.query('UPDATE doc_meta SET share_scope = ?, share_role = ? WHERE doc_id = ?', [
+        scopeNum,
+        roleNum,
+        docId,
+      ])
+      await docMetaRepo.bumpEpochTx(tx, docId)
+      const rows = await tx.query<{ permission_epoch: number }>(
+        'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+        [docId],
+      )
+      return Number(rows[0]?.permission_epoch ?? 0)
+    })
   },
 
   /**

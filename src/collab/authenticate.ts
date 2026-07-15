@@ -38,6 +38,15 @@ export interface AuthContext {
   user: { id: string; name?: string }
   role: Role
   permission_epoch: number
+  /**
+   * (#64) Was this uid a member of the doc's Space at token issuance? Carried
+   * from the collab token's optional `space_member` claim (absent => false,
+   * fail-closed). The live-socket write recheck combines this token-carried
+   * "who the requester is in the space" fact with a FRESH DB read of the doc's
+   * share settings ("what the doc allows"), so a scope narrowing takes effect
+   * without a new membership call. See design §5.3 case 2.
+   */
+  space_member: boolean
   /** 'document' (4-seg key) or 'whiteboard' (5-seg `:wb:` key, M2). */
   kind: 'document' | 'whiteboard'
   space: string
@@ -79,7 +88,11 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
   if (claims.permission_epoch < epoch) {
     let currentRole
     try {
-      currentRole = await recheckCurrentRoleCached(documentName, claims.uid)
+      currentRole = await recheckCurrentRoleCached(
+        documentName,
+        claims.uid,
+        claims.space_member ?? false,
+      )
     } catch {
       throw unauthorized() // recheck unconfirmable => fail-closed (4401)
     }
@@ -114,6 +127,9 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     user: { id: claims.uid, ...(claims.name ? { name: claims.name } : {}) },
     role,
     permission_epoch: claims.permission_epoch,
+    // #64: carry the space-membership claim (absent => false) so the write
+    // recheck can honor the anyone_in_space scope on already-connected sockets.
+    space_member: claims.space_member ?? false,
     space: parsed.space,
     folder: parsed.folder,
   }

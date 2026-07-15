@@ -28,6 +28,15 @@ export interface CollabClaims {
    * client publishes (XIN-694). Never the identity itself — `uid` stays the id.
    */
   name?: string
+  /**
+   * (#64) Was `uid` a member of the doc's Space at issuance time? Baked in so the
+   * hot-path write recheck (beforeHandleMessage) can honor the anyone_in_space
+   * share scope without a fresh octo-server membership call. OPTIONAL: a token
+   * minted before this change carries no claim and is treated as `false`
+   * (fail-closed), exactly like the optional `name` claim. Never client-supplied
+   * — derived server-side at issuance from isSpaceMember / the bot's space.
+   */
+  space_member?: boolean
 }
 
 export interface CollabTokenResult {
@@ -61,6 +70,10 @@ export function signCollabToken(claims: CollabClaims): CollabTokenResult {
       role: claims.role,
       permission_epoch: claims.permission_epoch,
       ...(name !== undefined ? { name } : {}),
+      // Only stamp the claim when the requester IS a space member; absence is the
+      // canonical "false" so an old token (no claim) and a non-member both
+      // fail-closed on the share path (design §5.2f / O1).
+      ...(claims.space_member === true ? { space_member: true } : {}),
     },
     config.collabToken.secret,
     { algorithm: 'HS256', expiresIn: ttl },
@@ -109,11 +122,16 @@ export function verifyCollabToken(token: string): CollabClaims {
   // dropped (never a rejection reason), so an old token minted before the
   // name claim existed verifies exactly as before.
   const name = d.name
+  // space_member is optional (#64): absent / non-boolean => false (fail-closed),
+  // so a token minted before this claim existed grants no share-derived access
+  // but keeps its direct `role` (design §5.2f / O1).
+  const spaceMember = d.space_member === true
   return {
     uid,
     documentName,
     role,
     permission_epoch,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
+    ...(spaceMember ? { space_member: true } : {}),
   }
 }
