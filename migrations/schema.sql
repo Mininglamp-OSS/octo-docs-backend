@@ -208,3 +208,18 @@ CREATE TABLE doc_version (
   KEY idx_doc_ver (doc_id, id),                         -- 列表/游标分页（按 id 倒序）
   KEY idx_doc_kind (doc_id, kind, id)                   -- 按 kind 过滤（如排除 auto）
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 每用户文档浏览记录（"最近查看"，FEAT-B）。net-new 表，无历史回填。
+-- 一个 (uid, doc_id) 至多一行：重复打开走 UPSERT 刷新 viewed_at，绝不新增行（幂等去重）。
+-- uid 恒由鉴权推导（NEVER client-supplied）。文档删除/失权由查询时 JOIN 过滤兜底
+-- （见 src/db/repos/docViewHistoryRepo.ts listRecent），本表不设硬 FK、不级联删；
+-- 残留行由写入时同步保留裁剪（DOC_VIEW_RETAIN_COUNT / DOC_VIEW_RETAIN_DAYS）慢慢清。
+CREATE TABLE doc_view_history (
+  uid        VARCHAR(64) NOT NULL,               -- 查看者 uid（鉴权推导）
+  doc_id     VARCHAR(64) NOT NULL,               -- 被查看文档（doc_meta.doc_id）
+  space_id   VARCHAR(64) NOT NULL,               -- 记录时所属 space（X-Space-Id 强作用域）
+  viewed_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                                    ON UPDATE CURRENT_TIMESTAMP(3), -- 最近一次查看时间
+  PRIMARY KEY (uid, doc_id),                      -- 去重键：每个(用户,文档)至多一行
+  KEY idx_uid_space_viewed (uid, space_id, viewed_at) -- 主查询：某用户某 space 内 viewed_at DESC + keyset
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

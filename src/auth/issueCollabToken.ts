@@ -20,6 +20,8 @@ import { signCollabToken, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
+import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
+import { config } from '../config/env.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -80,6 +82,26 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).
   const role = await resolveRole(uid, meta.doc_id)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
+
+  // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
+  // read-only INCLUDED — passes through here, so this is the reliable "open ==
+  // viewed" seam even if the front-end never calls POST /docs/{id}/view. We now
+  // hold a trusted uid + doc_id + space_id + role(!=none), everything the UPSERT
+  // needs. Best-effort: fire-and-forget (never awaited) so it can't slow or fail
+  // token issuance, and a failure only warns. It shares the (uid, doc_id) PK with
+  // the explicit endpoint, so a front-end that ALSO calls view never double-counts.
+  void docViewHistoryRepo
+    .upsertViewWithPrune({
+      uid,
+      docId: meta.doc_id,
+      spaceId: meta.space_id,
+      retainCount: config.docView.retainCount,
+      retainDays: config.docView.retainDays,
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[octo-docs] recent-view fallback ingest failed for ${meta.doc_id}:`, err)
+    })
 
   // Sign with the document's current epoch (§4.4 / §4.5). The token carries the
   // exact connection documentName (incl. the `:wb:` whiteboard form) so the WS
