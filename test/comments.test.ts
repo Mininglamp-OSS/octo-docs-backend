@@ -102,6 +102,29 @@ function mockInsertId(id: number) {
     fn({ query: txQuery })) as never)
 }
 
+/**
+ * Wire the transaction() mock for setStatus's atomic path: inside the tx, the
+ * SELECT ... FOR UPDATE reads the current status and the guarded UPDATE writes.
+ * We delegate tx.query to the same `query` mock so existing assertions that
+ * inspect the UPDATE call still work; the SELECT returns [{ status: fromNum }]
+ * and the UPDATE returns a ResultSetHeader stub with the given affectedRows
+ * (1 = row moved, 0 = lost the compare-and-swap race).
+ */
+function mockSetStatusTx(fromNum: number, updateAffectedRows = 1) {
+  vi.mocked(transaction).mockImplementation((async (fn: (tx: unknown) => unknown) => {
+    const tx = {
+      async query(sql: string, params?: unknown[]) {
+        if (String(sql).includes('FOR UPDATE')) return [{ status: fromNum }]
+        // Route the UPDATE through the `query` mock so call-arg assertions hold,
+        // then hand back a header carrying affectedRows.
+        await vi.mocked(query)(sql, params as never[])
+        return { affectedRows: updateAffectedRows } as unknown
+      },
+    }
+    return fn(tx)
+  }) as never)
+}
+
 /** A stored thread root row (snake_case, as mysql2 returns it). */
 function rootRow(over: Record<string, unknown> = {}) {
   return {
@@ -545,9 +568,10 @@ describe('PATCH adjudicate / body edit', () => {
   })
 
   it('approves a thread for a writer, stamps adjudicated_by + status, and mirrors resolved', async () => {
-    // getById is read twice on this path: once by the handler, once inside
-    // setStatus to validate the transition. Return the open root for both reads.
+    // Route getById reads the open root; setStatus's atomic tx re-reads it under
+    // FOR UPDATE and writes the guarded UPDATE.
     vi.mocked(query).mockResolvedValue([rootRow({ status: 0 })] as never)
+    mockSetStatusTx(0)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     const res = mockRes()
     await patchCommentHandler(
@@ -559,11 +583,12 @@ describe('PATCH adjudicate / body edit', () => {
     expect(update).toBeTruthy()
     // status=approved(1), adjudicated_by=uid, note threaded, resolved mirror set.
     expect(String(update![0])).toContain('resolved = 1')
-    expect(update![1]).toEqual([1, 'u_writer', 'lgtm', 'u_writer', 10])
+    expect(update![1]).toEqual([1, 'u_writer', 'lgtm', 'u_writer', 10, 0])
   })
 
   it('legacy { resolved: true } still works -> status becomes approved', async () => {
     vi.mocked(query).mockResolvedValue([rootRow({ status: 0 })] as never)
+    mockSetStatusTx(0)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     const res = mockRes()
     await patchCommentHandler(
@@ -578,6 +603,7 @@ describe('PATCH adjudicate / body edit', () => {
 
   it('legacy { resolved: false } reopens -> status becomes open (clears resolved mirror)', async () => {
     vi.mocked(query).mockResolvedValue([rootRow({ status: 1 })] as never)
+    mockSetStatusTx(1)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     const res = mockRes()
     await patchCommentHandler(
@@ -592,6 +618,7 @@ describe('PATCH adjudicate / body edit', () => {
 
   it('rejects an unknown status string with 400', async () => {
     vi.mocked(query).mockResolvedValue([rootRow({ status: 0 })] as never)
+    mockSetStatusTx(0)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     const res = mockRes()
     await patchCommentHandler(
@@ -624,6 +651,7 @@ describe('PATCH adjudicate / body edit', () => {
   ] as const)('allows valid transition %s -> %s', async (from, to) => {
     const fromNum = { open: 0, approved: 1, rejected: 2, committed: 3 }[from]
     vi.mocked(query).mockResolvedValue([rootRow({ status: fromNum })] as never)
+    mockSetStatusTx(fromNum)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     const res = mockRes()
     await patchCommentHandler(
@@ -644,6 +672,7 @@ describe('PATCH adjudicate / body edit', () => {
   ] as const)('rejects invalid transition %s -> %s with 400 invalid_transition', async (from, to) => {
     const fromNum = { open: 0, approved: 1, rejected: 2, committed: 3 }[from]
     vi.mocked(query).mockResolvedValue([rootRow({ status: fromNum })] as never)
+    mockSetStatusTx(fromNum)
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     const res = mockRes()
     await patchCommentHandler(
@@ -654,9 +683,51 @@ describe('PATCH adjudicate / body edit', () => {
     expect((res.body as { error: string }).error).toBe('invalid_transition')
   })
 
+  // A concurrent adjudicator can win the compare-and-swap first: the FOR UPDATE
+  // read still sees `approved`, but the guarded UPDATE matches 0 rows because
+  // the row already moved. setStatus must surface that as invalid_transition,
+  // NOT a silent 200 — this is what keeps `committed` terminal under a race
+  // (competing approved->committed vs approved->open can no longer land the row
+  // on the loser's target).
+  it('rejects a lost compare-and-swap race (0 rows updated) as 400 invalid_transition', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ status: 1 })] as never) // approved
+    mockSetStatusTx(1, 0) // FOR UPDATE sees approved, but UPDATE matches 0 rows
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '10' }, body: { status: 'committed' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_transition')
+    // The transition ran inside a transaction (atomic read+guarded write), not a
+    // bare query read-then-write.
+    expect(vi.mocked(transaction)).toHaveBeenCalled()
+  })
+
+  // The guarded UPDATE must re-assert the status we validated against, so a
+  // stale read cannot drive a forbidden write. Confirm the SQL carries the
+  // `status = ?` guard bound to the from-status.
+  it('makes the status UPDATE a compare-and-swap guarded on the from-status', async () => {
+    vi.mocked(query).mockResolvedValue([rootRow({ status: 1 })] as never) // approved
+    mockSetStatusTx(1)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_writer', params: { docId: 'd_1', id: '10' }, body: { status: 'committed' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
+    expect(update).toBeTruthy()
+    // WHERE id = ? AND status = ? — the last bound param is the from-status (1).
+    expect(String(update![0])).toContain('status = ?')
+    expect(update![1]![update![1]!.length - 1]).toBe(1)
+  })
+
   it('requires the author to edit the body', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
     const res = mockRes()
     await patchCommentHandler(
       req({ uid: 'u_other', params: { docId: 'd_1', id: '10' }, body: { body: 'hijack' } }),
@@ -665,9 +736,9 @@ describe('PATCH adjudicate / body edit', () => {
     expect(res.statusCode).toBe(403)
   })
 
-  it('lets the author edit the body', async () => {
+  it('lets the author edit the body of an OPEN comment', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
     const res = mockRes()
     await patchCommentHandler(
       req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'edited' } }),
@@ -676,6 +747,29 @@ describe('PATCH adjudicate / body edit', () => {
     expect(res.statusCode).toBe(200)
     const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET body = ?'))
     expect(update).toBeTruthy()
+  })
+
+  // Body of an adjudicated comment is part of the audit trail (留痕): a reviewer
+  // approved *that* text. The author must not be able to silently rewrite it
+  // afterwards, or the adjudication record would lie. Applies to every
+  // non-open status.
+  it.each([
+    ['approved', 1],
+    ['rejected', 2],
+    ['committed', 3],
+  ] as const)('409s the author editing the body of a %s comment', async (_label, statusNum) => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: statusNum })] as never)
+    const res = mockRes()
+    await patchCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' }, body: { body: 'rewrite' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('comment_not_editable')
+    // No body write happened.
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET body = ?'))
+    expect(update).toBeFalsy()
   })
 
   it('404s a cross-doc comment id (no leak)', async () => {
@@ -691,9 +785,9 @@ describe('PATCH adjudicate / body edit', () => {
 })
 
 describe('DELETE soft / hard', () => {
-  it('lets the author soft-delete their own comment', async () => {
+  it('lets the author soft-delete their own OPEN comment', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
     const res = mockRes()
     await deleteCommentHandler(
       req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
@@ -704,9 +798,32 @@ describe('DELETE soft / hard', () => {
     expect(update).toBeTruthy()
   })
 
+  // An adjudicated root belongs to the audit trail (留痕), not the author: letting
+  // an author soft-delete a `committed` row (proof a change was applied to the
+  // live doc) would erase it from every listing (reads filter deleted = 0) with
+  // no writer/admin involvement. Removing a decided comment is an admin-gated
+  // hard delete, not an author action.
+  it.each([
+    ['approved', 1],
+    ['rejected', 2],
+    ['committed', 3],
+  ] as const)('409s the author soft-deleting a %s comment', async (_label, statusNum) => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: statusNum })] as never)
+    const res = mockRes()
+    await deleteCommentHandler(
+      req({ uid: 'u_author', params: { docId: 'd_1', id: '10' } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('comment_not_deletable')
+    const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET deleted = 1'))
+    expect(update).toBeFalsy()
+  })
+
   it('rejects a soft delete by a non-author', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author' })] as never)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ author_uid: 'u_author', status: 0 })] as never)
     const res = mockRes()
     await deleteCommentHandler(
       req({ uid: 'u_other', params: { docId: 'd_1', id: '10' } }),
@@ -1017,12 +1134,13 @@ describe('docCommentRepo (§3.4)', () => {
 
   it('setStatus enforces the transition table and throws on an invalid move', async () => {
     // committed is terminal: committed -> open must throw (no UPDATE issued).
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 10, status: 3 })] as never)
+    // The atomic path reads the current status under FOR UPDATE inside the tx.
+    mockSetStatusTx(3) // committed
     await expect(docCommentRepo.setStatus(10, 'open', 'u_w')).rejects.toThrow(InvalidTransitionError)
   })
 
   it('setResolved shim maps true->approved / false->open through setStatus', async () => {
-    vi.mocked(query).mockResolvedValue([rootRow({ id: 10, status: 0 })] as never)
+    mockSetStatusTx(0) // open
     await docCommentRepo.setResolved(10, true, 'u_w')
     const update = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('SET status = ?'))
     expect(update).toBeTruthy()

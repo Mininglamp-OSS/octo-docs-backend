@@ -49,6 +49,11 @@ ALTER TABLE doc_comment
     AFTER adjudicated_at,
   ADD KEY idx_doc_status (doc_id, status, deleted, id);
 
+-- status 只能取 4 态生命周期的合法值（与 schema.sql 的 chk_doc_comment_status 对齐）。
+-- 一个漂移/越界的存储值会经 statusFromNumber(...) ?? 'open' 静默读成 open，CHECK 是最后防线。
+ALTER TABLE doc_comment
+  ADD CONSTRAINT chk_doc_comment_status CHECK (status BETWEEN 0 AND 3);
+
 -- Refresh the legacy column comment to note it is now a derived mirror.
 ALTER TABLE doc_comment
   MODIFY COLUMN resolved TINYINT NOT NULL DEFAULT 0
@@ -62,6 +67,5 @@ UPDATE doc_comment
       adjudicated_at = resolved_at
   WHERE resolved = 1;
 
-UPDATE doc_comment
-  SET status = 0
-  WHERE resolved = 0;
+-- Note: rows with resolved = 0 already have status = 0 from the ADD COLUMN
+-- DEFAULT 0 above, so no separate open backfill is needed.

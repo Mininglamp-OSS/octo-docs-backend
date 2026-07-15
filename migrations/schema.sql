@@ -193,7 +193,10 @@ CREATE TABLE doc_comment (
     (parent_id IS NULL AND anchor_start IS NOT NULL AND anchor_end IS NOT NULL)
     OR
     (parent_id IS NOT NULL AND anchor_start IS NULL AND anchor_end IS NULL)
-  )
+  ),
+  -- status 只能取 4 态生命周期的合法值（0=open 1=approved 2=rejected 3=committed）。
+  -- 代码层也强制此规则，CHECK 作为最后一道防线：挡住越界/漂移值经 statusFromNumber(...) ?? 'open' 静默读成 open。
+  CONSTRAINT chk_doc_comment_status CHECK (status BETWEEN 0 AND 3)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 版本历史（快照 + 恢复，见 §4 feature #4）。每条记录是某一时刻文档的完整 Yjs

@@ -427,6 +427,15 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
       res.status(403).json({ error: 'forbidden' })
       return
     }
+    // Once a root has been adjudicated (approved/rejected/committed), its text is
+    // part of the audit trail (留痕): a reviewer approved *that* text. Letting the
+    // author silently rewrite the body afterwards would make the adjudication
+    // record lie (adjudicated_by/at still stamp the old decision). Only an `open`
+    // comment — not yet decided — may still have its body edited.
+    if (comment.status !== 'open') {
+      res.status(409).json({ error: 'comment_not_editable' })
+      return
+    }
     if (typeof body !== 'string' || body.trim() === '') {
       res.status(400).json({ error: 'body required' })
       return
@@ -476,6 +485,16 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
   // Soft delete — only the author can remove their own comment.
   if (comment.authorUid !== req.uid) {
     res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  // An adjudicated root (approved/rejected/committed) belongs to the audit trail
+  // (留痕), not the author: letting an author soft-delete a `committed` row — the
+  // proof a change was applied to the live doc — would erase it from every
+  // listing (all reads filter deleted = 0) with no writer/admin involvement.
+  // Only an `open` (undecided) comment may be author-removed; removing a decided
+  // one is a moderator action (hard delete, admin-gated above).
+  if (comment.status !== 'open') {
+    res.status(409).json({ error: 'comment_not_deletable' })
     return
   }
   await docCommentRepo.softDelete(id)

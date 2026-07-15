@@ -10,6 +10,7 @@
  * snake_case -> camelCase in the typed return (see DocComment).
  */
 import { query, transaction } from '../pool.js'
+import type { ResultSetHeader } from 'mysql2'
 import {
   type Status,
   statusFromNumber,
@@ -236,36 +237,58 @@ export const docCommentRepo = {
    * transition or a missing root.
    */
   async setStatus(id: number, toStatus: Status, byUid: string, note = ''): Promise<void> {
-    const current = await this.getById(id)
-    if (!current) throw new InvalidTransitionError('open', toStatus)
-    if (current.status === toStatus) {
-      // No-op transition: not in the allowed table, but harmless. Treat setting a
-      // root to its current status as invalid to keep the state machine strict.
-      throw new InvalidTransitionError(current.status, toStatus)
-    }
-    if (!canTransition(current.status, toStatus)) {
-      throw new InvalidTransitionError(current.status, toStatus)
-    }
-    const resolved = toStatus !== 'open'
-    if (resolved) {
-      await query(
-        `UPDATE doc_comment
-           SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
-               adjudication_note = ?, resolved = 1, resolved_by = ?, resolved_at = CURRENT_TIMESTAMP(3)
-         WHERE id = ?`,
-        [statusToNumber(toStatus), byUid, note, byUid, id],
+    // Read + validate + write must be ONE atomic step, or two concurrent
+    // adjudicators can both read the same `from` status, both pass
+    // canTransition, and both write — the later writer can land the row on a
+    // status the earlier writer's transition already left (e.g. one does
+    // approved->committed, the other approved->open, final row = open, i.e. the
+    // forbidden committed->open reached via a stale read). We close the window
+    // by (a) locking the row FOR UPDATE inside a transaction and (b) making the
+    // UPDATE a compare-and-swap guarded on the `from` status we validated
+    // against; a 0-row result means someone moved it first -> InvalidTransition.
+    await transaction(async (tx) => {
+      const rows = await tx.query<{ status: number }>(
+        'SELECT status FROM doc_comment WHERE id = ? FOR UPDATE',
+        [id],
       )
-    } else {
-      // Reopen: clear the legacy resolved mirror, but keep the adjudication
-      // stamp as the audit trail of who last acted (留痕).
-      await query(
-        `UPDATE doc_comment
-           SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
-               adjudication_note = ?, resolved = 0, resolved_by = NULL, resolved_at = NULL
-         WHERE id = ?`,
-        [statusToNumber(toStatus), byUid, note, id],
-      )
-    }
+      const row = rows[0]
+      if (!row) throw new InvalidTransitionError('open', toStatus)
+      const fromStatus = statusFromNumber(row.status) ?? 'open'
+      if (fromStatus === toStatus) {
+        // No-op transition: not in the allowed table. Treat setting a root to its
+        // current status as invalid to keep the state machine strict.
+        throw new InvalidTransitionError(fromStatus, toStatus)
+      }
+      if (!canTransition(fromStatus, toStatus)) {
+        throw new InvalidTransitionError(fromStatus, toStatus)
+      }
+      const fromNum = statusToNumber(fromStatus)
+      const resolved = toStatus !== 'open'
+      const result = resolved
+        ? await tx.query<ResultSetHeader>(
+            `UPDATE doc_comment
+               SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
+                   adjudication_note = ?, resolved = 1, resolved_by = ?, resolved_at = CURRENT_TIMESTAMP(3)
+             WHERE id = ? AND status = ?`,
+            [statusToNumber(toStatus), byUid, note, byUid, id, fromNum],
+          )
+        : // Reopen: clear the legacy resolved mirror, but keep the adjudication
+          // stamp as the audit trail of who last acted (留痕).
+          await tx.query<ResultSetHeader>(
+            `UPDATE doc_comment
+               SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
+                   adjudication_note = ?, resolved = 0, resolved_by = NULL, resolved_at = NULL
+             WHERE id = ? AND status = ?`,
+            [statusToNumber(toStatus), byUid, note, id, fromNum],
+          )
+      // The FOR UPDATE lock plus the `status = fromNum` guard make this belt-and-
+      // suspenders, but keep the guard so a lost update surfaces as an invalid
+      // transition rather than a silent no-op.
+      const header = result as unknown as ResultSetHeader
+      if (header.affectedRows === 0) {
+        throw new InvalidTransitionError(fromStatus, toStatus)
+      }
+    })
   },
 
   /**
