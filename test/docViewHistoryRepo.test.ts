@@ -118,16 +118,16 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
 })
 
 describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', () => {
-  it('filters at query time on status=1 + the owner/member/space-share visibility predicate', async () => {
+  it('filters at query time on status=1 + the owner/member/space-share visibility predicate (member)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', isSpaceMember: true, pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     // this — NOT pruning — is what makes revoked/deleted/archived docs vanish.
     expect(itemsSql).toContain('m.status = 1')
-    // Write/read symmetry (#64): the read predicate now also recognizes the
-    // space-scoped share source, so an anyone_in_space doc a Space member opened
-    // (written by POST /view's effectiveRole guard) is no longer dropped here.
+    // Write/read symmetry (#64): for a CONFIRMED member the read predicate also
+    // recognizes the space-scoped share source, so an anyone_in_space doc a member
+    // opened (written by POST /view's effectiveRole guard) is no longer dropped.
     expect(itemsSql).toContain(
       '(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = 1 AND m.space_id = v.space_id))',
     )
@@ -147,10 +147,10 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     expect(countSql).toContain('COUNT(*)')
   })
 
-  it('CROSS-SPACE ISOLATION: the share branch is same-space-guarded and never leaks another space', async () => {
+  it('CROSS-SPACE ISOLATION: the share branch is same-space-guarded and never leaks another space (member)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', isSpaceMember: true, pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     const itemsParams = mockQuery.mock.calls.at(-1)![1] as unknown[]
     // The recent query is pinned to ONE space: v.space_id = ? bound to the caller's
@@ -163,6 +163,24 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     // via a stray view row — that is the cross-space leak this guard forbids.
     expect(itemsSql).toContain('m.share_scope = 1 AND m.space_id = v.space_id')
     expect(itemsSql).not.toMatch(/OR\s+m\.share_scope = 1\s*\)/) // never unguarded
+  })
+
+  it('CROSS-SPACE GATE: a NON-member never gets the share branch at all — visibility is owner OR doc_member (XIN-1295)', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
+    mockQuery.mockResolvedValueOnce([] as never) // items
+    // v.space_id pins the query to the caller-named space, but naming a space does
+    // not make the caller a member of it. Symmetric with the write side
+    // (resolveEffectiveRole -> isSpaceMember): an unconfirmed member must NOT read
+    // that space's anyone_in_space docs, even via a residual view row.
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', isSpaceMember: false, pageSize: 20 })
+    const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
+    expect(itemsSql).not.toContain('share_scope')
+    expect(itemsSql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+    // isSpaceMember omitted (undefined) is fail-closed too: no share branch.
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
+    mockQuery.mockResolvedValueOnce([] as never)
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', pageSize: 20 })
+    expect(mockQuery.mock.calls.at(-1)![0] as string).not.toContain('share_scope')
   })
 
   it('fetches pageSize+1 (inlined LIMIT) and derives nextCursor from the last kept row', async () => {
@@ -283,21 +301,31 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
 })
 
 describe('docViewHistoryRepo.listCreators — pre-facet distinct owners', () => {
-  it('returns DISTINCT owners under q + query-time permission filter, WITHOUT the creator filter', async () => {
+  it('returns DISTINCT owners under q + query-time permission filter, WITHOUT the creator filter (member)', async () => {
     mockQuery.mockResolvedValueOnce([{ owner_id: 'u_a' }, { owner_id: 'u_b' }] as never)
-    const out = await docViewHistoryRepo.listCreators({ uid: 'u_1', spaceId: 's1', q: 'spec' })
+    const out = await docViewHistoryRepo.listCreators({ uid: 'u_1', spaceId: 's1', isSpaceMember: true, q: 'spec' })
     const sql = mockQuery.mock.calls.at(-1)![0] as string
     expect(sql).toContain('SELECT DISTINCT m.owner_id')
     expect(sql).toContain('m.status = 1')
     // Creator facet must share listRecent's visibility, including the space-share
-    // branch, so a shared-doc owner shows up in the filter dropdown too — and it
-    // stays same-space-guarded (no cross-space leak into the facet).
+    // branch for a member, so a shared-doc owner shows up in the filter dropdown too
+    // — and it stays same-space-guarded (no cross-space leak into the facet).
     expect(sql).toContain(
       '(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = 1 AND m.space_id = v.space_id))',
     )
     expect(sql).toContain("LIKE ? ESCAPE '\\\\'") // respects q
     expect(sql).not.toContain('owner_id IN') // NOT the creator filter
     expect(out).toEqual(['u_a', 'u_b'])
+  })
+
+  it('CROSS-SPACE GATE: a NON-member creator facet drops the share branch (XIN-1295)', async () => {
+    mockQuery.mockResolvedValueOnce([] as never)
+    await docViewHistoryRepo.listCreators({ uid: 'u_1', spaceId: 's1', isSpaceMember: false, q: 'spec' })
+    const sql = mockQuery.mock.calls.at(-1)![0] as string
+    // Same asymmetry fix as listRecent: no share source in the facet for a
+    // non-member, so a share-only doc's owner never leaks into the dropdown.
+    expect(sql).not.toContain('share_scope')
+    expect(sql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
   })
 })
 

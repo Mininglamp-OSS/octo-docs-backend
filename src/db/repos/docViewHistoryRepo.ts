@@ -80,24 +80,34 @@ function escapeLike(s: string): string {
 
 /**
  * Read-side visibility predicate for the recent-view queries. Mirrors the WRITE
- * side (POST /view -> requireDocRole -> effectiveRole): a doc is visible when the
- * caller is the owner, holds a doc_member row, OR the doc is space-scoped-shared
- * (share_scope = anyone_in_space) and lives in the SAME space as the view record.
+ * side (POST /view -> requireDocRole -> resolveEffectiveRole): a doc is visible
+ * when the caller is the owner, holds a doc_member row, OR the doc is
+ * space-scoped-shared (share_scope = anyone_in_space) and lives in the SAME space
+ * as the view record.
  *
- * The `m.share_scope = ${SHARE_SCOPE_ANYONE}` branch closes the write/read gap
- * from #64: before it, an anyone_in_space doc a Space member opened was written to
- * doc_view_history (the write guard honors the share) but silently dropped here
- * because the caller had no owner/doc_member row.
+ * The space-share branch is gated on `isSpaceMember` — the SAME membership check
+ * the write side runs (resolveEffectiveRole -> isSpaceMember(uid, space, token)).
+ * `v.space_id = ?` in the surrounding WHERE only pins the query to a space the
+ * CALLER named (the unverified X-Space-Id header); it does NOT prove the caller
+ * belongs to it. Without the membership gate a non-member could name another
+ * space and read its anyone_in_space docs via a stray view row — the cross-space
+ * metadata leak this predicate closes. When the caller is NOT a confirmed member
+ * of the queried space, the share branch is dropped entirely, so visibility
+ * collapses to owner OR doc_member (the pre-#64 behavior) and no share-only doc
+ * of that space is ever returned.
  *
- * Cross-space isolation is preserved, not relaxed: the surrounding WHERE already
- * pins `v.space_id = ?` (the view record's space = the queried space), and the
- * `m.space_id = v.space_id` conjunct requires the doc's HOME space to equal that
- * same space. A doc shared in another space therefore never leaks in — the share
- * branch only ever grants access WITHIN the one queried space. SHARE_SCOPE_ANYONE
- * is a numeric module constant, inlined (not bound) so the positional bind arrays
- * stay unchanged; it carries no injection surface.
+ * When the caller IS a member, the branch is added but stays same-space-guarded:
+ * `m.space_id = v.space_id` requires the doc's HOME space to equal the view
+ * record's space, so a doc shared in a DIFFERENT space never leaks in even for a
+ * member. SHARE_SCOPE_ANYONE is a numeric module constant, inlined (not bound),
+ * and the branch adds no positional bind, so the bind arrays are identical in
+ * both forms and paging stays stable; it carries no injection surface.
  */
-const VISIBILITY_PREDICATE = `(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
+function visibilityPredicate(isSpaceMember: boolean): string {
+  return isSpaceMember
+    ? `(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
+    : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+}
 
 export const docViewHistoryRepo = {
   /**
@@ -175,6 +185,7 @@ export const docViewHistoryRepo = {
   async listRecent(params: {
     uid: string
     spaceId: string
+    isSpaceMember?: boolean
     q?: string
     creators?: string[]
     types?: string[]
@@ -186,7 +197,9 @@ export const docViewHistoryRepo = {
 
     // WHERE fragments + binds, assembled in positional order. The role CASE and
     // the doc_member join both bind :uid, so the leading binds are (uid, uid, spaceId).
-    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', VISIBILITY_PREDICATE]
+    // The visibility predicate binds exactly one trailing uid whether or not the
+    // space-share branch is present, so the membership gate never shifts the args.
+    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', visibilityPredicate(params.isSpaceMember === true)]
     // filter binds follow the base binds; the base binds are added when building `args`.
     const filterArgs: unknown[] = []
 
@@ -259,8 +272,8 @@ export const docViewHistoryRepo = {
    * full distinct owner set BEFORE the creator facet is applied. Name resolution
    * is done by the caller (route), which holds the octo session token.
    */
-  async listCreators(params: { uid: string; spaceId: string; q?: string }): Promise<string[]> {
-    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', VISIBILITY_PREDICATE]
+  async listCreators(params: { uid: string; spaceId: string; isSpaceMember?: boolean; q?: string }): Promise<string[]> {
+    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', visibilityPredicate(params.isSpaceMember === true)]
     const args: unknown[] = [params.uid, params.spaceId, params.uid]
     const q = (params.q ?? '').trim()
     if (q !== '') {

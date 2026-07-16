@@ -63,15 +63,15 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
     expect(countParams).toEqual(['u_1', 's_scope', 'f_1', 'u_1'])
   })
 
-  it('CROSS-SPACE ISOLATION: the #64 space-share branch never escapes the space scope', async () => {
-    // The shared-with-me list surfaces anyone_in_space docs (share_scope = 1), but
-    // ONLY within the caller's space: the unconditional `m.space_id = ?` filter
-    // (bound to the requested space) applies to EVERY row, share-visible ones
-    // included. So a doc shared as anyone_in_space in ANOTHER space is never in the
-    // result set. The share branch also adds no positional bind, so paging stays
-    // stable (verified by the bind-order test above).
+  it('CROSS-SPACE ISOLATION: the #64 space-share branch never escapes the space scope (member)', async () => {
+    // For a CONFIRMED space member the shared-with-me list surfaces anyone_in_space
+    // docs (share_scope = 1), but ONLY within the caller's space: the unconditional
+    // `m.space_id = ?` filter (bound to the requested space) applies to EVERY row,
+    // share-visible ones included. So a doc shared as anyone_in_space in ANOTHER
+    // space is never in the result set. The share branch also adds no positional
+    // bind, so paging stays stable (verified by the bind-order test above).
     await docMetaRepo.listForUser({
-      uid: 'u_1', spaceId: 's_trident', page: 1, pageSize: 10, sort: 'updatedAt:desc',
+      uid: 'u_1', spaceId: 's_trident', isSpaceMember: true, page: 1, pageSize: 10, sort: 'updatedAt:desc',
     })
     for (const call of mockQuery.mock.calls) {
       const sql = call[0] as string
@@ -83,5 +83,27 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
       // of the AND-ed space filter — it can only ever match docs already in-space.
       expect(sql).toContain('OR m.share_scope = 1')
     }
+  })
+
+  it('CROSS-SPACE GATE: a NON-member never gets the space-share branch, so no share-only doc leaks (XIN-1295)', async () => {
+    // req.spaceId is an UNVERIFIED header — being able to name a space does not make
+    // the caller a member. Symmetric with the write side (resolveEffectiveRole ->
+    // isSpaceMember): a non-member must not read another space's anyone_in_space doc
+    // metadata. When membership is not confirmed, the share branch is dropped and
+    // the bind array is byte-identical to the member case (share adds no bind).
+    await docMetaRepo.listForUser({
+      uid: 'u_1', spaceId: 's_trident', isSpaceMember: false, page: 1, pageSize: 10, sort: 'updatedAt:desc',
+    })
+    for (const call of mockQuery.mock.calls) {
+      const sql = call[0] as string
+      const params = (call[1] ?? []) as unknown[]
+      expect(sql).toMatch(/m\.space_id = \? AND/)
+      expect(params).toContain('s_trident')
+      // NO share branch: the visibility predicate is owner OR doc_member only.
+      expect(sql).not.toContain('share_scope')
+      expect(sql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+    }
+    // paging binds unchanged vs the member case (share branch carries no bind).
+    expect((mockQuery.mock.calls[0]![1] ?? []) as unknown[]).toEqual(['u_1', 's_trident', 'u_1'])
   })
 })

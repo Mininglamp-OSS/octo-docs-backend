@@ -31,6 +31,7 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     verifyBot: async () => null,
     getUser: async (): Promise<OctoUser | null> => null,
     getUsers: async (): Promise<OctoUser[]> => [],
+    isSpaceMember: async () => false,
     ...overrides,
   }
 }
