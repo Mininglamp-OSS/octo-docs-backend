@@ -266,6 +266,22 @@ export async function listRecentHandler(req: Request, res: Response) {
     }
     throw err
   }
+  // Resolve the last-editor (updated_by) display names server-side so the
+  // front-end (XIN-1236 merged-view) can render "<name> 更新于 <time>" without a
+  // second round-trip — mirrors the creators handler's name resolution. Batch the
+  // distinct non-empty uids through one directory call, authenticated with the
+  // caller's own token; a uid that fails to resolve falls back to its own value.
+  // updated_by is '' for a doc that has never been edited (schema DEFAULT ''),
+  // which maps to updatedBy: null so the client can hide the editor line.
+  const editorIds = [...new Set(result.items.map((d) => d.updated_by).filter((id) => id !== ''))]
+  const editorNameByUid = new Map<string, string>()
+  if (editorIds.length > 0) {
+    const users = await getOctoIdentity().getUsers(editorIds, req.octoToken)
+    for (const u of users) {
+      const name = typeof u.name === 'string' ? u.name.trim() : ''
+      if (name !== '') editorNameByUid.set(u.uid, name)
+    }
+  }
   res.status(200).json({
     total: result.total,
     items: result.items.map((d) => ({
@@ -275,6 +291,10 @@ export async function listRecentHandler(req: Request, res: Response) {
       docType: d.doc_type,
       role: roleName(Number(d.role)),
       updatedAt: d.updated_at,
+      updatedBy:
+        d.updated_by === ''
+          ? null
+          : { uid: d.updated_by, name: editorNameByUid.get(d.updated_by) ?? d.updated_by },
       viewedAt: new Date(d.viewed_at).toISOString(),
     })),
     nextCursor: result.nextCursor,

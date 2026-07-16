@@ -129,6 +129,19 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     expect(itemsSql).toMatch(/ORDER BY v\.viewed_at DESC, v\.doc_id DESC/)
   })
 
+  it('selects the last-editor uid (m.updated_by) alongside the existing doc_meta columns (XIN-1240)', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
+    mockQuery.mockResolvedValueOnce([] as never) // items
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 20 })
+    const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
+    // additive: updated_by joins the existing SELECT list, next to updated_at.
+    expect(itemsSql).toContain('m.updated_by')
+    expect(itemsSql).toContain('m.updated_at') // existing column not dropped
+    // the COUNT query is unaffected (no per-row column in the aggregate).
+    const countSql = mockQuery.mock.calls[0]![0] as string
+    expect(countSql).toContain('COUNT(*)')
+  })
+
   it('fetches pageSize+1 (inlined LIMIT) and derives nextCursor from the last kept row', async () => {
     const rows = Array.from({ length: 3 }, (_, i) => ({
       doc_id: `d_${i}`, title: `T${i}`, owner_id: 'u_o', doc_type: 'doc', role: 1,
