@@ -12,8 +12,35 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+/**
+ * Query surface the runner drives. IMPORTANT: every call must land on the SAME
+ * MySQL connection for the run — `GET_LOCK`/`RELEASE_LOCK` are session-scoped, so
+ * a `db` backed by a bare pool (which hands out an arbitrary connection per call)
+ * would acquire the lock on one connection and release it on another (a no-op),
+ * defeating the advisory lock. Build one via `connectionMigrationDb()` over a
+ * single dedicated `pool.getConnection()`.
+ */
 export interface MigrationDb {
   query(sql: string, params?: unknown[]): Promise<unknown>
+}
+
+/** A single MySQL connection: `query` returns mysql2's `[rows, fields]` tuple. */
+export interface MigrationConnection {
+  query(sql: string, params?: unknown[]): Promise<[unknown, unknown]>
+}
+
+/**
+ * Bind a {@link MigrationDb} to one dedicated connection so the advisory lock,
+ * every migration statement, and the release all execute on the same MySQL
+ * session — the affinity `GET_LOCK`/`RELEASE_LOCK` require to work.
+ */
+export function connectionMigrationDb(conn: MigrationConnection): MigrationDb {
+  return {
+    async query(sql, params) {
+      const [result] = await conn.query(sql, params)
+      return result
+    },
+  }
 }
 
 export interface MigrationFile {
@@ -51,18 +78,76 @@ export async function loadMigrationFiles(dir: string): Promise<MigrationFile[]> 
 }
 
 /**
+ * Strip SQL comments from a single line, tracking C-style block-comment state
+ * across lines and respecting string/identifier quotes so a `--`, `#` or `;`
+ * inside a literal is never mistaken for a comment or delimiter. Mirrors the
+ * mysql client: a `--` line comment requires whitespace/EOL after the dashes.
+ */
+function stripComments(line: string, inBlockComment: boolean): { code: string; inBlockComment: boolean } {
+  let out = ''
+  let quote: string | null = null
+  let i = 0
+  while (i < line.length) {
+    const c = line[i]!
+    const n = line[i + 1]
+    if (inBlockComment) {
+      if (c === '*' && n === '/') {
+        inBlockComment = false
+        i += 2
+        continue
+      }
+      i += 1
+      continue
+    }
+    if (quote) {
+      out += c
+      // backslash-escapes apply inside '...' and "..." but not `...`
+      if (c === '\\' && quote !== '`' && n !== undefined) {
+        out += n
+        i += 2
+        continue
+      }
+      if (c === quote) quote = null
+      i += 1
+      continue
+    }
+    if (c === '-' && n === '-' && (line[i + 2] === undefined || /\s/.test(line[i + 2]!))) break
+    if (c === '#') break
+    if (c === '/' && n === '*') {
+      inBlockComment = true
+      i += 2
+      continue
+    }
+    if (c === "'" || c === '"' || c === '`') quote = c
+    out += c
+    i += 1
+  }
+  return { code: out, inBlockComment }
+}
+
+/**
  * Split MySQL scripts into executable statements, including migration files that
  * use `DELIMITER //` for stored procedures. This is deliberately small and
  * line-oriented: our migrations put delimiter markers on their own lines and
  * terminate statements at the end of a line, matching mysql CLI conventions.
+ *
+ * SQL line comments (`-- ...`, `# ...`) and C-style block comments are stripped
+ * before tokenizing so a comment block preceding `DELIMITER` is not an open statement,
+ * and a `;` inside a comment does not prematurely terminate a statement.
  */
 export function splitSqlStatements(sql: string): string[] {
   let delimiter = ';'
   let buf = ''
+  let inBlockComment = false
   const statements: string[] = []
 
   for (const rawLine of sql.split(/\r?\n/)) {
-    const delim = rawLine.trim().match(/^DELIMITER\s+(.+)$/i)
+    const { code, inBlockComment: nextBlock } = stripComments(rawLine, inBlockComment)
+    inBlockComment = nextBlock
+
+    if (code.trim() === '') continue
+
+    const delim = code.trim().match(/^DELIMITER\s+(\S+)/i)
     if (delim) {
       const pending = buf.trim()
       if (pending !== '') {
@@ -72,7 +157,7 @@ export function splitSqlStatements(sql: string): string[] {
       continue
     }
 
-    buf += rawLine + '\n'
+    buf += code + '\n'
     const trimmed = buf.trimEnd()
     if (!trimmed.endsWith(delimiter)) continue
 
@@ -181,12 +266,10 @@ async function main(): Promise<void> {
   const migrationsDir = defaultMigrationsDir()
   const files = await loadMigrationFiles(migrationsDir)
   const pool = getPool()
-  const db: MigrationDb = {
-    async query(sql, params) {
-      const [result] = await pool.query(sql, params)
-      return result
-    },
-  }
+  // One dedicated connection for the whole run: the session-scoped advisory lock
+  // is only correct if GET_LOCK, the migrations, and RELEASE_LOCK share a connection.
+  const conn = await pool.getConnection()
+  const db = connectionMigrationDb(conn)
 
   try {
     const result = await runMigrations(db, files, { lockTimeoutSeconds: lockTimeoutSeconds() })
@@ -194,6 +277,7 @@ async function main(): Promise<void> {
     for (const name of result.applied) console.log(`[migrate] applied ${name}`)
     console.log(`[migrate] complete: ${result.applied.length} applied, ${result.skipped.length} skipped`)
   } finally {
+    conn.release()
     await closePool()
   }
 }
