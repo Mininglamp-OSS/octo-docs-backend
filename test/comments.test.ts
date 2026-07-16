@@ -442,12 +442,36 @@ describe('POST create (commenter can comment, reader cannot)', () => {
     )
     expect(res.statusCode).toBe(201)
     expect((res.body as { id: number }).id).toBe(200)
-    // INSERT args: parent_id = 10, both anchors NULL.
+    // Reply insert is the atomic parent-open-guarded INSERT ... SELECT; arg order
+    // is [docId, documentName, authorUid, body, anchorStart, anchorEnd, anchorText,
+    // parentId, openStatus].
     const insert = txQuery.mock.calls.find((c) => String(c[0]).includes('INSERT INTO doc_comment'))!
+    expect(String(insert[0])).toContain('FROM doc_comment root')
+    expect(String(insert[0])).toContain('root.status = ?')
     const args = insert[1] as unknown[]
-    expect(args[2]).toBe(10) // parent_id
-    expect(args[5]).toBeNull() // anchor_start
-    expect(args[6]).toBeNull() // anchor_end
+    expect(args[4]).toBeNull() // anchor_start
+    expect(args[5]).toBeNull() // anchor_end
+    expect(args[7]).toBe(10) // parent_id (join target)
+  })
+
+  it('409s a reply when the parent thread is already adjudicated (atomic 0-row insert)', async () => {
+    // Audit-immutability: once the root leaves `open`, no new reply may attach.
+    // The pre-read sees a root; the guarded INSERT ... SELECT ... WHERE
+    // root.status = open emits 0 rows because the root was adjudicated, so the
+    // route must 409 thread_not_open rather than silently attaching.
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 10 })] as never)
+    // tx INSERT ... SELECT matches nothing -> affectedRows 0; no LAST_INSERT_ID.
+    txQuery = vi.fn(async () => ({ affectedRows: 0 }) as unknown)
+    vi.mocked(transaction).mockImplementation((async (fn: (tx: unknown) => unknown) =>
+      fn({ query: txQuery })) as never)
+    const res = mockRes()
+    await createCommentHandler(
+      req({ params: { docId: 'd_1' }, body: { body: 'late reply', parentId: 10 } }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('thread_not_open')
   })
 
   it('rejects a reply to a non-root (single-level nesting only)', async () => {

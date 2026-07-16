@@ -1,7 +1,7 @@
 /**
  * Inline-comment endpoints (feature #3 — doc_comment).
  *   GET    /api/v1/docs/{docId}/comments        (reader)  list thread roots + replies
- *   POST   /api/v1/docs/{docId}/comments        (reader)  create root or reply
+ *   POST   /api/v1/docs/{docId}/comments        (commenter)  create root or reply
  *   PATCH  /api/v1/docs/{docId}/comments/{id}    body edit -> author; status -> writer
  *   DELETE /api/v1/docs/{docId}/comments/{id}    soft -> author; hard -> admin
  *
@@ -265,7 +265,13 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       res.status(400).json({ error: 'parent is not a thread root' })
       return
     }
-    const id = await docCommentRepo.create({
+    // Audit-immutability (留痕): a reply may only be appended while the parent
+    // thread is still open. Once the root is adjudicated (approved/rejected/
+    // committed) the discussion is frozen — mirroring the edit/delete guards. The
+    // parent.status snapshot above is a non-locking read, so do the authoritative
+    // check as an atomic guarded insert (INSERT ... SELECT ... WHERE root.status =
+    // open) to close the read->insert race; a null result => adjudicated under us.
+    const id = await docCommentRepo.createReplyIfParentOpen({
       docId,
       documentName,
       parentId: pid,
@@ -275,6 +281,10 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       anchorEnd: null,
       anchorText: '',
     })
+    if (id === null) {
+      res.status(409).json({ error: 'thread_not_open' })
+      return
+    }
     res.status(201).json({ id })
     return
   }

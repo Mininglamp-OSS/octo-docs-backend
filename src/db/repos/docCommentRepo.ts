@@ -150,6 +150,54 @@ export const docCommentRepo = {
     return rows[0] ? mapRow(rows[0]) : null
   },
 
+  /**
+   * Create a reply atomically gated on the parent thread still being open.
+   *
+   * A reply appended to an already-adjudicated (approved/rejected/committed)
+   * root would mutate the discussion context behind a recorded decision — and,
+   * for an `approved` root, add agent-visible context to a queued item — which
+   * breaks the same audit-immutability (留痕) invariant that updateBody/softDelete
+   * already enforce for reply EDITS/DELETES. Root state must therefore be
+   * consulted on reply CREATION too. A plain read-then-insert leaves a TOCTOU
+   * window (the root can be adjudicated between the read and the insert), so the
+   * insert itself is guarded: `INSERT ... SELECT` only emits a row while the
+   * parent is a live, open root in this doc. A 0-row result means the parent was
+   * adjudicated/removed under us (or is not a valid reply target); we return null
+   * so the route can 409 instead of silently attaching to a closed thread.
+   *
+   * Caller must still pre-validate parent existence/doc/root-ness for correct
+   * 404 / 400 error codes; this method is the authoritative race-safe gate.
+   */
+  async createReplyIfParentOpen(input: CreateCommentInput): Promise<number | null> {
+    const open = statusToNumber('open')
+    return transaction(async (tx) => {
+      const result = await tx.query<ResultSetHeader>(
+        `INSERT INTO doc_comment
+           (doc_id, document_name, parent_id, author_uid, body, anchor_start, anchor_end, anchor_text)
+         SELECT ?, ?, root.id, ?, ?, ?, ?, ?
+           FROM doc_comment root
+          WHERE root.id = ?
+            AND root.parent_id IS NULL
+            AND root.deleted = 0
+            AND root.status = ?`,
+        [
+          input.docId,
+          input.documentName,
+          input.authorUid,
+          input.body,
+          input.anchorStart,
+          input.anchorEnd,
+          input.anchorText,
+          input.parentId,
+          open,
+        ],
+      )
+      if ((result as unknown as ResultSetHeader).affectedRows === 0) return null
+      const rows = await tx.query<{ id: number | string }>('SELECT LAST_INSERT_ID() AS id')
+      return Number(rows[0]?.id ?? 0)
+    })
+  },
+
   /** All non-deleted comments for a doc (roots + replies), oldest first. */
   async listByDoc(docId: string): Promise<DocComment[]> {
     const rows = await query<DocCommentRow>(
