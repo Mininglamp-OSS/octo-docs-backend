@@ -14,6 +14,7 @@
  *     is what makes a revoked / deleted / archived doc drop out of the next query.
  */
 import { query, transaction } from '../pool.js'
+import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
 
 /** A recent-view row joined with its doc_meta business columns. */
 export interface RecentViewItem {
@@ -76,6 +77,27 @@ export function decodeViewCursor(raw: string | undefined): ViewCursor | null {
 function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (c) => `\\${c}`)
 }
+
+/**
+ * Read-side visibility predicate for the recent-view queries. Mirrors the WRITE
+ * side (POST /view -> requireDocRole -> effectiveRole): a doc is visible when the
+ * caller is the owner, holds a doc_member row, OR the doc is space-scoped-shared
+ * (share_scope = anyone_in_space) and lives in the SAME space as the view record.
+ *
+ * The `m.share_scope = ${SHARE_SCOPE_ANYONE}` branch closes the write/read gap
+ * from #64: before it, an anyone_in_space doc a Space member opened was written to
+ * doc_view_history (the write guard honors the share) but silently dropped here
+ * because the caller had no owner/doc_member row.
+ *
+ * Cross-space isolation is preserved, not relaxed: the surrounding WHERE already
+ * pins `v.space_id = ?` (the view record's space = the queried space), and the
+ * `m.space_id = v.space_id` conjunct requires the doc's HOME space to equal that
+ * same space. A doc shared in another space therefore never leaks in — the share
+ * branch only ever grants access WITHIN the one queried space. SHARE_SCOPE_ANYONE
+ * is a numeric module constant, inlined (not bound) so the positional bind arrays
+ * stay unchanged; it carries no injection surface.
+ */
+const VISIBILITY_PREDICATE = `(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
 
 export const docViewHistoryRepo = {
   /**
@@ -164,7 +186,7 @@ export const docViewHistoryRepo = {
 
     // WHERE fragments + binds, assembled in positional order. The role CASE and
     // the doc_member join both bind :uid, so the leading binds are (uid, uid, spaceId).
-    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', '(m.owner_id = ? OR dm.uid IS NOT NULL)']
+    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', VISIBILITY_PREDICATE]
     // filter binds follow the base binds; the base binds are added when building `args`.
     const filterArgs: unknown[] = []
 
@@ -238,7 +260,7 @@ export const docViewHistoryRepo = {
    * is done by the caller (route), which holds the octo session token.
    */
   async listCreators(params: { uid: string; spaceId: string; q?: string }): Promise<string[]> {
-    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', '(m.owner_id = ? OR dm.uid IS NOT NULL)']
+    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', VISIBILITY_PREDICATE]
     const args: unknown[] = [params.uid, params.spaceId, params.uid]
     const q = (params.q ?? '').trim()
     if (q !== '') {

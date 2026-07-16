@@ -118,14 +118,19 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
 })
 
 describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', () => {
-  it('filters at query time on status=1 + the owner-or-member visibility predicate', async () => {
+  it('filters at query time on status=1 + the owner/member/space-share visibility predicate', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
     await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     // this — NOT pruning — is what makes revoked/deleted/archived docs vanish.
     expect(itemsSql).toContain('m.status = 1')
-    expect(itemsSql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+    // Write/read symmetry (#64): the read predicate now also recognizes the
+    // space-scoped share source, so an anyone_in_space doc a Space member opened
+    // (written by POST /view's effectiveRole guard) is no longer dropped here.
+    expect(itemsSql).toContain(
+      '(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = 1 AND m.space_id = v.space_id))',
+    )
     expect(itemsSql).toMatch(/ORDER BY v\.viewed_at DESC, v\.doc_id DESC/)
   })
 
@@ -140,6 +145,24 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     // the COUNT query is unaffected (no per-row column in the aggregate).
     const countSql = mockQuery.mock.calls[0]![0] as string
     expect(countSql).toContain('COUNT(*)')
+  })
+
+  it('CROSS-SPACE ISOLATION: the share branch is same-space-guarded and never leaks another space', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
+    mockQuery.mockResolvedValueOnce([] as never) // items
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', pageSize: 20 })
+    const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
+    const itemsParams = mockQuery.mock.calls.at(-1)![1] as unknown[]
+    // The recent query is pinned to ONE space: v.space_id = ? bound to the caller's
+    // queried space. A view row recorded under another space is never selected.
+    expect(itemsSql).toContain('v.space_id = ?')
+    expect(itemsParams).toContain('s_trident')
+    // The space-share branch MUST require the doc's HOME space to equal the view
+    // record's space (m.share_scope = 1 AND m.space_id = v.space_id). A bare
+    // `OR m.share_scope = 1` would let a doc shared in a DIFFERENT space surface
+    // via a stray view row — that is the cross-space leak this guard forbids.
+    expect(itemsSql).toContain('m.share_scope = 1 AND m.space_id = v.space_id')
+    expect(itemsSql).not.toMatch(/OR\s+m\.share_scope = 1\s*\)/) // never unguarded
   })
 
   it('fetches pageSize+1 (inlined LIMIT) and derives nextCursor from the last kept row', async () => {
@@ -266,7 +289,12 @@ describe('docViewHistoryRepo.listCreators — pre-facet distinct owners', () => 
     const sql = mockQuery.mock.calls.at(-1)![0] as string
     expect(sql).toContain('SELECT DISTINCT m.owner_id')
     expect(sql).toContain('m.status = 1')
-    expect(sql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+    // Creator facet must share listRecent's visibility, including the space-share
+    // branch, so a shared-doc owner shows up in the filter dropdown too — and it
+    // stays same-space-guarded (no cross-space leak into the facet).
+    expect(sql).toContain(
+      '(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = 1 AND m.space_id = v.space_id))',
+    )
     expect(sql).toContain("LIKE ? ESCAPE '\\\\'") // respects q
     expect(sql).not.toContain('owner_id IN') // NOT the creator filter
     expect(out).toEqual(['u_a', 'u_b'])

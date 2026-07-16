@@ -6,6 +6,7 @@
  * persistence key, unique). See appendix B for the naming convention.
  */
 import { query, transaction, type Tx } from '../pool.js'
+import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
 
 export interface DocMeta {
   doc_id: string
@@ -199,10 +200,20 @@ export const docMetaRepo = {
       where.push(`m.doc_type IN (${types.map(() => '?').join(', ')})`)
       filterArgs.push(...types)
     }
-    // Visibility predicate. Default: owner OR member. owner='me': strictly owner,
-    // excluding shared-with-me (FEAT-B Q7). Both bind a single trailing uid.
+    // Visibility predicate. Default: owner OR doc_member OR space-scoped share
+    // (share_scope = anyone_in_space). The share branch mirrors the write side
+    // (#64 effectiveRole) so a Space member sees anyone_in_space docs in their
+    // "shared with me" list without a doc_member row. Cross-space isolation is
+    // untouched: the unconditional `m.space_id = ?` filter above already pins the
+    // result set to the caller's space, so `share_scope = anyone_in_space` here
+    // means "shared to THIS space" — a doc shared in another space never appears.
+    // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
+    // owner='me': strictly owner, excluding shared-with-me AND space-shared (FEAT-B
+    // Q7 — "my documents" is authorship, not access). Both bind a single trailing uid.
     const visibility =
-      params.owner === 'me' ? 'm.owner_id = ?' : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+      params.owner === 'me'
+        ? 'm.owner_id = ?'
+        : `(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
     // space/folder/q filters, then the trailing visibility `m.owner_id = ?`. The
     // join uid leads and the owner uid trails — they are not interchangeable.
