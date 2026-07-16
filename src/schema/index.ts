@@ -89,6 +89,18 @@ export const COLLAB_FIELD = 'default'
  *         render + on the JSON write path. SCHEMA_VERSION 18 is the shared
  *         front/back contract for this feature — the octo-web @octo/docs-schema
  *         half registers the SAME number; the backend does NOT self-assign.
+ *   - v19 tableRow.height — ATTR on the `tableRow` node (no new node/mark): a
+ *         per-row height in px so the front-end row-height drag handle can
+ *         persist a dragged row height. Type `number | null`, default `null`
+ *         (no height = the row is content-sized, exactly the v18 behavior, so
+ *         existing docs never regress). A set height serializes to the inline
+ *         `height:Npx` style on the `<tr>`; a null height emits a bare `<tr>`
+ *         with no style. parseDOM reads the integer px back off the tr's inline
+ *         height. Unlike the cell `colwidth` (a `number[]`), the row height is
+ *         a single integer SCALAR — one value per row. SCHEMA_VERSION 19 is the
+ *         shared front/back contract for this feature — the octo-web
+ *         @octo/docs-schema half registers the SAME number; the backend does
+ *         NOT self-assign.
  *
  * 14/15 land in the same lockstep as the frontend `@octo/docs-schema` /
  * SCHEMA-SPEC registration (node + attr byte alignment): the front-end Tiptap
@@ -98,7 +110,7 @@ export const COLLAB_FIELD = 'default'
  * horizontalRule + the marks above) use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization, consistent with the image/table nodes here.
  */
-export const SCHEMA_VERSION = 18
+export const SCHEMA_VERSION = 19
 
 /**
  * Shared attrs + DOM mapping for `tableCell` / `tableHeader` (SCHEMA-SPEC §4).
@@ -155,6 +167,34 @@ function setCellAttrs(node: { attrs: Record<string, unknown> }): Record<string, 
   if (colwidth) attrs['data-colwidth'] = colwidth.join(',')
   if (align != null) attrs['data-align'] = align
   return attrs
+}
+
+/**
+ * Row height helpers for `tableRow` (SCHEMA-SPEC v19).
+ *
+ * A `tableRow` carries an optional `height` — a single integer of px (NOT a
+ * `number[]` like the cell `colwidth`; a row has exactly one height). It rides
+ * the tr's inline `height:Npx` style so a dragged row height survives the
+ * Y.Doc <-> ProseMirror round-trip and HTML import/export. `null` = no height
+ * (the default; the row is content-sized, exactly the v18 behavior). Both ends
+ * sanitize to a positive integer so a hostile / malformed inline height can
+ * neither enter the Y.Doc nor serialize back out.
+ */
+function sanitizeRowHeight(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(n)) return null
+  const px = Math.round(n)
+  return px > 0 ? px : null
+}
+
+// Read the integer px height off a tr's inline `height:Npx` style (`null` when
+// absent or not an integer px value).
+function getRowHeight(dom: unknown): number | null {
+  const el = dom as { style?: { height?: string } }
+  const raw = el.style?.height
+  if (typeof raw !== 'string') return null
+  const m = /^(\d+)px$/.exec(raw.trim())
+  return m ? sanitizeRowHeight(m[1]) : null
 }
 
 /**
@@ -291,29 +331,34 @@ function setBlockAttrs(node: { attrs: Record<string, unknown> }): Record<string,
 const BLOCK_SPACING_NODE_TYPES = new Set(['paragraph', 'heading'])
 
 /**
- * Sanitize the block-spacing / alignment / indent attr VALUES (textAlign / lineHeight /
- * spaceBefore / spaceAfter / indent) on every paragraph / heading in a ProseMirror-JSON
- * tree, coercing any value that fails the whitelist to `null` (indent to 0). Mutates the
- * passed JSON in place and returns it. These attrs share a single serialized
- * `style` string (see setBlockAttrs), so they must be sanitized together on
- * every write path or the shared string can carry a hostile declaration.
+ * Sanitize the untrusted attr VALUES that ride an inline `style` string on every
+ * node in a ProseMirror-JSON tree, coercing any value that fails the whitelist to
+ * its safe default. Mutates the passed JSON in place and returns it. Covers:
+ *   - paragraph / heading — textAlign / lineHeight / spaceBefore / spaceAfter / indent
+ *     (v5/v17/v18); these share ONE serialized `style` string (see setBlockAttrs),
+ *     so they must be sanitized together or the shared string can carry a hostile
+ *     declaration.
+ *   - tableRow — height (v19); a scalar integer px that rides the tr's inline
+ *     `height:Npx` style (see the tableRow toDOM / sanitizeRowHeight), null = content-sized.
  *
- * WHY this exists (the parse-side sanitizer is not enough): `getBlockAttrs`
- * (parseDOM getAttrs) only runs on the HTML-import path. The authoritative
- * client/bot write path is JSON, not HTML — `PATCH /:docId/content` →
+ * WHY this exists (the parse-side sanitizer is not enough): `getBlockAttrs` /
+ * `getRowHeight` (parseDOM getAttrs) only run on the HTML-import path. The
+ * authoritative client/bot write path is JSON, not HTML — `PATCH /:docId/content` →
  * editDocBody → applyIncrementalOps → parseContent → `PMNode.fromJSON(schema,
  * json)`. `PMNode.fromJSON` reads `attrs` verbatim (via `computeAttrs`) and
  * `.check()` only validates attr SHAPE/existence, never the VALUE — neither one
  * calls parseDOM/getAttrs. So without this pass an API caller can smuggle a
  * hostile `textAlign` / `lineHeight` / `spaceBefore` / `spaceAfter` (e.g. a
  * multi-declaration `"1.5; position: fixed; ..."`, or a `textAlign` of
- * `"left; position: fixed"`) straight into the Y.Doc, where it round-trips
- * through prosemirrorJSONToYDocState ↔ yDocStateToProsemirrorJSON and is handed
- * back verbatim by `GET /:docId/content`.
+ * `"left; position: fixed"`), or a hostile `tableRow.height` (e.g.
+ * `"1px; position:fixed; top:0"`, `Infinity`/`NaN`, a negative/zero, a string or
+ * object), straight into the Y.Doc, where it round-trips through prosemirrorJSONToYDocState
+ * ↔ yDocStateToProsemirrorJSON and is handed back verbatim by `GET /:docId/content`.
  *
  * Running this over every node parsed from untrusted JSON restores the
  * "hostile value never enters the Y.Doc" invariant on the JSON write path,
- * matching the guarantee the HTML parse path already had.
+ * matching the guarantee the HTML parse path already had — the same both-ends
+ * sanitize pattern parseDOM/toDOM use, extended to the DOM-less JSON write path.
  */
 export function sanitizeBlockAttrValues(json: unknown): unknown {
   if (Array.isArray(json)) {
@@ -326,21 +371,26 @@ export function sanitizeBlockAttrValues(json: unknown): unknown {
     attrs?: Record<string, unknown>
     content?: unknown
   }
-  if (
-    typeof node.type === 'string' &&
-    BLOCK_SPACING_NODE_TYPES.has(node.type) &&
-    node.attrs &&
-    typeof node.attrs === 'object'
-  ) {
+  if (typeof node.type === 'string' && node.attrs && typeof node.attrs === 'object') {
     const attrs = node.attrs
-    if ('textAlign' in attrs) attrs.textAlign = sanitizeTextAlign(attrs.textAlign)
-    if ('lineHeight' in attrs) attrs.lineHeight = sanitizeLineHeight(attrs.lineHeight)
-    if ('spaceBefore' in attrs) attrs.spaceBefore = sanitizeSpacing(attrs.spaceBefore)
-    if ('spaceAfter' in attrs) attrs.spaceAfter = sanitizeSpacing(attrs.spaceAfter)
-    if ('indent' in attrs) attrs.indent = sanitizeIndent(attrs.indent)
+    if (BLOCK_SPACING_NODE_TYPES.has(node.type)) {
+      if ('textAlign' in attrs) attrs.textAlign = sanitizeTextAlign(attrs.textAlign)
+      if ('lineHeight' in attrs) attrs.lineHeight = sanitizeLineHeight(attrs.lineHeight)
+      if ('spaceBefore' in attrs) attrs.spaceBefore = sanitizeSpacing(attrs.spaceBefore)
+      if ('spaceAfter' in attrs) attrs.spaceAfter = sanitizeSpacing(attrs.spaceAfter)
+      if ('indent' in attrs) attrs.indent = sanitizeIndent(attrs.indent)
+    }
+    // v19: tableRow carries a scalar `height` (integer px) on the same untrusted
+    // JSON write path. It is NOT in BLOCK_SPACING_NODE_TYPES (different attr, own
+    // toDOM style), so it gets its own branch — mirroring the parseDOM/toDOM
+    // sanitize with the shared sanitizeRowHeight so the third (JSON) entry point
+    // no longer lets a hostile height bypass into the Y.Doc.
+    if (node.type === 'tableRow' && 'height' in attrs) {
+      attrs.height = sanitizeRowHeight(attrs.height)
+    }
   }
   // Recurse into children so nested paragraphs/headings (list items, table
-  // cells, blockquotes, details, callouts) are covered too.
+  // cells, blockquotes, details, callouts) and table rows are covered too.
   if (node.content !== undefined) sanitizeBlockAttrValues(node.content)
   return json
 }
@@ -369,8 +419,9 @@ function sanitizeBookmarkUrl(raw: string | null | undefined): string | null {
 /**
  * Build the ProseMirror schema used for server-side Y.Doc <-> ProseMirror
  * conversion (§7.1). Mirrors the frozen `@octo/docs-schema` package at
- * SCHEMA_VERSION 18 — the FULL Tiptap node/mark set (v17 adds the block-spacing
- * attrs, v18 adds the indent attr, on heading/paragraph) — so any front-end-authored
+ * SCHEMA_VERSION 19 — the FULL Tiptap node/mark set (v17 adds the block-spacing
+ * attrs, v18 adds the indent attr on heading/paragraph, v19 adds the height attr
+ * on tableRow) — so any front-end-authored
  * document round-trips through y-prosemirror and `PMNode.fromJSON(...).check()`
  * without loss. The standard nodes/marks use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization; the self-built nodes (image/table/callout/
@@ -587,8 +638,14 @@ export function buildSchema(): Schema {
       tableRow: {
         content: '(tableCell | tableHeader)*',
         tableRole: 'row',
-        parseDOM: [{ tag: 'tr' }],
-        toDOM: () => ['tr', 0],
+        // v19: optional per-row height (integer px, default null). Rides the
+        // tr's inline `height:Npx` style; null = content-sized (v18 behavior).
+        attrs: { height: { default: null as number | null } },
+        parseDOM: [{ tag: 'tr', getAttrs: (dom) => ({ height: getRowHeight(dom) }) }],
+        toDOM: (node) => {
+          const height = sanitizeRowHeight(node.attrs.height)
+          return height != null ? ['tr', { style: 'height:' + height + 'px' }, 0] : ['tr', 0]
+        },
       },
       tableCell: {
         content: 'block+',
