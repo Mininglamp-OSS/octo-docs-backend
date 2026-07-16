@@ -331,29 +331,34 @@ function setBlockAttrs(node: { attrs: Record<string, unknown> }): Record<string,
 const BLOCK_SPACING_NODE_TYPES = new Set(['paragraph', 'heading'])
 
 /**
- * Sanitize the block-spacing / alignment / indent attr VALUES (textAlign / lineHeight /
- * spaceBefore / spaceAfter / indent) on every paragraph / heading in a ProseMirror-JSON
- * tree, coercing any value that fails the whitelist to `null` (indent to 0). Mutates the
- * passed JSON in place and returns it. These attrs share a single serialized
- * `style` string (see setBlockAttrs), so they must be sanitized together on
- * every write path or the shared string can carry a hostile declaration.
+ * Sanitize the untrusted attr VALUES that ride an inline `style` string on every
+ * node in a ProseMirror-JSON tree, coercing any value that fails the whitelist to
+ * its safe default. Mutates the passed JSON in place and returns it. Covers:
+ *   - paragraph / heading — textAlign / lineHeight / spaceBefore / spaceAfter / indent
+ *     (v5/v17/v18); these share ONE serialized `style` string (see setBlockAttrs),
+ *     so they must be sanitized together or the shared string can carry a hostile
+ *     declaration.
+ *   - tableRow — height (v19); a scalar integer px that rides the tr's inline
+ *     `height:Npx` style (see the tableRow toDOM / sanitizeRowHeight), null = content-sized.
  *
- * WHY this exists (the parse-side sanitizer is not enough): `getBlockAttrs`
- * (parseDOM getAttrs) only runs on the HTML-import path. The authoritative
- * client/bot write path is JSON, not HTML — `PATCH /:docId/content` →
+ * WHY this exists (the parse-side sanitizer is not enough): `getBlockAttrs` /
+ * `getRowHeight` (parseDOM getAttrs) only run on the HTML-import path. The
+ * authoritative client/bot write path is JSON, not HTML — `PATCH /:docId/content` →
  * editDocBody → applyIncrementalOps → parseContent → `PMNode.fromJSON(schema,
  * json)`. `PMNode.fromJSON` reads `attrs` verbatim (via `computeAttrs`) and
  * `.check()` only validates attr SHAPE/existence, never the VALUE — neither one
  * calls parseDOM/getAttrs. So without this pass an API caller can smuggle a
  * hostile `textAlign` / `lineHeight` / `spaceBefore` / `spaceAfter` (e.g. a
  * multi-declaration `"1.5; position: fixed; ..."`, or a `textAlign` of
- * `"left; position: fixed"`) straight into the Y.Doc, where it round-trips
- * through prosemirrorJSONToYDocState ↔ yDocStateToProsemirrorJSON and is handed
- * back verbatim by `GET /:docId/content`.
+ * `"left; position: fixed"`), or a hostile `tableRow.height` (e.g.
+ * `"1px; position:fixed; top:0"`, `Infinity`/`NaN`, a negative/zero, a string or
+ * object), straight into the Y.Doc, where it round-trips through prosemirrorJSONToYDocState
+ * ↔ yDocStateToProsemirrorJSON and is handed back verbatim by `GET /:docId/content`.
  *
  * Running this over every node parsed from untrusted JSON restores the
  * "hostile value never enters the Y.Doc" invariant on the JSON write path,
- * matching the guarantee the HTML parse path already had.
+ * matching the guarantee the HTML parse path already had — the same both-ends
+ * sanitize pattern parseDOM/toDOM use, extended to the DOM-less JSON write path.
  */
 export function sanitizeBlockAttrValues(json: unknown): unknown {
   if (Array.isArray(json)) {
@@ -366,21 +371,26 @@ export function sanitizeBlockAttrValues(json: unknown): unknown {
     attrs?: Record<string, unknown>
     content?: unknown
   }
-  if (
-    typeof node.type === 'string' &&
-    BLOCK_SPACING_NODE_TYPES.has(node.type) &&
-    node.attrs &&
-    typeof node.attrs === 'object'
-  ) {
+  if (typeof node.type === 'string' && node.attrs && typeof node.attrs === 'object') {
     const attrs = node.attrs
-    if ('textAlign' in attrs) attrs.textAlign = sanitizeTextAlign(attrs.textAlign)
-    if ('lineHeight' in attrs) attrs.lineHeight = sanitizeLineHeight(attrs.lineHeight)
-    if ('spaceBefore' in attrs) attrs.spaceBefore = sanitizeSpacing(attrs.spaceBefore)
-    if ('spaceAfter' in attrs) attrs.spaceAfter = sanitizeSpacing(attrs.spaceAfter)
-    if ('indent' in attrs) attrs.indent = sanitizeIndent(attrs.indent)
+    if (BLOCK_SPACING_NODE_TYPES.has(node.type)) {
+      if ('textAlign' in attrs) attrs.textAlign = sanitizeTextAlign(attrs.textAlign)
+      if ('lineHeight' in attrs) attrs.lineHeight = sanitizeLineHeight(attrs.lineHeight)
+      if ('spaceBefore' in attrs) attrs.spaceBefore = sanitizeSpacing(attrs.spaceBefore)
+      if ('spaceAfter' in attrs) attrs.spaceAfter = sanitizeSpacing(attrs.spaceAfter)
+      if ('indent' in attrs) attrs.indent = sanitizeIndent(attrs.indent)
+    }
+    // v19: tableRow carries a scalar `height` (integer px) on the same untrusted
+    // JSON write path. It is NOT in BLOCK_SPACING_NODE_TYPES (different attr, own
+    // toDOM style), so it gets its own branch — mirroring the parseDOM/toDOM
+    // sanitize with the shared sanitizeRowHeight so the third (JSON) entry point
+    // no longer lets a hostile height bypass into the Y.Doc.
+    if (node.type === 'tableRow' && 'height' in attrs) {
+      attrs.height = sanitizeRowHeight(attrs.height)
+    }
   }
   // Recurse into children so nested paragraphs/headings (list items, table
-  // cells, blockquotes, details, callouts) are covered too.
+  // cells, blockquotes, details, callouts) and table rows are covered too.
   if (node.content !== undefined) sanitizeBlockAttrValues(node.content)
   return json
 }
