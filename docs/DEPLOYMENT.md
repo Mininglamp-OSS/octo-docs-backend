@@ -252,18 +252,35 @@ database, never re-run `schema.sql`; apply the incremental
 
 ### Existing deployment
 
-Apply the incremental migrations in `migrations/upgrades/` **in filename (date)
-order**. Each is idempotent and safe to re-run; skip them on a fresh install
-(`schema.sql` already includes them):
+Build the project, then run the migration ledger runner:
+
+```bash
+npm run build
+npm run migrate
+```
+
+`npm run migrate` applies `migrations/upgrades/*.sql` in filename (date) order,
+records `(filename, checksum, executed_at)` in `schema_migrations`, skips files
+already applied with the same checksum, and fails fast if an already-applied SQL
+file has been modified. It also takes a MySQL advisory lock so two deploy jobs
+do not run migrations concurrently.
+
+When adopting this runner on a database that was previously migrated manually,
+the first run has an empty `schema_migrations` ledger. It will therefore execute
+the existing upgrade files once to populate the ledger. The shipped upgrades are
+written to be idempotent/re-runnable for that exact bootstrap path.
+
+> Run migrations as a discrete deploy step **before** rolling the new image, so
+> the running (old) code tolerates the additive schema and the new code finds
+> the columns it expects. In Kubernetes/ArgoCD/Helm, run the same command from a
+> Job / PreSync hook / release hook. Adding new upgrade files? Keep the
+> `YYYY-MM-DD-<desc>.sql` naming so date order = apply order.
+
+Manual SQL execution remains a low-level fallback for break-glass operations:
 
 ```bash
 mysql -u <user> -p <database> < migrations/upgrades/2026-06-23-add-doc-attachment-file-name.sql
 ```
-
-> Run migrations as a discrete deploy step **before** rolling the new image, so
-> the running (old) code tolerates the additive schema and the new code finds
-> the columns it expects. Adding new upgrade files? Keep the
-> `YYYY-MM-DD-<desc>.sql` naming so date order = apply order.
 
 ---
 
