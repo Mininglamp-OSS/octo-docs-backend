@@ -34,8 +34,17 @@ export type IssueResult =
  *   - documentName malformed      => 403
  *   - doc/board missing/deleted   => 404
  *   - role === none               => 403 (no token)
+ *
+ * `viewerSpaceId` is the space the caller is CURRENTLY working in (the
+ * `X-Space-Id` header the front-end injects on the collab-token request). It is
+ * used only for the recent-view fallback ingest below, to keep the WRITE space
+ * consistent with the READ space — see that block for the contract.
  */
-export async function issueCollabToken(octoToken: string, documentName: string): Promise<IssueResult> {
+export async function issueCollabToken(
+  octoToken: string,
+  documentName: string,
+  viewerSpaceId?: string,
+): Promise<IssueResult> {
   // Layer-1: octo identity -> trusted uid (never trust a client-supplied uid).
   const identity = await getOctoIdentity().verifyToken(octoToken)
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
@@ -100,15 +109,27 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
   // read-only INCLUDED — passes through here, so this is the reliable "open ==
   // viewed" seam even if the front-end never calls POST /docs/{id}/view. We now
-  // hold a trusted uid + doc_id + space_id + role(!=none), everything the UPSERT
-  // needs. Best-effort: fire-and-forget (never awaited) so it can't slow or fail
-  // token issuance, and a failure only warns. It shares the (uid, doc_id) PK with
-  // the explicit endpoint, so a front-end that ALSO calls view never double-counts.
+  // hold a trusted uid + doc_id + role(!=none), everything the UPSERT needs.
+  // Best-effort: fire-and-forget (never awaited) so it can't slow or fail token
+  // issuance, and a failure only warns. It shares the (uid, doc_id) PK with the
+  // explicit endpoint, so a front-end that ALSO calls view never double-counts.
+  //
+  // SPACE 口径统一 (XIN-1237): recent-view is READ scoped to the viewer's CURRENT
+  // space (GET /docs/recent filters doc_view_history.space_id = X-Space-Id). To
+  // stay readable, the WRITE must land in that SAME space. So when the caller
+  // supplies its current space (viewerSpaceId, from the collab-token request's
+  // X-Space-Id header), record under it. This is what lets a doc opened from a
+  // chat share link (standalone page) show up in the viewer's current-space
+  // recent-view. Only when it is absent (legacy client that doesn't send the
+  // header) do we fall back to the document's home space (meta.space_id) — the
+  // pre-fix behavior, so same-space opens do not regress.
+  const trimmedViewerSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
+  const ingestSpaceId = trimmedViewerSpace !== '' ? trimmedViewerSpace : meta.space_id
   void docViewHistoryRepo
     .upsertViewWithPrune({
       uid,
       docId: meta.doc_id,
-      spaceId: meta.space_id,
+      spaceId: ingestSpaceId,
       retainCount: config.docView.retainCount,
       retainDays: config.docView.retainDays,
     })
