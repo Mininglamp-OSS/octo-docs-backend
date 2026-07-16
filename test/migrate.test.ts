@@ -153,6 +153,26 @@ describe('shipped migration files parse cleanly', () => {
     }
   })
 
+  it('backfills legacy resolved=1 to the reopenable approved state, not terminal committed', async () => {
+    // Regression guard for PR #81 P1-a: the legacy resolve/reopen shim maps
+    // setResolved(true) -> approved (1), which is reopenable (approved -> open).
+    // The backfill must land the same legacy signal (resolved=1) on the SAME
+    // state, otherwise the preserved PATCH { resolved: false } path breaks for
+    // every historically-resolved comment (committed is terminal -> 400). Assert
+    // the shipped file writes status = 1, never the terminal status = 3.
+    const files = await loadMigrationFiles(upgradesDir)
+    const lifecycle = files.find((f) => f.filename === '2026-07-15-add-comment-lifecycle.sql')
+    expect(lifecycle, 'lifecycle upgrade file must ship').toBeTruthy()
+    const backfill = splitSqlStatements(lifecycle!.sql)
+      .map((s) => s.replace(/\s+/g, ' ').trim())
+      .find((s) => /^UPDATE doc_comment SET status =/i.test(s) && /WHERE resolved = 1/i.test(s))
+    expect(backfill, 'legacy resolved backfill UPDATE must exist').toBeTruthy()
+    expect(backfill).toMatch(/SET status = 1\b/)
+    expect(backfill).not.toMatch(/SET status = 3\b/)
+    // And it stays re-run-safe: only touches rows still at the default open state.
+    expect(backfill).toMatch(/AND status = 0/)
+  })
+
   it('handles a comment preamble before DELIMITER and a ; inside a comment', () => {
     const sql = [
       '-- header line 1',

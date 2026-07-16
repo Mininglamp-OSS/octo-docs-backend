@@ -143,14 +143,19 @@ CALL octo_add_doc_comment_lifecycle();
 
 DROP PROCEDURE IF EXISTS octo_add_doc_comment_lifecycle;
 
--- Backfill: forward-map the legacy resolved flag onto the lifecycle. A resolved
--- comment is already done, so it lands on the terminal `committed` state (kept for
--- audit, never re-queued for execution), copying the resolve stamp into the new
--- audit columns. Re-runnable: it re-derives status from resolved, and only touches
--- rows still carrying the legacy resolved=1 flag whose status has not yet been
--- advanced past open (so it never clobbers a live reopened/approved row).
+-- Backfill: forward-map the legacy resolved flag onto the lifecycle. A legacy
+-- resolved comment maps to `approved` (1), matching the runtime legacy shim
+-- (setResolved(true) -> approved) so the same legacy signal never lands on two
+-- different lifecycle states. `approved` is reopenable (approved -> open), so the
+-- pre-upgrade corpus stays reopenable via the preserved PATCH { resolved: false }
+-- path; landing it on the terminal `committed` state would permanently break
+-- reopen (approved -> open allowed, committed -> open rejected). It copies the
+-- resolve stamp into the new audit columns. Re-runnable: it re-derives status
+-- from resolved, and only touches rows still carrying the legacy resolved=1 flag
+-- whose status has not yet been advanced past open (so it never clobbers a live
+-- reopened/approved row).
 UPDATE doc_comment
-  SET status = 3,
+  SET status = 1,
       adjudicated_by = resolved_by,
       adjudicated_at = resolved_at
   WHERE resolved = 1
