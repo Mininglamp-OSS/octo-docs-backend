@@ -5,6 +5,16 @@
  * inspect or run them manually. This runner adds the missing operational layer:
  * ordered execution, a schema_migrations ledger, checksum drift detection, and
  * a MySQL advisory lock to avoid concurrent deploy races.
+ *
+ * EXECUTION CONTRACT — at-least-once, so upgrade files MUST be idempotent.
+ * A migration is applied by running its SQL and then recording it in the ledger
+ * as two separate steps (`executeMigrationSql` then `recordMigration`). MySQL
+ * auto-commits DDL, so these cannot be wrapped in one atomic transaction; if the
+ * process dies between them the SQL is applied but unrecorded and the NEXT run
+ * re-executes the file. The same re-execution happens on first adoption over a
+ * hand-migrated DB (empty ledger). Every `migrations/upgrades/*.sql` file must
+ * therefore be safely re-runnable — guard DDL with information_schema checks or
+ * `IF NOT EXISTS`, and gate DML on a predicate that a re-run no longer matches.
  */
 /* eslint-disable no-console */
 import { createHash } from 'node:crypto'
@@ -237,6 +247,11 @@ export async function runMigrations(
         continue
       }
 
+      // Execute-then-record is not atomic (DDL auto-commits in MySQL, so a
+      // wrapping transaction would not help): a crash between these two lines
+      // leaves the file applied but unrecorded, and the next run re-executes it.
+      // This is why every upgrade file must be idempotent — see the module-level
+      // EXECUTION CONTRACT.
       await executeMigrationSql(db, file)
       await recordMigration(db, file)
       applied.push(file.filename)

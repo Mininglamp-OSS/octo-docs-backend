@@ -270,6 +270,15 @@ the first run has an empty `schema_migrations` ledger. It will therefore execute
 the existing upgrade files once to populate the ledger. The shipped upgrades are
 written to be idempotent/re-runnable for that exact bootstrap path.
 
+**Authoring new upgrade files — they MUST be idempotent.** The runner applies a
+file and records it in the ledger as two separate steps; MySQL auto-commits DDL,
+so they cannot be one atomic transaction. If a deploy dies between them, or on
+the bootstrap re-run above, the file is executed again. Every upgrade file must
+therefore be safely re-runnable: guard DDL with `information_schema` checks or
+`IF NOT EXISTS`, and gate DML on a predicate a re-run no longer matches (a bare
+`INSERT ... SELECT` or unguarded `ALTER` will corrupt or error on the second
+run). The shipped files under `migrations/upgrades/` are the reference pattern.
+
 > Run migrations as a discrete deploy step **before** rolling the new image, so
 > the running (old) code tolerates the additive schema and the new code finds
 > the columns it expects. In Kubernetes/ArgoCD/Helm, run the same command from a
