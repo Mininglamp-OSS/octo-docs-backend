@@ -16,19 +16,23 @@
 --   clients (resolved = status != open). The existing `resolved`/resolved_by/at
 --   columns and idx_doc_open are kept unchanged for backward-compat.
 --
--- BACKFILL: `resolved` is ambiguous against the new axis, so map it forward with
---   the least-lossy interpretation. An old "resolved" comment is one an editor
---   already ACTED ON / closed out — i.e. done — which on the new axis is the
---   terminal `committed` state, NOT `approved`. `approved` means "queued, not yet
---   executed": mapping resolved history there would re-queue every historical
---   resolved comment for the agent to re-execute against the live doc body (data
---   pollution). `committed` is terminal (no outbound transitions), kept for audit,
---   and never re-picked up by the approved-execution pull. It also preserves the
---   derived-mirror rule (resolved = status != open) since committed != open.
---   Open rows stay open.
+-- BACKFILL: `resolved` is ambiguous against the new axis, so map it forward to
+--   match the runtime legacy shim (setResolved(true) -> approved) so the same
+--   legacy signal never lands on two different lifecycle states. A legacy
+--   "resolved" comment maps to `approved` (1): `approved` is reopenable
+--   (approved -> open), so the pre-upgrade corpus stays reopenable via the
+--   preserved PATCH { resolved: false } path; landing it on the terminal
+--   `committed` state would permanently break reopen (committed -> open is
+--   rejected). Trade-off: with the agent pulling its execution list via
+--   ?status=approved, the historical resolved corpus appears in that list on
+--   existing installs — this is a deliberate, shim-consistent product call, not
+--   an accident. The derived-mirror rule (resolved = status != open) still holds
+--   since approved != open. Open rows stay open.
 --     resolved = 0 -> status = 0 (open)
---     resolved = 1 -> status = 3 (committed); copy resolved_by/at into
+--     resolved = 1 -> status = 1 (approved); copy resolved_by/at into
 --                     adjudicated_by/at as the audit stamp.
+--   Bounded WHERE resolved = 1 AND status = 0 so a re-run never clobbers a row
+--   already advanced past open.
 --
 -- WHO NEEDS THIS: EXISTING deployments upgrading across this batch. Fresh installs
 --   already get these columns/indexes/comments from migrations/schema.sql.
