@@ -164,3 +164,107 @@ describe('JSON write-path block-attr value sanitize (§17 security invariant)', 
     expect(JSON.stringify(storedBack)).not.toContain('background: url')
   })
 })
+
+// v19 tableRow.height is the THIRD attr to fall into the "three sanitize entry
+// points" pattern (after v17 lineHeight/spacing and v18 indent). parseDOM
+// (getRowHeight) and toDOM already sanitize the inline `height:Npx` style, but
+// the AUTHORITATIVE write path is JSON (PATCH /:docId/content -> parseContent ->
+// PMNode.fromJSON), which never touches parseDOM. Without the JSON-write pass a
+// caller can PATCH a hostile tableRow.height straight past .check() (which only
+// validates attr SHAPE, not value) into the Y.Doc, where GET returns it verbatim
+// — contradicting the PR's "malformed/hostile height can neither enter the Y.Doc
+// nor serialize back out" guarantee. sanitizeBlockAttrValues must cover it too.
+describe('JSON write-path tableRow.height sanitize (v19 third entry point)', () => {
+  function cell(text: string) {
+    return {
+      type: 'tableCell',
+      attrs: { colspan: 1, rowspan: 1, colwidth: null, align: null },
+      content: [{ type: 'paragraph', content: [{ type: 'text', text }] }],
+    }
+  }
+  function row(attrs: Record<string, unknown>) {
+    return { type: 'tableRow', attrs, content: [cell('a')] }
+  }
+  function tableDoc(rows: unknown[]): PMNode {
+    return PMNode.fromJSON(schema, {
+      type: 'doc',
+      content: [{ type: 'table', content: rows }],
+    } as Parameters<typeof PMNode.fromJSON>[1])
+  }
+  // Pull the first tableRow's attrs back out of the Y.Doc exactly as GET would.
+  function storedRowAttrs(doc: PMNode): Record<string, unknown> {
+    const back = yDocStateToProsemirrorJSON(
+      Y.encodeStateAsUpdate(prosemirrorToYDoc(doc, COLLAB_FIELD)),
+    ) as { content?: Array<{ content?: Array<{ attrs?: Record<string, unknown> }> }> }
+    return back.content?.[0]?.content?.[0]?.attrs ?? {}
+  }
+
+  it('coerces hostile / malformed tableRow.height to null in place', () => {
+    const json = {
+      type: 'doc',
+      content: [
+        {
+          type: 'table',
+          content: [
+            row({ height: '1px; position:fixed; top:0' }), // multi-declaration string
+            row({ height: Number.POSITIVE_INFINITY }), // non-finite
+            row({ height: Number.NaN }), // NaN
+            row({ height: -5 }), // negative
+            row({ height: 0 }), // zero
+            row({ height: 'auto' }), // non-numeric string
+            row({ height: { evil: true } }), // object
+            row({ height: 48 }), // legal — survives
+            row({ height: 42.7 }), // legal float — rounds to integer px
+          ],
+        },
+      ],
+    }
+    sanitizeBlockAttrValues(json)
+    const rows = (json.content[0] as { content: Array<{ attrs: Record<string, unknown> }> }).content
+    expect(rows[0].attrs.height).toBeNull()
+    expect(rows[1].attrs.height).toBeNull()
+    expect(rows[2].attrs.height).toBeNull()
+    expect(rows[3].attrs.height).toBeNull()
+    expect(rows[4].attrs.height).toBeNull()
+    expect(rows[5].attrs.height).toBeNull()
+    expect(rows[6].attrs.height).toBeNull()
+    expect(rows[7].attrs.height).toBe(48)
+    expect(rows[8].attrs.height).toBe(43)
+  })
+
+  it('insert op: a hostile tableRow.height never reaches the Y.Doc', () => {
+    const doc = tableDoc([row({ height: null })])
+    const ops: DocEditOp[] = [
+      {
+        type: 'replace',
+        range: { from: { path: [0, 0] }, to: { path: [0, 0] } },
+        content: [row({ height: '1px; position:fixed; top:0' })],
+      },
+    ]
+    const newDoc = applyIncrementalOps(doc, ops, schema)
+    // The row actually stored carries a sanitized (null) height, not the hostile
+    // string — the null default is stripped from storage entirely.
+    const storedRow = newDoc.child(0).child(0)
+    expect(storedRow.type.name).toBe('tableRow')
+    expect(storedRow.attrs.height).toBeNull()
+
+    const storedBack = yDocStateToProsemirrorJSON(
+      Y.encodeStateAsUpdate(prosemirrorToYDoc(newDoc, COLLAB_FIELD)),
+    )
+    expect(JSON.stringify(storedBack)).not.toContain('position:fixed')
+  })
+
+  it('replace op: a legal dragged row height survives the JSON write path', () => {
+    const doc = tableDoc([row({ height: null })])
+    const ops: DocEditOp[] = [
+      {
+        type: 'replace',
+        range: { from: { path: [0, 0] }, to: { path: [0, 0] } },
+        content: [row({ height: 96 })],
+      },
+    ]
+    const newDoc = applyIncrementalOps(doc, ops, schema)
+    expect(newDoc.child(0).child(0).attrs.height).toBe(96)
+    expect(storedRowAttrs(newDoc)).toMatchObject({ height: 96 })
+  })
+})

@@ -98,13 +98,17 @@ describe('GET /docs/recent — listRecentHandler', () => {
       nextCursor: 'CURSOR',
       items: [
         { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 2,
-          updated_at: new Date('2026-07-10T00:00:00.000Z'),
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_e1',
           viewed_at: new Date('2026-07-15T06:00:00.000Z') },
         { doc_id: 'd_2', title: 'B', owner_id: 'u_1', doc_type: 'board', role: 3,
-          updated_at: new Date('2026-07-11T00:00:00.000Z'),
+          updated_at: new Date('2026-07-11T00:00:00.000Z'), updated_by: 'u_e2',
           viewed_at: new Date('2026-07-15T05:00:00.000Z') },
       ],
     } as never)
+    getUsersMock.mockResolvedValue([
+      { uid: 'u_e1', name: 'Editor One' },
+      { uid: 'u_e2', name: 'Editor Two' },
+    ])
     const res = mockRes()
     await listRecentHandler(req({ query: { q: 'a', creator: ['u_o'], cursor: 'X' } }), res as never)
     expect(res.statusCode).toBe(200)
@@ -131,7 +135,7 @@ describe('GET /docs/recent — listRecentHandler', () => {
       nextCursor: null,
       items: [
         { doc_id: 'd_c', title: 'C', owner_id: 'u_o', doc_type: 'doc', role: 4,
-          updated_at: new Date('2026-07-12T00:00:00.000Z'),
+          updated_at: new Date('2026-07-12T00:00:00.000Z'), updated_by: '',
           viewed_at: new Date('2026-07-15T04:00:00.000Z') },
       ],
     } as never)
@@ -140,6 +144,87 @@ describe('GET /docs/recent — listRecentHandler', () => {
     expect(res.statusCode).toBe(200)
     const body = res.body as { items: Array<Record<string, unknown>> }
     expect(body.items[0]!.role).toBe('commenter')
+  })
+
+  it('resolves updatedBy (last editor) to { uid, name } server-side, authenticated with the caller token (XIN-1240)', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 1,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 2,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_e1',
+          viewed_at: new Date('2026-07-15T06:00:00.000Z') },
+      ],
+    } as never)
+    getUsersMock.mockResolvedValue([{ uid: 'u_e1', name: 'Zhang San' }])
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    expect(body.items[0]!.updatedBy).toEqual({ uid: 'u_e1', name: 'Zhang San' })
+    // name resolution is authenticated with the caller's own token (same as creators).
+    expect(getUsersMock).toHaveBeenCalledWith(['u_e1'], 'tok')
+  })
+
+  it('falls back updatedBy.name to the uid when the directory has no (or blank) name', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 2,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 2,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_blank',
+          viewed_at: new Date('2026-07-15T06:00:00.000Z') },
+        { doc_id: 'd_2', title: 'B', owner_id: 'u_o', doc_type: 'doc', role: 2,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_missing',
+          viewed_at: new Date('2026-07-15T05:00:00.000Z') },
+      ],
+    } as never)
+    getUsersMock.mockResolvedValue([{ uid: 'u_blank', name: '  ' }]) // blank name; u_missing absent
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    expect(body.items[0]!.updatedBy).toEqual({ uid: 'u_blank', name: 'u_blank' })
+    expect(body.items[1]!.updatedBy).toEqual({ uid: 'u_missing', name: 'u_missing' })
+  })
+
+  it('returns updatedBy=null for a never-edited doc (updated_by = "") without hitting the directory', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 1,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 2,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: '',
+          viewed_at: new Date('2026-07-15T06:00:00.000Z') },
+      ],
+    } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    expect(body.items[0]!.updatedBy).toBeNull()
+    // no non-empty editor uids => no directory call.
+    expect(getUsersMock).not.toHaveBeenCalled()
+  })
+
+  it('batches distinct editor uids into a single directory call (dedup across rows)', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 2,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 2,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_e1',
+          viewed_at: new Date('2026-07-15T06:00:00.000Z') },
+        { doc_id: 'd_2', title: 'B', owner_id: 'u_o', doc_type: 'doc', role: 2,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_e1',
+          viewed_at: new Date('2026-07-15T05:00:00.000Z') },
+      ],
+    } as never)
+    getUsersMock.mockResolvedValue([{ uid: 'u_e1', name: 'Editor One' }])
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect(getUsersMock).toHaveBeenCalledTimes(1)
+    expect(getUsersMock).toHaveBeenCalledWith(['u_e1'], 'tok') // deduped, not ['u_e1','u_e1']
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    expect(body.items[0]!.updatedBy).toEqual({ uid: 'u_e1', name: 'Editor One' })
+    expect(body.items[1]!.updatedBy).toEqual({ uid: 'u_e1', name: 'Editor One' })
   })
 
   it('answers 400 invalid_cursor when the repo rejects a malformed cursor', async () => {
