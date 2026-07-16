@@ -37,14 +37,32 @@ The runner:
   concurrent execution.
 
 The first runner invocation on a database that was previously migrated by hand
-will execute the existing idempotent upgrade files once to populate the ledger.
+will attempt to execute the existing idempotent upgrade files to populate the
+ledger. Migration SQL execution and the ledger insert are separate operations
+because MySQL DDL auto-commits. If the process stops between those operations,
+the next run executes that migration again. Upgrade files must therefore remain
+safe to re-run, not merely safe when the ledger already contains an entry.
+
+## Configuration
+
+The runner uses the application's standard `MYSQL_*` connection settings; see
+`.env.example` for their defaults.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MIGRATIONS_DIR` | `migrations/upgrades` relative to the current working directory | Override the directory scanned for `.sql` files. |
+| `MIGRATION_LOCK_TIMEOUT_SECONDS` | `60` | Seconds to wait for the MySQL advisory lock. Use `0` to fail immediately when another migration run holds the lock. |
+
+If the runner cannot acquire `octo_docs_backend_migrations` within this timeout,
+it exits non-zero. During overlapping deploys this is expected mutual exclusion;
+the failed deployment should be retried after the active migration finishes.
 
 ## Automatic execution is deployment-specific
 
-The upstream image contains this directory, but it does **not** run migrations
-automatically. Its default command starts the application directly. Operators
-must deliberately integrate `npm run migrate` into deployment, preferably as a
-pre-deploy Job, Helm hook, or Argo CD PreSync hook.
+The upstream `Dockerfile` copies this directory into its image, but it does
+**not** run migrations automatically. Its default command starts the application
+directly. Operators must deliberately integrate `npm run migrate` into
+deployment, preferably as a pre-deploy Job, Helm hook, or Argo CD PreSync hook.
 
 A deployment that intentionally couples migration to application startup can
 use an equivalent command:
@@ -66,6 +84,10 @@ same MySQL configuration and credentials as the application.
 4. Add or update tests for the affected schema contract.
 5. Never edit a migration after it has been applied. Add a new migration
    instead, otherwise checksum validation will fail.
+
+The SQL splitter supports MySQL `DELIMITER` directives for stored procedures.
+Keep each `DELIMITER` directive on its own line and terminate statements with
+the active delimiter at the end of a line, matching the existing upgrade files.
 
 Do not place documentation or helper files with a `.sql` extension under
 `upgrades/`; the runner will attempt to execute them.
