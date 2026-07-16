@@ -24,6 +24,7 @@ import type { PmNode, PmMark } from './types.js'
 import { safeHref, ooxmlHexColor, safeCssColor, decodeXmlText } from './types.js'
 import { parseXmlOrdered, orderedTag, orderedAttr, orderedToXml, type OrderedNode } from './xml.js'
 import type { Numbering } from './numbering.js'
+import type { StyleMap } from './styles.js'
 import { buildList, type ListLine } from './list.js'
 import { mapTable } from './table.js'
 import { ommlToLatex, mathNode } from './math.js'
@@ -94,6 +95,7 @@ export function walkDocument(
   rels: RelMap,
   numbering?: Numbering,
   deadline?: Deadline,
+  styles?: StyleMap,
 ): WalkResult {
   const warnings: string[] = []
   const top = parseXmlOrdered(documentXml)
@@ -104,7 +106,7 @@ export function walkDocument(
     return { content: [emptyParagraph()], warnings }
   }
 
-  const content = mapBlockChildren(kids(body, 'w:body'), rels, numbering, warnings, undefined, 0, deadline)
+  const content = mapBlockChildren(kids(body, 'w:body'), rels, numbering, warnings, undefined, 0, deadline, styles)
   if (content.length === 0) content.push(emptyParagraph())
   return { content, warnings }
 }
@@ -123,6 +125,7 @@ function mapBlockChildren(
   parentFillsWidth?: boolean,
   depth = 0,
   deadline?: Deadline,
+  styles?: StyleMap,
 ): PmNode[] {
   const content: PmNode[] = []
   let listRun: ListLine[] = []
@@ -177,19 +180,19 @@ function mapBlockChildren(
       // Code block boundary marker: flush the current CodeBlock run so an
       // immediately-following code block starts a NEW codeBlock node instead of
       // merging. The marker itself carries no content and is dropped.
-      if (codeBlockEndMarker(child)) {
+      if (codeBlockEndMarker(child, styles)) {
         flushStyled()
         continue
       }
       // Code block / callout paragraphs (recognised by pStyle). Group runs of
       // the same kind; a callout run also requires the same variant.
-      const styled = styledKindOf(child)
+      const styled = styledKindOf(child, styles)
       // Blockquote boundary markers (BlockQuoteStart / BlockQuoteEnd) bracket a
       // quote's content; foldBlockquote() rebuilds the quote (and nesting) from
       // them. Handle these BEFORE the pStyle grouping: inside a frame, a
       // `BlockQuote`-styled paragraph is a plain quote paragraph, not a separate
       // grouped blockquote node (the frame is the wrapper).
-      const bqMarker = blockquoteMarkerOf(child)
+      const bqMarker = blockquoteMarkerOf(child, styles)
       if (bqMarker === 'start') {
         flushList()
         flushStyled()
@@ -209,7 +212,7 @@ function mapBlockChildren(
         // wraps it once (avoids double-wrapping via the legacy pStyle grouping).
         flushList()
         flushStyled()
-        content.push(...mapParagraph(child, rels, warnings, deadline))
+        content.push(...mapParagraph(child, rels, warnings, deadline, styles))
         continue
       }
       if (styled) {
@@ -240,7 +243,7 @@ function mapBlockChildren(
         // Details boundary markers (DetailsStart / DetailsEnd) and the summary
         // line are emitted as sentinel nodes; foldDetails() rebuilds the nested
         // details tree from them after the linear walk.
-        const marker = detailsMarkerOf(child)
+        const marker = detailsMarkerOf(child, styles)
         if (marker === 'start') {
           content.push({ type: '__detailsStart' } as unknown as PmNode)
         } else if (marker === 'end') {
@@ -252,7 +255,7 @@ function mapBlockChildren(
             content: stripLeadingDetailsToggle(inline),
           })
         } else {
-          content.push(...mapParagraph(child, rels, warnings, deadline))
+          content.push(...mapParagraph(child, rels, warnings, deadline, styles))
         }
       }
     } else if (tag === 'm:oMathPara' || tag === 'm:oMath') {
@@ -278,7 +281,7 @@ function mapBlockChildren(
         mapTable(
           tblChildren,
           (tcChildren, fillsWidth) =>
-            mapBlockChildren(tcChildren, rels, numbering, warnings, fillsWidth, depth + 1, deadline),
+            mapBlockChildren(tcChildren, rels, numbering, warnings, fillsWidth, depth + 1, deadline, styles),
           parentFillsWidth,
           deadline,
         ),
@@ -306,16 +309,17 @@ const CALLOUT_PREFIX_GLYPHS = ['ℹ️', '⚠️', '💡', '✅', 'ℹ', '⚠']
  * Classify a paragraph as a details boundary marker or summary line by its
  * pStyle (DetailsStart / DetailsEnd / DetailsSummary), or null otherwise.
  */
-function detailsMarkerOf(p: OrderedNode): 'start' | 'end' | 'summary' | null {
+function detailsMarkerOf(p: OrderedNode, styles?: StyleMap): 'start' | 'end' | 'summary' | null {
   const pChildren = kids(p, 'w:p')
   const pPr = firstChild(pChildren, 'w:pPr')
   if (!pPr) return null
   const styleId = orderedAttr(firstChild(kids(pPr, 'w:pPr'), 'w:pStyle') ?? {}, 'w:val')
   if (!styleId) return null
-  const key = styleId.toLowerCase().replace(/\s+/g, '')
-  if (key === 'detailsstart') return 'start'
-  if (key === 'detailsend') return 'end'
-  if (key === 'detailssummary') return 'summary'
+  const has = (token: string): boolean =>
+    styles ? styles.matches(styleId, token) : styleId.toLowerCase().replace(/\s+/g, '') === token
+  if (has('detailsstart')) return 'start'
+  if (has('detailsend')) return 'end'
+  if (has('detailssummary')) return 'summary'
   return null
 }
 
@@ -325,15 +329,16 @@ function detailsMarkerOf(p: OrderedNode): 'start' | 'end' | 'summary' | null {
  * bracket a quote's content so any inner block (list, nested quote, …) stays
  * inside the quote on re-import.
  */
-function blockquoteMarkerOf(p: OrderedNode): 'start' | 'end' | null {
+function blockquoteMarkerOf(p: OrderedNode, styles?: StyleMap): 'start' | 'end' | null {
   const pChildren = kids(p, 'w:p')
   const pPr = firstChild(pChildren, 'w:pPr')
   if (!pPr) return null
   const styleId = orderedAttr(firstChild(kids(pPr, 'w:pPr'), 'w:pStyle') ?? {}, 'w:val')
   if (!styleId) return null
-  const key = styleId.toLowerCase().replace(/\s+/g, '')
-  if (key === 'blockquotestart') return 'start'
-  if (key === 'blockquoteend') return 'end'
+  const has = (token: string): boolean =>
+    styles ? styles.matches(styleId, token) : styleId.toLowerCase().replace(/\s+/g, '') === token
+  if (has('blockquotestart')) return 'start'
+  if (has('blockquoteend')) return 'end'
   return null
 }
 
@@ -341,13 +346,15 @@ function blockquoteMarkerOf(p: OrderedNode): 'start' | 'end' | null {
  * True if the paragraph is the invisible `CodeBlockEnd` boundary marker the
  * exporter appends after each code block (so adjacent code blocks do not merge).
  */
-function codeBlockEndMarker(p: OrderedNode): boolean {
+function codeBlockEndMarker(p: OrderedNode, styles?: StyleMap): boolean {
   const pChildren = kids(p, 'w:p')
   const pPr = firstChild(pChildren, 'w:pPr')
   if (!pPr) return false
   const styleId = orderedAttr(firstChild(kids(pPr, 'w:pPr'), 'w:pStyle') ?? {}, 'w:val')
   if (!styleId) return false
-  return styleId.toLowerCase().replace(/\s+/g, '') === 'codeblockend'
+  return styles
+    ? styles.matches(styleId, 'codeblockend')
+    : styleId.toLowerCase().replace(/\s+/g, '') === 'codeblockend'
 }
 
 /**
@@ -488,17 +495,20 @@ function foldDetails(blocks: PmNode[]): PmNode[] {
  */
 function styledKindOf(
   p: OrderedNode,
+  styles?: StyleMap,
 ): { kind: 'code' } | { kind: 'callout'; variant: string } | { kind: 'blockquote' } | null {
   const pChildren = kids(p, 'w:p')
   const pPr = firstChild(pChildren, 'w:pPr')
   if (!pPr) return null
   const styleId = orderedAttr(firstChild(kids(pPr, 'w:pPr'), 'w:pStyle') ?? {}, 'w:val')
   if (!styleId) return null
-  const key = styleId.toLowerCase().replace(/\s+/g, '')
-  if (key === 'codeblock') return { kind: 'code' }
-  if (key === 'blockquote') return { kind: 'blockquote' }
-  const variant = CALLOUT_STYLE_VARIANT[key]
-  if (variant) return { kind: 'callout', variant }
+  const has = (token: string): boolean =>
+    styles ? styles.matches(styleId, token) : styleId.toLowerCase().replace(/\s+/g, '') === token
+  if (has('codeblock')) return { kind: 'code' }
+  if (has('blockquote')) return { kind: 'blockquote' }
+  for (const [token, variant] of Object.entries(CALLOUT_STYLE_VARIANT)) {
+    if (has(token)) return { kind: 'callout', variant }
+  }
   return null
 }
 
@@ -744,6 +754,7 @@ function mapParagraph(
   rels: RelMap,
   warnings: string[],
   deadline?: Deadline,
+  styles?: StyleMap,
 ): PmNode[] {
   const pChildren = kids(p, 'w:p')
   const pPr = firstChild(pChildren, 'w:pPr')
@@ -766,7 +777,7 @@ function mapParagraph(
   // paragraph flow is not representable, so trailing-sibling is the closest).
   const { inline, blocks } = collectInline(pChildren, rels, warnings, deadline)
 
-  const headingLevel = headingLevelFromStyle(styleId)
+  const headingLevel = headingLevelFromStyle(styleId, styles)
   const attrs: Record<string, unknown> = {}
   if (align) attrs.textAlign = align
 
@@ -789,10 +800,22 @@ function mapParagraph(
 }
 
 /** "Heading1".."Heading6" (or "heading 1" variants) → 1..6, else null. */
-function headingLevelFromStyle(styleId: string | null): number | null {
+function headingLevelFromStyle(styleId: string | null, styles?: StyleMap): number | null {
   if (!styleId) return null
-  const m = styleId.toLowerCase().replace(/\s+/g, '').match(/^heading([1-6])$/)
-  return m ? Number(m[1]) : null
+  // Resolve a numeric styleId (e.g. "2") to its style name via styles.xml first,
+  // the same indirection the code/quote/callout/details classifiers use; Word
+  // renumbers named heading styleIds into bare integers on copy/re-save.
+  // Resolve a numeric styleId (e.g. "2") to its style name via styles.xml, but
+  // also accept the raw styleId token (Heading1..6): resolving must not stop a
+  // recognised token from classifying when its <w:name> is localized/third-party.
+  for (let level = 1; level <= 6; level++) {
+    const token = `heading${level}`
+    const hit = styles
+      ? styles.matches(styleId, token)
+      : styleId.toLowerCase().replace(/\s+/g, '') === token
+    if (hit) return level
+  }
+  return null
 }
 
 /**
