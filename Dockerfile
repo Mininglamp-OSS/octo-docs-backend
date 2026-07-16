@@ -56,6 +56,7 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src ./src
+COPY migrations ./migrations
 RUN npm run build
 
 ENV NODE_ENV=production

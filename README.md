@@ -91,17 +91,18 @@ Copy `.env.example` to `.env` and adjust. Summary:
 # 1. install
 npm install
 
-# 2. create the schema (the 8 tables from §3.4)
+# 2. create the schema (fresh install only)
 #    FRESH INSTALL ONLY — schema.sql holds the full CREATE TABLE DDLs and is
 #    applied once. Re-running it on an existing DB does nothing for tables that
 #    already exist, so it does NOT add columns introduced after the initial
 #    install — use the upgrade migrations below for that.
 mysql -u <user> -p <database> < migrations/schema.sql
 
-# 2b. EXISTING DEPLOYMENTS — apply the incremental upgrade migrations in
-#     migrations/upgrades/ IN FILENAME (date) ORDER. Each is idempotent and
-#     safe to re-run. Skip on a fresh install (schema.sql already covers them).
-mysql -u <user> -p <database> < migrations/upgrades/2026-06-23-add-doc-attachment-file-name.sql
+# 2b. EXISTING DEPLOYMENTS — build, then run the migration ledger runner.
+#     It applies migrations/upgrades/*.sql in filename order, records filename
+#     + checksum in schema_migrations, and safely skips already-applied files.
+npm run build
+npm run migrate
 
 # 3. dev server (tsx watch) — starts both WS (:1234) and REST (:3000)
 npm run dev
@@ -110,6 +111,14 @@ npm run dev
 npm run build
 npm start
 ```
+
+For local development before building, `npm run migrate:dev` runs the same
+runner directly from TypeScript. Plain `mysql < migrations/upgrades/...` remains
+valid as a low-level fallback, but production deploys should use `npm run
+migrate` as an explicit step before starting the new server version.
+When adopting the runner on a database previously migrated by hand, its first
+run will re-run the idempotent upgrade files once to populate the
+`schema_migrations` ledger.
 
 ## PDF export (Typst)
 
