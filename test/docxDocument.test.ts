@@ -53,6 +53,61 @@ describe('walkDocument — paragraphs & headings', () => {
     const out = walkDocument(docXml(''), new Map())
     expect(out.content).toEqual([{ type: 'paragraph', content: [] }])
   })
+
+  it('resolves numeric pStyle styleIds via styles.xml for headings, code and quotes', () => {
+    // Word renumbers named styleIds (Heading 1 / Code Block / Block Quote) into
+    // bare integers on copy/re-save, keeping the real name only in <w:name>.
+    const stylesXml = buf(
+      `<?xml version="1.0"?><w:styles xmlns:w="http://x">` +
+        `<w:style w:styleId="2"><w:name w:val="heading 1"/></w:style>` +
+        `<w:style w:styleId="19"><w:name w:val="Code Block"/></w:style>` +
+        `<w:style w:styleId="20"><w:name w:val="Block Quote"/></w:style>` +
+        `</w:styles>`,
+    )
+    const document = docXml(
+      '<w:p><w:pPr><w:pStyle w:val="2"/></w:pPr><w:r><w:t>Title</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="19"/></w:pPr><w:r><w:t>code</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="20"/></w:pPr><w:r><w:t>quote</w:t></w:r></w:p>',
+    )
+    const { doc } = buildDocFromParts(
+      extracted({ 'word/document.xml': document, 'word/styles.xml': stylesXml }),
+    )
+    const types = doc.content.map((n) => n.type)
+    expect(types).toContain('heading')
+    expect(types).toContain('codeBlock')
+    expect(types).toContain('blockquote')
+    expect(doc.content.find((n) => n.type === 'heading')!.attrs).toMatchObject({ level: 1 })
+  })
+
+  it('numeric styleId with no styles.xml stays a plain paragraph (no false match)', () => {
+    // Without a styles map a bare numeric styleId cannot be resolved, so it must
+    // NOT be misclassified — it degrades to a plain paragraph, unchanged behaviour.
+    const document = docXml('<w:p><w:pPr><w:pStyle w:val="19"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>')
+    const out = walkDocument(document, new Map())
+    expect(out.content[0]!.type).toBe('paragraph')
+  })
+
+  it('recognised styleId token still classifies when its <w:name> diverges', () => {
+    // A styleId whose TOKEN is recognised (Heading1 / CodeBlock) but whose
+    // <w:name> is localized/third-party (标题 1 / Source Code) must still
+    // classify: resolving to the name is additive, it must not drop the token.
+    const stylesXml = buf(
+      `<?xml version="1.0"?><w:styles xmlns:w="http://x">` +
+        `<w:style w:styleId="Heading1"><w:name w:val="标题 1"/></w:style>` +
+        `<w:style w:styleId="CodeBlock"><w:name w:val="Source Code"/></w:style>` +
+        `</w:styles>`,
+    )
+    const document = docXml(
+      '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>H</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="CodeBlock"/></w:pPr><w:r><w:t>code</w:t></w:r></w:p>',
+    )
+    const { doc } = buildDocFromParts(
+      extracted({ 'word/document.xml': document, 'word/styles.xml': stylesXml }),
+    )
+    const types = doc.content.map((n) => n.type)
+    expect(types).toContain('heading')
+    expect(types).toContain('codeBlock')
+  })
 })
 
 describe('walkDocument — run marks', () => {

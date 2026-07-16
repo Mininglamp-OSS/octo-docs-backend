@@ -20,6 +20,7 @@ import { walkDocument, makeDeadline, type Deadline } from './document.js'
 import { config } from '../../config/env.js'
 import { parseRels } from './rels.js'
 import { parseNumbering } from './numbering.js'
+import { parseStyles } from './styles.js'
 import { resolveImages, type MediaResolver, type MediaUploadCtx } from './media.js'
 import type { PmNode } from './types.js'
 import { Node as PMNode } from 'prosemirror-model'
@@ -70,7 +71,9 @@ export function buildDocFromParts(extracted: ExtractedDocx, deadline?: Deadline)
 
   const numbering = parseNumbering(extracted.parts.get('word/numbering.xml')?.data)
 
-  const walked = walkDocument(documentXml, rels.targets, numbering, deadline)
+  const styleMap = parseStyles(extracted.parts.get('word/styles.xml')?.data)
+
+  const walked = walkDocument(documentXml, rels.targets, numbering, deadline, styleMap)
   warnings.push(...walked.warnings)
 
   // rId → media entry: the rel Target for an image is e.g. "media/image1.png",
