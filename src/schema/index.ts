@@ -89,6 +89,18 @@ export const COLLAB_FIELD = 'default'
  *         render + on the JSON write path. SCHEMA_VERSION 18 is the shared
  *         front/back contract for this feature — the octo-web @octo/docs-schema
  *         half registers the SAME number; the backend does NOT self-assign.
+ *   - v19 tableRow.height — ATTR on the `tableRow` node (no new node/mark): a
+ *         per-row height in px so the front-end row-height drag handle can
+ *         persist a dragged row height. Type `number | null`, default `null`
+ *         (no height = the row is content-sized, exactly the v18 behavior, so
+ *         existing docs never regress). A set height serializes to the inline
+ *         `height:Npx` style on the `<tr>`; a null height emits a bare `<tr>`
+ *         with no style. parseDOM reads the integer px back off the tr's inline
+ *         height. Unlike the cell `colwidth` (a `number[]`), the row height is
+ *         a single integer SCALAR — one value per row. SCHEMA_VERSION 19 is the
+ *         shared front/back contract for this feature — the octo-web
+ *         @octo/docs-schema half registers the SAME number; the backend does
+ *         NOT self-assign.
  *
  * 14/15 land in the same lockstep as the frontend `@octo/docs-schema` /
  * SCHEMA-SPEC registration (node + attr byte alignment): the front-end Tiptap
@@ -98,7 +110,7 @@ export const COLLAB_FIELD = 'default'
  * horizontalRule + the marks above) use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization, consistent with the image/table nodes here.
  */
-export const SCHEMA_VERSION = 18
+export const SCHEMA_VERSION = 19
 
 /**
  * Shared attrs + DOM mapping for `tableCell` / `tableHeader` (SCHEMA-SPEC §4).
@@ -155,6 +167,34 @@ function setCellAttrs(node: { attrs: Record<string, unknown> }): Record<string, 
   if (colwidth) attrs['data-colwidth'] = colwidth.join(',')
   if (align != null) attrs['data-align'] = align
   return attrs
+}
+
+/**
+ * Row height helpers for `tableRow` (SCHEMA-SPEC v19).
+ *
+ * A `tableRow` carries an optional `height` — a single integer of px (NOT a
+ * `number[]` like the cell `colwidth`; a row has exactly one height). It rides
+ * the tr's inline `height:Npx` style so a dragged row height survives the
+ * Y.Doc <-> ProseMirror round-trip and HTML import/export. `null` = no height
+ * (the default; the row is content-sized, exactly the v18 behavior). Both ends
+ * sanitize to a positive integer so a hostile / malformed inline height can
+ * neither enter the Y.Doc nor serialize back out.
+ */
+function sanitizeRowHeight(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(n)) return null
+  const px = Math.round(n)
+  return px > 0 ? px : null
+}
+
+// Read the integer px height off a tr's inline `height:Npx` style (`null` when
+// absent or not an integer px value).
+function getRowHeight(dom: unknown): number | null {
+  const el = dom as { style?: { height?: string } }
+  const raw = el.style?.height
+  if (typeof raw !== 'string') return null
+  const m = /^(\d+)px$/.exec(raw.trim())
+  return m ? sanitizeRowHeight(m[1]) : null
 }
 
 /**
@@ -369,8 +409,9 @@ function sanitizeBookmarkUrl(raw: string | null | undefined): string | null {
 /**
  * Build the ProseMirror schema used for server-side Y.Doc <-> ProseMirror
  * conversion (§7.1). Mirrors the frozen `@octo/docs-schema` package at
- * SCHEMA_VERSION 18 — the FULL Tiptap node/mark set (v17 adds the block-spacing
- * attrs, v18 adds the indent attr, on heading/paragraph) — so any front-end-authored
+ * SCHEMA_VERSION 19 — the FULL Tiptap node/mark set (v17 adds the block-spacing
+ * attrs, v18 adds the indent attr on heading/paragraph, v19 adds the height attr
+ * on tableRow) — so any front-end-authored
  * document round-trips through y-prosemirror and `PMNode.fromJSON(...).check()`
  * without loss. The standard nodes/marks use their standard Tiptap/StarterKit
  * ProseMirror DOM serialization; the self-built nodes (image/table/callout/
@@ -587,8 +628,14 @@ export function buildSchema(): Schema {
       tableRow: {
         content: '(tableCell | tableHeader)*',
         tableRole: 'row',
-        parseDOM: [{ tag: 'tr' }],
-        toDOM: () => ['tr', 0],
+        // v19: optional per-row height (integer px, default null). Rides the
+        // tr's inline `height:Npx` style; null = content-sized (v18 behavior).
+        attrs: { height: { default: null as number | null } },
+        parseDOM: [{ tag: 'tr', getAttrs: (dom) => ({ height: getRowHeight(dom) }) }],
+        toDOM: (node) => {
+          const height = sanitizeRowHeight(node.attrs.height)
+          return height != null ? ['tr', { style: 'height:' + height + 'px' }, 0] : ['tr', 0]
+        },
       },
       tableCell: {
         content: 'block+',
