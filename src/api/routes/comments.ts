@@ -1,8 +1,8 @@
 /**
  * Inline-comment endpoints (feature #3 — doc_comment).
  *   GET    /api/v1/docs/{docId}/comments        (reader)  list thread roots + replies
- *   POST   /api/v1/docs/{docId}/comments        (reader)  create root or reply
- *   PATCH  /api/v1/docs/{docId}/comments/{id}    body edit -> author; resolve -> writer
+ *   POST   /api/v1/docs/{docId}/comments        (commenter)  create root or reply
+ *   PATCH  /api/v1/docs/{docId}/comments/{id}    body edit -> author; status -> writer
  *   DELETE /api/v1/docs/{docId}/comments/{id}    soft -> author; hard -> admin
  *
  * Comments live entirely out-of-band from the Y.Doc. Anchors are opaque encoded
@@ -17,14 +17,18 @@
  * always takes precedence, so the existing front-end selection flow is not
  * affected.
  *
- * Product decision: read => can comment, so creating a comment only needs the
- * reader role. Resolving/reopening a thread needs writer; deleting your own
- * comment (soft) needs to be its author; hard delete needs admin.
+ * Product decision: commenting requires the commenter role or higher — a plain
+ * read-only reader can view but NOT comment. Viewing comments (list/get) stays
+ * at reader. Adjudicating a thread (open/approved/rejected/committed) needs
+ * writer; deleting your own comment (soft) needs to be its author; hard delete
+ * needs admin. Comment VISIBILITY is never gated by status — a reader sees
+ * rejected/committed roots too; approval is only an execution-list FILTER.
  */
 import { Router, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { roleAtLeast } from '../../permission/role.js'
 import { docCommentRepo, type DocComment } from '../../db/repos/docCommentRepo.js'
+import { isStatus, InvalidTransitionError, type Status } from '../../comments/status.js'
 import {
   resolveAnchorFromLiveDoc,
   AmbiguousAnchorError,
@@ -168,6 +172,11 @@ function serialize(c: DocComment) {
     anchorStart: c.anchorStart ? c.anchorStart.toString('base64') : null,
     anchorEnd: c.anchorEnd ? c.anchorEnd.toString('base64') : null,
     anchorText: c.anchorText,
+    status: c.status,
+    adjudicatedBy: c.adjudicatedBy,
+    adjudicatedAt: c.adjudicatedAt,
+    adjudicationNote: c.adjudicationNote,
+    // Legacy fields kept for old clients: resolved is derived (status !== 'open').
     resolved: c.resolved,
     resolvedBy: c.resolvedBy,
     resolvedAt: c.resolvedAt,
@@ -183,11 +192,25 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
   if (!guard) return
 
   const includeResolved = req.query.includeResolved === '1'
+  // Optional lifecycle filter (agent pulls its execution list with ?status=approved).
+  // Visibility is NOT gated: any reader may filter to any status, including
+  // rejected/committed. When the param is PRESENT but not a valid Status, 400 —
+  // silently falling back to the default open list would mask API misuse (esp.
+  // the agent execution-list path). An ABSENT param keeps the default behavior.
+  const statusRaw = req.query.status
+  let status: Status | undefined
+  if (statusRaw !== undefined) {
+    if (!isStatus(statusRaw)) {
+      res.status(400).json({ error: 'invalid status' })
+      return
+    }
+    status = statusRaw
+  }
   const cursor = parseId(req.query.cursor)
   const limitRaw = Number(req.query.limit ?? DEFAULT_LIMIT)
   const limit = Math.min(MAX_LIMIT, Math.max(1, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : DEFAULT_LIMIT))
 
-  const roots = await docCommentRepo.listRoots(guard.meta.doc_id, { includeResolved, cursor, limit })
+  const roots = await docCommentRepo.listRoots(guard.meta.doc_id, { includeResolved, status, cursor, limit })
   // Batch all replies for this page of roots in ONE query, then group by
   // parent in memory — avoids an N+1 (one listReplies per root, up to ~101).
   const replies = await docCommentRepo.listRepliesForRoots(roots.map((r) => r.id))
@@ -209,8 +232,9 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
 commentsRouter.post('/:docId/comments', createCommentHandler)
 
 export async function createCommentHandler(req: Request, res: Response): Promise<void> {
-  // Product decision: read => can comment.
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  // Product decision (feat/commentable-role): commenting requires commenter or
+  // higher; a read-only reader can view comments but cannot create them.
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const { body, anchorStart, anchorEnd, anchorText, parentId } = req.body ?? {}
@@ -241,7 +265,13 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       res.status(400).json({ error: 'parent is not a thread root' })
       return
     }
-    const id = await docCommentRepo.create({
+    // Audit-immutability (留痕): a reply may only be appended while the parent
+    // thread is still open. Once the root is adjudicated (approved/rejected/
+    // committed) the discussion is frozen — mirroring the edit/delete guards. The
+    // parent.status snapshot above is a non-locking read, so do the authoritative
+    // check as an atomic guarded insert (INSERT ... SELECT ... WHERE root.status =
+    // open) to close the read->insert race; a null result => adjudicated under us.
+    const id = await docCommentRepo.createReplyIfParentOpen({
       docId,
       documentName,
       parentId: pid,
@@ -251,6 +281,10 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       anchorEnd: null,
       anchorText: '',
     })
+    if (id === null) {
+      res.status(409).json({ error: 'thread_not_open' })
+      return
+    }
     res.status(201).json({ id })
     return
   }
@@ -353,23 +387,62 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
     return
   }
 
-  const { body, resolved } = req.body ?? {}
+  const { body, status, resolved, note } = req.body ?? {}
 
-  // Resolve / reopen a thread root — requires writer (elevated above the floor).
-  if (resolved !== undefined) {
+  // Adjudicate a thread root — requires writer (elevated above the reader floor).
+  // Accepts either the new `status` field or the legacy `resolved` boolean; both
+  // route through the same transition-validated path.
+  //   { status: 'open'|'approved'|'rejected'|'committed', note?: string }
+  //   { resolved: true }  -> status:'approved'   (legacy compat)
+  //   { resolved: false } -> status:'open'       (legacy compat)
+  // `committed` may be set by a writer too (the agent acts through a writer/bot
+  // identity on the commit-confirm path).
+  if (status !== undefined || resolved !== undefined) {
     if (!roleAtLeast(guard.role, 'writer')) {
       res.status(403).json({ error: 'forbidden' })
       return
     }
     if (comment.parentId !== null) {
-      res.status(400).json({ error: 'only a thread root can be resolved' })
+      res.status(400).json({ error: 'only a thread root can be adjudicated' })
       return
     }
-    if (typeof resolved !== 'boolean') {
-      res.status(400).json({ error: 'resolved must be a boolean' })
+    // Resolve the target status from whichever field was supplied.
+    let toStatus: Status
+    if (status !== undefined) {
+      if (!isStatus(status)) {
+        res.status(400).json({ error: 'invalid status' })
+        return
+      }
+      toStatus = status
+    } else {
+      if (typeof resolved !== 'boolean') {
+        res.status(400).json({ error: 'resolved must be a boolean' })
+        return
+      }
+      toStatus = resolved ? 'approved' : 'open'
+    }
+    if (note !== undefined && typeof note !== 'string') {
+      res.status(400).json({ error: 'note must be a string' })
       return
     }
-    await docCommentRepo.setResolved(id, resolved, req.uid!)
+    // adjudication_note is VARCHAR(1024); a longer note would truncate silently
+    // (or error under STRICT sql_mode) at write time. Reject up front so the
+    // limit is explicit rather than mode-dependent.
+    if (note !== undefined && note.length > 1024) {
+      res.status(400).json({ error: 'note too long (max 1024)' })
+      return
+    }
+    try {
+      await docCommentRepo.setStatus(id, toStatus, req.uid!, note ?? '')
+    } catch (err) {
+      // A disallowed lifecycle move (e.g. committed->open, open->committed) is a
+      // client error, not a 500 — surface it as 400 invalid_transition.
+      if (err instanceof InvalidTransitionError) {
+        res.status(400).json({ error: 'invalid_transition' })
+        return
+      }
+      throw err
+    }
     res.status(200).json({ id })
     return
   }
@@ -380,11 +453,29 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
       res.status(403).json({ error: 'forbidden' })
       return
     }
+    // Once a root has been adjudicated (approved/rejected/committed), its text is
+    // part of the audit trail (留痕): a reviewer approved *that* text. Letting the
+    // author silently rewrite the body afterwards would make the adjudication
+    // record lie (adjudicated_by/at still stamp the old decision). Only an `open`
+    // comment — not yet decided — may still have its body edited.
+    if (comment.status !== 'open') {
+      res.status(409).json({ error: 'comment_not_editable' })
+      return
+    }
     if (typeof body !== 'string' || body.trim() === '') {
       res.status(400).json({ error: 'body required' })
       return
     }
-    await docCommentRepo.updateBody(id, body)
+    // The status check above is off a non-locking read, so it closes only the
+    // sequential bypass. updateBody does the authoritative compare-and-swap on
+    // `status = open AND deleted = 0`; if a reviewer adjudicated (or the row was
+    // removed) between the read and the write, it lands 0 rows -> 409, so a
+    // concurrent adjudication can't be silently overwritten.
+    const edited = await docCommentRepo.updateBody(id, body)
+    if (!edited) {
+      res.status(409).json({ error: 'comment_not_editable' })
+      return
+    }
     res.status(200).json({ id })
     return
   }
@@ -431,6 +522,25 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
     res.status(403).json({ error: 'forbidden' })
     return
   }
-  await docCommentRepo.softDelete(id)
+  // An adjudicated root (approved/rejected/committed) belongs to the audit trail
+  // (留痕), not the author: letting an author soft-delete a `committed` row — the
+  // proof a change was applied to the live doc — would erase it from every
+  // listing (all reads filter deleted = 0) with no writer/admin involvement.
+  // Only an `open` (undecided) comment may be author-removed; removing a decided
+  // one is a moderator action (hard delete, admin-gated above).
+  if (comment.status !== 'open') {
+    res.status(409).json({ error: 'comment_not_deletable' })
+    return
+  }
+  // The status check above is a non-locking read (sequential guard only); the
+  // authoritative check is softDelete's compare-and-swap on `status = open AND
+  // deleted = 0`. If the root was adjudicated (or already removed) between the
+  // read and the write, it lands 0 rows -> 409, so a concurrent commit can't be
+  // erased out from under the audit trail.
+  const removed = await docCommentRepo.softDelete(id)
+  if (!removed) {
+    res.status(409).json({ error: 'comment_not_deletable' })
+    return
+  }
   res.status(200).json({ id })
 }

@@ -10,6 +10,14 @@
  * snake_case -> camelCase in the typed return (see DocComment).
  */
 import { query, transaction } from '../pool.js'
+import type { ResultSetHeader } from 'mysql2'
+import {
+  type Status,
+  statusFromNumber,
+  statusToNumber,
+  canTransition,
+  InvalidTransitionError,
+} from '../../comments/status.js'
 
 export interface DocComment {
   id: number
@@ -21,6 +29,12 @@ export interface DocComment {
   anchorStart: Buffer | null
   anchorEnd: Buffer | null
   anchorText: string
+  /** Adjudication lifecycle state; root-only (open|approved|rejected|committed). */
+  status: Status
+  adjudicatedBy: string | null
+  adjudicatedAt: Date | null
+  adjudicationNote: string
+  /** Legacy DERIVED mirror for old clients: resolved = status !== 'open'. */
   resolved: boolean
   resolvedBy: string | null
   resolvedAt: Date | null
@@ -39,6 +53,10 @@ interface DocCommentRow {
   anchor_start: Buffer | null
   anchor_end: Buffer | null
   anchor_text: string
+  status: number
+  adjudicated_by: string | null
+  adjudicated_at: Date | null
+  adjudication_note: string
   resolved: number
   resolved_by: string | null
   resolved_at: Date | null
@@ -48,6 +66,9 @@ interface DocCommentRow {
 }
 
 function mapRow(row: DocCommentRow): DocComment {
+  // status is the single source of truth; resolved is derived from it so old
+  // clients keep working even if a legacy row's stored `resolved` drifts.
+  const status = statusFromNumber(row.status) ?? 'open'
   return {
     id: Number(row.id),
     docId: row.doc_id,
@@ -58,7 +79,11 @@ function mapRow(row: DocCommentRow): DocComment {
     anchorStart: row.anchor_start ?? null,
     anchorEnd: row.anchor_end ?? null,
     anchorText: row.anchor_text,
-    resolved: row.resolved === 1,
+    status,
+    adjudicatedBy: row.adjudicated_by ?? null,
+    adjudicatedAt: row.adjudicated_at ?? null,
+    adjudicationNote: row.adjudication_note ?? '',
+    resolved: status !== 'open',
     resolvedBy: row.resolved_by ?? null,
     resolvedAt: row.resolved_at ?? null,
     deleted: row.deleted === 1,
@@ -81,6 +106,13 @@ export interface CreateCommentInput {
 
 export interface ListRootsOptions {
   includeResolved: boolean
+  /**
+   * Optional lifecycle filter. When set, roots are filtered to exactly this
+   * status (overrides `includeResolved`); the agent uses status='approved' to
+   * pull its execution list. When unset, `includeResolved` controls whether
+   * non-open roots are included (false => open only, matching legacy behavior).
+   */
+  status?: Status
   /** Return roots with id strictly greater than this cursor (ascending paging). */
   cursor: number | null
   limit: number
@@ -118,6 +150,54 @@ export const docCommentRepo = {
     return rows[0] ? mapRow(rows[0]) : null
   },
 
+  /**
+   * Create a reply atomically gated on the parent thread still being open.
+   *
+   * A reply appended to an already-adjudicated (approved/rejected/committed)
+   * root would mutate the discussion context behind a recorded decision — and,
+   * for an `approved` root, add agent-visible context to a queued item — which
+   * breaks the same audit-immutability (留痕) invariant that updateBody/softDelete
+   * already enforce for reply EDITS/DELETES. Root state must therefore be
+   * consulted on reply CREATION too. A plain read-then-insert leaves a TOCTOU
+   * window (the root can be adjudicated between the read and the insert), so the
+   * insert itself is guarded: `INSERT ... SELECT` only emits a row while the
+   * parent is a live, open root in this doc. A 0-row result means the parent was
+   * adjudicated/removed under us (or is not a valid reply target); we return null
+   * so the route can 409 instead of silently attaching to a closed thread.
+   *
+   * Caller must still pre-validate parent existence/doc/root-ness for correct
+   * 404 / 400 error codes; this method is the authoritative race-safe gate.
+   */
+  async createReplyIfParentOpen(input: CreateCommentInput): Promise<number | null> {
+    const open = statusToNumber('open')
+    return transaction(async (tx) => {
+      const result = await tx.query<ResultSetHeader>(
+        `INSERT INTO doc_comment
+           (doc_id, document_name, parent_id, author_uid, body, anchor_start, anchor_end, anchor_text)
+         SELECT ?, ?, root.id, ?, ?, ?, ?, ?
+           FROM doc_comment root
+          WHERE root.id = ?
+            AND root.parent_id IS NULL
+            AND root.deleted = 0
+            AND root.status = ?`,
+        [
+          input.docId,
+          input.documentName,
+          input.authorUid,
+          input.body,
+          input.anchorStart,
+          input.anchorEnd,
+          input.anchorText,
+          input.parentId,
+          open,
+        ],
+      )
+      if ((result as unknown as ResultSetHeader).affectedRows === 0) return null
+      const rows = await tx.query<{ id: number | string }>('SELECT LAST_INSERT_ID() AS id')
+      return Number(rows[0]?.id ?? 0)
+    })
+  },
+
   /** All non-deleted comments for a doc (roots + replies), oldest first. */
   async listByDoc(docId: string): Promise<DocComment[]> {
     const rows = await query<DocCommentRow>(
@@ -131,8 +211,15 @@ export const docCommentRepo = {
   async listRoots(docId: string, opts: ListRootsOptions): Promise<DocComment[]> {
     const where = ['doc_id = ?', 'parent_id IS NULL', 'deleted = 0']
     const args: unknown[] = [docId]
-    if (!opts.includeResolved) {
-      where.push('resolved = 0')
+    if (opts.status !== undefined) {
+      // Explicit lifecycle filter wins over includeResolved (agent execution list).
+      where.push('status = ?')
+      args.push(statusToNumber(opts.status))
+    } else if (!opts.includeResolved) {
+      // Legacy default: only open (unadjudicated) roots. status is the source of
+      // truth; status=0 is exactly the old `resolved = 0` set.
+      where.push('status = ?')
+      args.push(statusToNumber('open'))
     }
     if (opts.cursor != null) {
       where.push('id > ?')
@@ -182,27 +269,149 @@ export const docCommentRepo = {
     return rows.map(mapRow)
   },
 
-  async updateBody(id: number, body: string): Promise<void> {
-    await query('UPDATE doc_comment SET body = ? WHERE id = ?', [body, id])
+  /**
+   * Edit a comment's body, but ONLY while the thread is still `open` and live.
+   * The route pre-checks `status === 'open'` off a non-locking read, which closes
+   * the sequential bypass but not the concurrent one: between that read and this
+   * write a reviewer can adjudicate the root (open->approved/committed), and an
+   * unconditional `WHERE id = ?` UPDATE would then rewrite the body a reviewer
+   * just approved — the exact audit-immutability (留痕) invariant this lifecycle
+   * exists to protect, via the same TOCTOU class `setStatus` already closes.
+   *
+   * The catch: only a ROOT carries a lifecycle status; a reply's own status is
+   * always `open` (replies are never adjudicated). So a per-row `status = 0`
+   * guard would let a reply author keep editing AFTER the parent thread was
+   * adjudicated — mutating the discussion behind an already-recorded decision.
+   * The compare-and-swap therefore gates on the whole thread: for a root, its
+   * OWN status must be open; for a reply, the PARENT ROOT must still be open (and
+   * live). Done atomically via a self-join so it stays race-free like the root
+   * CAS. A 0-row result means the thread was adjudicated or removed under us; we
+   * return false so the route can 409 instead of silently no-op'ing.
+   */
+  async updateBody(id: number, body: string): Promise<boolean> {
+    const open = statusToNumber('open')
+    const result = await query<ResultSetHeader>(
+      `UPDATE doc_comment c
+         LEFT JOIN doc_comment root ON c.parent_id = root.id
+       SET c.body = ?
+       WHERE c.id = ?
+         AND c.deleted = 0
+         AND (
+           (c.parent_id IS NULL AND c.status = ?)
+           OR
+           (c.parent_id IS NOT NULL AND root.status = ? AND root.deleted = 0)
+         )`,
+      [body, id, open, open],
+    )
+    return (result as unknown as ResultSetHeader).affectedRows > 0
   },
 
-  /** Resolve / reopen a thread root; stamps resolved_by/resolved_at when set. */
-  async setResolved(id: number, resolved: boolean, byUid: string): Promise<void> {
-    if (resolved) {
-      await query(
-        'UPDATE doc_comment SET resolved = 1, resolved_by = ?, resolved_at = CURRENT_TIMESTAMP(3) WHERE id = ?',
-        [byUid, id],
-      )
-    } else {
-      await query(
-        'UPDATE doc_comment SET resolved = 0, resolved_by = NULL, resolved_at = NULL WHERE id = ?',
+  /**
+   * Adjudicate a thread root: move it to `toStatus`, enforcing the allowed
+   * transition table (see comments/status.ts). Reads the current status first
+   * and throws InvalidTransitionError on a disallowed move so the route can
+   * 400 invalid_transition instead of silently writing.
+   *
+   * Stamps adjudicated_by/at (留痕 audit trail) and, for backward-compat, keeps
+   * the legacy resolved mirror in sync: resolved = (toStatus !== 'open'), with
+   * resolved_by/at cleared on reopen. Returns void; throws only on an invalid
+   * transition or a missing root.
+   */
+  async setStatus(id: number, toStatus: Status, byUid: string, note = ''): Promise<void> {
+    // Read + validate + write must be ONE atomic step, or two concurrent
+    // adjudicators can both read the same `from` status, both pass
+    // canTransition, and both write — the later writer can land the row on a
+    // status the earlier writer's transition already left (e.g. one does
+    // approved->committed, the other approved->open, final row = open, i.e. the
+    // forbidden committed->open reached via a stale read). We close the window
+    // by (a) locking the row FOR UPDATE inside a transaction and (b) making the
+    // UPDATE a compare-and-swap guarded on the `from` status we validated
+    // against; a 0-row result means someone moved it first -> InvalidTransition.
+    await transaction(async (tx) => {
+      const rows = await tx.query<{ status: number }>(
+        'SELECT status FROM doc_comment WHERE id = ? FOR UPDATE',
         [id],
       )
-    }
+      const row = rows[0]
+      if (!row) throw new InvalidTransitionError('open', toStatus)
+      const fromStatus = statusFromNumber(row.status) ?? 'open'
+      if (fromStatus === toStatus) {
+        // No-op transition: not in the allowed table. Treat setting a root to its
+        // current status as invalid to keep the state machine strict.
+        throw new InvalidTransitionError(fromStatus, toStatus)
+      }
+      if (!canTransition(fromStatus, toStatus)) {
+        throw new InvalidTransitionError(fromStatus, toStatus)
+      }
+      const fromNum = statusToNumber(fromStatus)
+      const resolved = toStatus !== 'open'
+      const result = resolved
+        ? await tx.query<ResultSetHeader>(
+            `UPDATE doc_comment
+               SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
+                   adjudication_note = ?, resolved = 1, resolved_by = ?, resolved_at = CURRENT_TIMESTAMP(3)
+             WHERE id = ? AND status = ? AND deleted = 0`,
+            [statusToNumber(toStatus), byUid, note, byUid, id, fromNum],
+          )
+        : // Reopen: clear the legacy resolved mirror, but keep the adjudication
+          // stamp as the audit trail of who last acted (留痕).
+          await tx.query<ResultSetHeader>(
+            `UPDATE doc_comment
+               SET status = ?, adjudicated_by = ?, adjudicated_at = CURRENT_TIMESTAMP(3),
+                   adjudication_note = ?, resolved = 0, resolved_by = NULL, resolved_at = NULL
+             WHERE id = ? AND status = ? AND deleted = 0`,
+            [statusToNumber(toStatus), byUid, note, id, fromNum],
+          )
+      // The FOR UPDATE lock plus the `status = fromNum` guard make this belt-and-
+      // suspenders, but keep the guard so a lost update surfaces as an invalid
+      // transition rather than a silent no-op.
+      const header = result as unknown as ResultSetHeader
+      if (header.affectedRows === 0) {
+        throw new InvalidTransitionError(fromStatus, toStatus)
+      }
+    })
   },
 
-  async softDelete(id: number): Promise<void> {
-    await query('UPDATE doc_comment SET deleted = 1 WHERE id = ?', [id])
+  /**
+   * Legacy compatibility shim: map the old boolean resolve/reopen onto the
+   * lifecycle. resolved:true -> approved, resolved:false -> open. Kept so old
+   * callers/tests keep working; new code should call setStatus directly.
+   */
+  async setResolved(id: number, resolved: boolean, byUid: string): Promise<void> {
+    await this.setStatus(id, resolved ? 'approved' : 'open', byUid)
+  },
+
+  /**
+   * Author soft-delete, but ONLY while the thread is still `open` and live. Same
+   * concurrent-TOCTOU shape as updateBody: the route's `status === 'open'` guard
+   * is a non-locking read, so a reviewer can commit the root between that read
+   * and this write; an unconditional `WHERE id = ?` would then hide a
+   * `committed` audit row (all reads filter deleted = 0) with no writer/admin
+   * involvement. And, as in updateBody, a per-row `status = 0` guard would miss
+   * replies (a reply's own status is always open): a reply author could soft-
+   * delete their reply after the parent thread was adjudicated. So the compare-
+   * and-swap gates on the whole thread via the same self-join — for a root, its
+   * OWN status must be open; for a reply, the PARENT ROOT must still be open (and
+   * live). A 0-row result (adjudicated or already gone under us) returns false so
+   * the route can 409. The `deleted = 0` guard also makes a double soft-delete a
+   * no-op rather than a spurious success.
+   */
+  async softDelete(id: number): Promise<boolean> {
+    const open = statusToNumber('open')
+    const result = await query<ResultSetHeader>(
+      `UPDATE doc_comment c
+         LEFT JOIN doc_comment root ON c.parent_id = root.id
+       SET c.deleted = 1
+       WHERE c.id = ?
+         AND c.deleted = 0
+         AND (
+           (c.parent_id IS NULL AND c.status = ?)
+           OR
+           (c.parent_id IS NOT NULL AND root.status = ? AND root.deleted = 0)
+         )`,
+      [id, open, open],
+    )
+    return (result as unknown as ResultSetHeader).affectedRows > 0
   },
 
   /**
