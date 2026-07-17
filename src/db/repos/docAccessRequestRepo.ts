@@ -31,9 +31,18 @@ export const docAccessRequestRepo = {
   /**
    * Submit (or re-submit) a request. Idempotent by (doc_id, uid): a duplicate
    * refreshes the existing row to pending with the new role/reason and clears
-   * the previous decision, keeping the original request_id stable so any list
-   * already showing it keeps addressing the same row. Returns the row's
-   * request_id and current status.
+   * the previous decision. A re-submit ROTATES request_id to a fresh high-entropy
+   * value so every submission is a distinct, addressable snapshot.
+   *
+   * Why rotate (not keep it stable): an approval card carries only request_id as
+   * its decision key. If request_id were reused across re-submits, a stale card
+   * minted for an earlier submission (e.g. "reader") could approve a later,
+   * different pending row (e.g. re-submitted as "writer"), granting a role the
+   * approver never saw on their card. Rotating request_id binds each card to the
+   * exact submission it represents: a stale card's request_id no longer matches
+   * any row, so the callback resolves it as not_found instead of applying to a
+   * newer request. The (doc_id, uid) PK still collapses duplicates to one row.
+   * Returns the row's (now current) request_id and status.
    */
   async submit(params: {
     docId: string
@@ -49,11 +58,13 @@ export const docAccessRequestRepo = {
          requested_role = VALUES(requested_role),
          reason         = VALUES(reason),
          status         = ${REQUEST_STATUS_PENDING},
-         decided_by     = ''`,
+         decided_by     = '',
+         request_id     = VALUES(request_id)`,
       [params.docId, params.uid, params.requestedRoleNum, params.reason, candidateId],
     )
-    // On a duplicate the passed candidateId is ignored (request_id is not updated),
-    // so read back the authoritative row to return its real request_id + status.
+    // request_id is now rotated to candidateId on both insert and duplicate-update,
+    // but read back the authoritative row to return the real stored id + status
+    // (defensive against any trigger/collation surprise on the write path).
     const rows = await query<{ request_id: string; status: number }>(
       'SELECT request_id, status FROM doc_access_request WHERE doc_id = ? AND uid = ? LIMIT 1',
       [params.docId, params.uid],
