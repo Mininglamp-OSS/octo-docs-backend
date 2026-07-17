@@ -81,6 +81,19 @@ describe('POST /docs/:docId/view — recordDocViewHandler', () => {
     expect(arg.docId).toBe('d_1')
     expect(arg.spaceId).toBe('s1')
   })
+
+  it('threads { isBot, token } into requireDocRole so share-scoped (anyone_in_space) readers resolve, not fail-closed', async () => {
+    // Once share resolution is live, a token-less reader guard fail-closes an
+    // anyone_in_space reader (no doc_member row) with a wrongful 403. The /view
+    // handler must pass the caller token/isBot just like the doc-read path.
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: {}, role: 'reader' } as never)
+    vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mockResolvedValue(
+      new Date('2026-07-15T06:20:48.123Z'),
+    )
+    await recordDocViewHandler(req({ params: { docId: 'd_1' } }), mockRes() as never)
+    const opts = vi.mocked(requireDocRole).mock.calls[0]![5]
+    expect(opts).toEqual({ isBot: false, token: 'tok' })
+  })
 })
 
 describe('GET /docs/recent — listRecentHandler', () => {
@@ -114,6 +127,28 @@ describe('GET /docs/recent — listRecentHandler', () => {
     const arg = vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0]
     expect(arg.creators).toEqual(['u_o'])
     expect(arg.cursor).toBe('X')
+  })
+
+  it('renders a stored role 4 as commenter (not reader) in the /recent payload', async () => {
+    // Regression: the stored role value 4 (commenter) is not the rank ordinal,
+    // so a hand-rolled ternary without a commenter branch silently degrades it
+    // to 'reader' and hides the comment affordance on the recent feed. The
+    // serializer must defer to the shared roleFromNumber map so a commenter
+    // stays a commenter here, exactly as on the docs-list route.
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 1,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_c', title: 'C', owner_id: 'u_o', doc_type: 'doc', role: 4,
+          updated_at: new Date('2026-07-12T00:00:00.000Z'), updated_by: '',
+          viewed_at: new Date('2026-07-15T04:00:00.000Z') },
+      ],
+    } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    expect(body.items[0]!.role).toBe('commenter')
   })
 
   it('resolves updatedBy (last editor) to { uid, name } server-side, authenticated with the caller token (XIN-1240)', async () => {

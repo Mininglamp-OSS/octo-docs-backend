@@ -17,8 +17,9 @@
  * always takes precedence, so the existing front-end selection flow is not
  * affected.
  *
- * Product decision: read => can comment, so creating a comment only needs the
- * reader role. Resolving/reopening a thread needs writer; deleting your own
+ * Product decision: commenting requires the commenter role or higher — a plain
+ * read-only reader can view but NOT comment. Viewing comments (list/get) stays
+ * at reader. Resolving/reopening a thread needs writer; deleting your own
  * comment (soft) needs to be its author; hard delete needs admin.
  */
 import { Router, type Request, type Response } from 'express'
@@ -209,8 +210,9 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
 commentsRouter.post('/:docId/comments', createCommentHandler)
 
 export async function createCommentHandler(req: Request, res: Response): Promise<void> {
-  // Product decision: read => can comment.
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  // Product decision (feat/commentable-role): commenting requires commenter or
+  // higher; a read-only reader can view comments but cannot create them.
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const { body, anchorStart, anchorEnd, anchorText, parentId } = req.body ?? {}
