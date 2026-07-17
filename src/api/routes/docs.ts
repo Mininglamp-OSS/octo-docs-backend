@@ -198,7 +198,7 @@ export async function getDocHandler(req: Request, res: Response) {
 }
 
 /** GET /api/v1/docs — list docs the caller owns or is a member of. */
-docsRouter.get('/', async (req: Request, res: Response) => {
+export async function listDocsHandler(req: Request, res: Response) {
   const uid = req.uid!
   // Space isolation (P1): the space is the enforced X-Space-Id header
   // (req.spaceId, set by spaceContextMiddleware), never a client-supplied query
@@ -234,7 +234,9 @@ docsRouter.get('/', async (req: Request, res: Response) => {
       updatedAt: d.updated_at,
     })),
   })
-})
+}
+
+docsRouter.get('/', listDocsHandler)
 
 /**
  * POST /api/v1/docs/{docId}/view — record that the caller opened this doc

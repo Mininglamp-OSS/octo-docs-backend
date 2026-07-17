@@ -1,14 +1,19 @@
 /**
  * doc_view_history repository (FEAT-B recent-view).
  *
- * Per-user document view records ("recent viewed"). One row per (uid, doc_id):
- * opening a document UPSERTs the row and refreshes viewed_at, so a re-open never
- * creates a second row (idempotent dedup, PK (uid, doc_id)).
+ * Per-user, per-space document view records ("recent viewed"). One row per
+ * (uid, doc_id, space_id): opening a document from a space UPSERTs that space's
+ * row and refreshes its viewed_at, so a re-open in the SAME space never creates a
+ * second row (idempotent dedup, PK (uid, doc_id, space_id)). A doc reachable from
+ * two spaces keeps an independent row per space, so it stays "recent" in BOTH —
+ * recent-view is per-space independent, not last-space-wins (P1-b, XIN-1297).
  *
  * Two responsibilities, kept strictly separate:
- *   - WRITE (upsertViewWithPrune): idempotent UPSERT + synchronous per-uid
- *     retention prune in ONE transaction (mirrors docVersionRepo.createAutoWithPrune).
- *     Pruning is capacity maintenance only.
+ *   - WRITE (upsertViewWithPrune): idempotent UPSERT + synchronous retention
+ *     prune in ONE transaction (mirrors docVersionRepo.createAutoWithPrune).
+ *     Pruning is capacity maintenance only. The count pass is scoped per
+ *     (uid, space_id) so each space's recent list is retained independently; the
+ *     age pass is per-uid so stale rows are reaped across every space.
  *   - READ (listRecent / listCreators): joins doc_meta (+ doc_member) and filters
  *     at QUERY TIME on status=1 + the visibility predicate. This — never pruning —
  *     is what makes a revoked / deleted / archived doc drop out of the next query.
@@ -111,8 +116,8 @@ function visibilityPredicate(isSpaceMember: boolean): string {
 
 export const docViewHistoryRepo = {
   /**
-   * Idempotent UPSERT of one (uid, doc_id) view + synchronous per-uid retention
-   * prune, in ONE transaction. Returns the row's post-write viewed_at.
+   * Idempotent UPSERT of one (uid, doc_id, space_id) view + synchronous
+   * retention prune, in ONE transaction. Returns the row's post-write viewed_at.
    *
    * Mirrors docVersionRepo.createAutoWithPrune: doing the UPSERT and both prune
    * passes under a single transaction avoids the race where two concurrent
@@ -121,7 +126,10 @@ export const docViewHistoryRepo = {
    * LIMIT / INTERVAL with ER_WRONG_ARGUMENTS; the clamped integers carry no
    * injection surface — same rationale as listForUser's LIMIT).
    *
-   * Uses the `VALUES(col)` UPSERT form for broad MySQL 8 compatibility; the
+   * Uses the `VALUES(col)` UPSERT form for broad MySQL 8 compatibility. Only
+   * viewed_at is refreshed on a duplicate — space_id is part of the PK now
+   * (P1-b), so a re-open in the SAME space matches the exact triple and just
+   * bumps viewed_at, while an open in a DIFFERENT space is a distinct row. The
    * explicit viewed_at = VALUES(viewed_at) assignment overrides the column's
    * ON UPDATE CURRENT_TIMESTAMP so the write time is deterministic (= NOW(3)).
    */
@@ -138,26 +146,31 @@ export const docViewHistoryRepo = {
       await tx.query(
         `INSERT INTO doc_view_history (uid, doc_id, space_id, viewed_at)
          VALUES (?, ?, ?, NOW(3))
-         ON DUPLICATE KEY UPDATE viewed_at = VALUES(viewed_at), space_id = VALUES(space_id)`,
+         ON DUPLICATE KEY UPDATE viewed_at = VALUES(viewed_at)`,
         [input.uid, input.docId, input.spaceId],
       )
-      // count-based prune (keep most-recent N view rows for this uid; 0 = unbounded).
+      // count-based prune (keep most-recent N view rows for this uid IN THIS
+      // SPACE; 0 = unbounded). Scoped per (uid, space_id) so a space's recent
+      // list is retained independently — heavy activity in one space never
+      // evicts another space's rows (P1-b per-space independence).
       if (keep > 0) {
         await tx.query(
           `DELETE FROM doc_view_history
-           WHERE uid = ?
+           WHERE uid = ? AND space_id = ?
              AND doc_id NOT IN (
                SELECT doc_id FROM (
                  SELECT doc_id FROM doc_view_history
-                 WHERE uid = ?
+                 WHERE uid = ? AND space_id = ?
                  ORDER BY viewed_at DESC, doc_id DESC
                  LIMIT ${keep}
                ) AS keep
              )`,
-          [input.uid, input.uid],
+          [input.uid, input.spaceId, input.uid, input.spaceId],
         )
       }
       // age-based prune (drop view rows older than retainDays; 0 = unbounded).
+      // Kept per-uid (space-agnostic) so stale rows are reaped across EVERY
+      // space on any open, including spaces the user no longer visits.
       if (days > 0) {
         await tx.query(
           `DELETE FROM doc_view_history
@@ -166,8 +179,8 @@ export const docViewHistoryRepo = {
         )
       }
       const rows = await tx.query<{ viewed_at: Date }>(
-        'SELECT viewed_at FROM doc_view_history WHERE uid = ? AND doc_id = ? LIMIT 1',
-        [input.uid, input.docId],
+        'SELECT viewed_at FROM doc_view_history WHERE uid = ? AND doc_id = ? AND space_id = ? LIMIT 1',
+        [input.uid, input.docId, input.spaceId],
       )
       return rows[0]?.viewed_at ?? new Date()
     })

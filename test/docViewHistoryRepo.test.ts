@@ -2,9 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // Offline unit test for docViewHistoryRepo: the REAL repo methods run against a
 // mocked pool (query + transaction), so we assert the exact (sql, params) shape
-// — idempotent UPSERT, synchronous per-uid retention prune (both passes), the
-// query-time permission/status filter, keyset-cursor paging, and the cursor
-// codec — with no live MySQL (mirrors docVersionPrune.test.ts).
+// — idempotent UPSERT, synchronous retention prune (count per (uid, space_id),
+// age per uid), the query-time permission/status filter, keyset-cursor paging,
+// and the cursor codec — with no live MySQL (mirrors docVersionPrune.test.ts).
 vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(async () => []),
   transaction: vi.fn(),
@@ -48,16 +48,19 @@ beforeEach(() => {
 })
 
 describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune', () => {
-  it('UPSERTs on (uid, doc_id): a re-open refreshes viewed_at, never inserts a new row', async () => {
+  it('UPSERTs on (uid, doc_id, space_id): a same-space re-open refreshes viewed_at, never inserts a new row', async () => {
     const calls = mockTx()
     await docViewHistoryRepo.upsertViewWithPrune({
       uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 200, retainDays: 90,
     })
     const insert = calls.find((c) => c.sql.includes('INSERT INTO doc_view_history'))
     expect(insert).toBeDefined()
-    // idempotency is the ON DUPLICATE KEY UPDATE arm refreshing viewed_at (+space).
+    // idempotency is the ON DUPLICATE KEY UPDATE arm refreshing viewed_at ONLY.
+    // space_id is part of the PK now (P1-b), so it is never overwritten — a
+    // different space is a distinct row, not a rewrite of the same one.
     expect(insert!.sql).toContain('ON DUPLICATE KEY UPDATE')
     expect(insert!.sql).toMatch(/viewed_at\s*=\s*VALUES\(viewed_at\)/)
+    expect(insert!.sql).not.toMatch(/space_id\s*=\s*VALUES\(space_id\)/)
     expect(insert!.params).toEqual(['u_1', 'd_1', 's1'])
   })
 
@@ -69,7 +72,7 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
     expect(out.toISOString()).toBe('2026-07-15T06:20:48.123Z')
   })
 
-  it('count prune (retainCount=3) keeps the most-recent 3 via an inlined LIMIT, keyed by uid', async () => {
+  it('count prune (retainCount=3) keeps the most-recent 3 via an inlined LIMIT, keyed by (uid, space_id)', async () => {
     const calls = mockTx()
     await docViewHistoryRepo.upsertViewWithPrune({
       uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 3, retainDays: 0,
@@ -79,8 +82,11 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
     expect(del!.sql).toMatch(/LIMIT 3\b/)
     expect(del!.sql).not.toMatch(/LIMIT \?/)
     expect(del!.sql).toMatch(/ORDER BY viewed_at DESC, doc_id DESC/)
-    // both the DELETE scope and the keep-set subquery are pinned to this uid.
-    expect(del!.params).toEqual(['u_1', 'u_1'])
+    // per-space retention (P1-b): both the DELETE scope and the keep-set subquery
+    // are pinned to this (uid, space_id), so activity in one space never prunes
+    // another space's rows.
+    expect(del!.sql).toMatch(/space_id = \?/)
+    expect(del!.params).toEqual(['u_1', 's1', 'u_1', 's1'])
     // 3 must not leak into params (inlined, not bound).
     expect(del!.params).not.toContain(3)
   })
@@ -114,6 +120,45 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
     expect(del!.sql).toMatch(/LIMIT 3\b/) // floor(3.9)=3
     // retainDays=-5 clamps to 0 => no age pass.
     expect(calls.some((c) => c.sql.includes('INTERVAL'))).toBe(false)
+  })
+})
+
+describe('docViewHistoryRepo — P1-b per-space recent (triple key, no flip-flop) [XIN-1297]', () => {
+  it('the same doc opened from two spaces writes one row PER space, each preserving its own space_id', async () => {
+    // Root cause of the flip-flop: the old (uid, doc_id) PK meant a re-open in a
+    // different space overwrote the single row's space_id, so the doc dropped out
+    // of the first space's recent list. With PK (uid, doc_id, space_id) each open
+    // is a distinct row keyed by space, and the UPSERT refreshes viewed_at only —
+    // it never rewrites space_id — so the doc stays "recent" in BOTH spaces.
+    const callsA = mockTx()
+    await docViewHistoryRepo.upsertViewWithPrune({
+      uid: 'u_1', docId: 'd_shared', spaceId: 's_A', retainCount: 200, retainDays: 90,
+    })
+    const insertA = callsA.find((c) => c.sql.includes('INSERT INTO doc_view_history'))!
+    expect(insertA.params).toEqual(['u_1', 'd_shared', 's_A'])
+
+    const callsB = mockTx()
+    await docViewHistoryRepo.upsertViewWithPrune({
+      uid: 'u_1', docId: 'd_shared', spaceId: 's_B', retainCount: 200, retainDays: 90,
+    })
+    const insertB = callsB.find((c) => c.sql.includes('INSERT INTO doc_view_history'))!
+    // Same (uid, doc) but a DIFFERENT space_id — a separate row, not a rewrite.
+    expect(insertB.params).toEqual(['u_1', 'd_shared', 's_B'])
+    // The UPSERT clause must not touch space_id (it is part of the PK), so the
+    // s_A row can never be flipped to s_B (or vice-versa) by an open in the other.
+    expect(insertB.sql).not.toMatch(/space_id\s*=\s*VALUES\(space_id\)/)
+  })
+
+  it('count prune stays within the written space, so a busy space cannot evict another space recent rows', async () => {
+    const calls = mockTx()
+    await docViewHistoryRepo.upsertViewWithPrune({
+      uid: 'u_1', docId: 'd_shared', spaceId: 's_A', retainCount: 3, retainDays: 0,
+    })
+    const del = calls.find((c) => c.sql.includes('DELETE') && c.sql.includes('NOT IN'))!
+    // The prune only ever deletes rows in the space just written (s_A). Rows in
+    // s_B are out of scope, so per-space recent lists are retained independently.
+    expect(del.sql).toMatch(/WHERE uid = \? AND space_id = \?/)
+    expect(del.params).toEqual(['u_1', 's_A', 'u_1', 's_A'])
   })
 })
 
