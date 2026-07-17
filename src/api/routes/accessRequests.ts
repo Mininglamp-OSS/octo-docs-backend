@@ -10,11 +10,12 @@
  * (grantForwardAccess: only-up, epoch bump, owner/admin skip). Denial leaves the
  * requester forbidden.
  *
- * NOTE (§4.2 / scope item 6): notification to owner+admin is PULL-based this
- * round — requests land in the table and admins fetch the pending list. Active
- * push to owner+admin is a second-phase backlog item (docs-backend has no
- * outbound IM capability today; octoIdentity only verifies tokens / looks up
- * users), intentionally NOT built here.
+ * NOTE (§4.2 / scope item 6): the pending list stays PULL-based (admins fetch it
+ * in the manage-members panel). The second-phase ACTIVE push to owner+admin is
+ * now implemented as a best-effort side effect of submit: a docs-notify card is
+ * sent via octo-server's internal notify API (see services/docsNotify.ts). It is
+ * fire-and-forget and gated on config — if OCTO_DOCS_NOTIFY_TOKEN is unset it is a
+ * silent no-op, and any send failure never affects the submit response.
  */
 import { Router, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
@@ -27,6 +28,7 @@ import {
 import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
+import { notifyDocAccessRequested } from '../services/docsNotify.js'
 import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
 
 export const accessRequestsRouter = Router()
@@ -83,6 +85,21 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     requestedRoleNum: roleToNumber(requestedRole),
     reason,
   })
+
+  // Best-effort second-phase push: notify owner+admins with a docs-notify card
+  // via octo-server's internal notify API. Fire-and-forget — never blocks or
+  // fails the 201 (notifyDocAccessRequested swallows all errors internally); the
+  // pending list is the source of truth.
+  void notifyDocAccessRequested({
+    docId,
+    requestId: out.requestId,
+    spaceId: meta.space_id,
+    ownerId: meta.owner_id,
+    title: meta.title,
+    requesterUid: req.uid!,
+    reason,
+  }).catch(() => {})
+
   res.status(201).json({ requestId: out.requestId, status: 'pending' })
 })
 

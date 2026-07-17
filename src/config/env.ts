@@ -234,6 +234,27 @@ export const config = {
     membershipCacheTtlSeconds: num('SPACE_MEMBERSHIP_CACHE_TTL_SECONDS', 30),
   },
 
+  // Outbound IM notification via octo-server's internal notify API (docs-notify
+  // producer, octo-server PR #584 / docs-notify-contract.md). When a doc event
+  // fires (currently: an access request is submitted) we POST a structured
+  // `docs_card` to octo-server, which server-templates an octo/v1 card and
+  // delivers it as a DM from the shared notification bot. This is the ONLY
+  // outbound IM path docs-backend has; it augments — never replaces — the
+  // pull-based pending list. See api/services/docsNotify.ts.
+  notify: {
+    // Docs-specific ingress token for POST /v1/internal/notify (docs_card). Sent
+    // as `X-Internal-Token`; must equal octo-server's `OCTO_DOCS_NOTIFY_TOKEN`
+    // (which is required to DIFFER from NOTIFY_INTERNAL_TOKEN). Empty here =
+    // outbound docs notifications disabled (best-effort no-op). Never logged.
+    docsToken: str('OCTO_DOCS_NOTIFY_TOKEN', ''),
+    // `service` label echoed on every notify request (octo-server logs/metrics).
+    service: str('NOTIFY_SERVICE_NAME', 'docs-service'),
+    // HMAC-SHA256 secret (≥32 bytes) octo-server signs card-action callbacks
+    // with; must equal the route's `secret_env` value in OCTO_CARD_ACTION_ROUTES.
+    // Empty = the decide endpoint rejects all callbacks (fail-closed). Never logged.
+    cardActionSecret: str('OCTO_DOCS_CARD_ACTION_SECRET', ''),
+  },
+
   attachments: {
     bucket: str('ATTACHMENT_BUCKET', 'octo-docs-attachments'),
     // Object-storage presign driver (§3.5). 'local-hmac' mints real, verifiable

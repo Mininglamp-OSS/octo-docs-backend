@@ -19,6 +19,7 @@
 --   yjs_update_log        OPTIONAL incremental log (incremental-log model only)
 --   doc_attachment        OPTIONAL attachment reference table (§3.5)
 --   doc_version           version history snapshots (snapshot + restore, §4 #4)
+--   card_action_receipt   signed card-action callback idempotency receipts
 
 -- 文档元数据（业务库）
 CREATE TABLE doc_meta (
@@ -230,4 +231,18 @@ CREATE TABLE doc_view_history (
                                     ON UPDATE CURRENT_TIMESTAMP(3), -- 最近一次查看时间
   PRIMARY KEY (uid, doc_id),                      -- 去重键：每个(用户,文档)至多一行
   KEY idx_uid_space_viewed (uid, space_id, viewed_at) -- 主查询：某用户某 space 内 viewed_at DESC + keyset
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 签名 card-action 回调（文档 approve/deny 按钮）的幂等收据表。
+-- octo-server 至少投递一次（超时/崩溃/丢响应会重投同一 event_id），本表以 event_id
+-- 为主键：claim 首个写入者执行域决策并 finalize 存下 response，任何重投直接 replay
+-- 该 response 而不再重复状态跃迁。与 upgrade 迁移
+-- migrations/upgrades/2026-07-15-add-card-action-receipt.sql 保持完全一致，
+-- 供全新部署从本 schema.sql 建库时同样创建（否则签名回调全部 503）。
+CREATE TABLE card_action_receipt (
+  event_id   VARCHAR(32)  NOT NULL,               -- octo callback event_id（十进制字符串；不强转数字）
+  response   TEXT         NULL,                    -- JSON DecisionResult；claim 到 finalize 之间为 NULL
+  created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

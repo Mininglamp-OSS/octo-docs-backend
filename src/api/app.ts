@@ -28,6 +28,7 @@ import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
+import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardActionDecide.js'
 import { invitesRouter, acceptInviteRouter, botAcceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
@@ -83,6 +84,22 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
       })
     })
   }
+
+  // Signed card-action callback (docs approve/deny). HMAC-authenticated, so it
+  // sits OUTSIDE the auth/space chain; it reads the RAW body for signature
+  // verification, so it MUST be mounted before the global express.json below.
+  //
+  // A per-IP rate limiter runs IN FRONT of the HMAC verify so an attacker
+  // cannot flood the signature-check path (each request forces a sha256 + HMAC
+  // compute) or brute-force signatures unthrottled. It gets its own limiter
+  // instance so its budget is independent of the blob gateway's above.
+  const cardActionLimiter = createRateLimiter(opts.rateLimit)
+  app.post(
+    CARD_ACTION_DECIDE_PATH,
+    cardActionLimiter,
+    express.raw({ type: 'application/json', limit: '64kb' }),
+    cardActionDecideHandler,
+  )
 
   app.use(express.json({ limit: '1mb' }))
 
