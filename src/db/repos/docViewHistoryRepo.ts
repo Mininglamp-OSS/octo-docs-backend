@@ -19,7 +19,7 @@
  *     is what makes a revoked / deleted / archived doc drop out of the next query.
  */
 import { query, transaction } from '../pool.js'
-import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
+import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
 
 /** A recent-view row joined with its doc_meta business columns. */
 export interface RecentViewItem {
@@ -112,6 +112,34 @@ function visibilityPredicate(isSpaceMember: boolean): string {
   return isSpaceMember
     ? `(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
     : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+}
+
+/**
+ * Role projection for the recent list — the read-side twin of `effectiveRole`
+ * (shareScope.ts). owner => admin(3); otherwise the MAX of the direct doc_member
+ * role and the share-derived role. A doc that is visible ONLY via the space-share
+ * branch has no doc_member row (dm.role NULL), so without the share arm its role
+ * collapses to Number(null)=0 => reader in the route — mislabeling an EDIT-shared
+ * doc as read-only. GREATEST(COALESCE(...)) keeps the share path RAISE-only, so a
+ * direct writer/admin is never lowered by a reader share.
+ *
+ * The share arm carries the SAME same-space guard as the visibility predicate
+ * (`m.share_scope = ANYONE AND m.space_id = v.space_id`) and is only emitted when
+ * the caller is a confirmed member — a non-member (or a doc shared in a different
+ * space) never gets a share label. SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are
+ * numeric constants inlined (no bind); the single owner-uid `?` is unchanged
+ * whether or not the arm is present, so the bind arrays stay stable.
+ */
+function roleProjection(isSpaceMember: boolean): string {
+  return isSpaceMember
+    ? `CASE WHEN m.owner_id = ? THEN 3
+            ELSE GREATEST(
+              COALESCE(dm.role, 0),
+              CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
+                   THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
+                   ELSE 0 END
+            ) END`
+    : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
 }
 
 export const docViewHistoryRepo = {
@@ -259,7 +287,7 @@ export const docViewHistoryRepo = {
     const cursorArgs = cursor ? [new Date(cursor.viewedAt), cursor.docId] : []
     const items = await query<RecentViewItem>(
       `SELECT m.doc_id, m.title, m.owner_id, m.doc_type, m.updated_at, m.updated_by, v.viewed_at,
-              CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END AS role
+              ${roleProjection(params.isSpaceMember === true)} AS role
        ${base}${cursorSql}
        ORDER BY v.viewed_at DESC, v.doc_id DESC
        LIMIT ${pageSize + 1}`,

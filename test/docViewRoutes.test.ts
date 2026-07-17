@@ -240,6 +240,15 @@ describe('GET /docs/recent — listRecentHandler', () => {
     await listRecentHandler(req({ query: {} }), res as never)
     expect(vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0].isSpaceMember).toBe(false)
   })
+
+  it('RC#2 fail-closed: a rejected isSpaceMember lookup degrades to non-member, never a 500', async () => {
+    isSpaceMemberMock.mockRejectedValue(new Error('identity service unavailable'))
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({ total: 0, nextCursor: null, items: [] } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0].isSpaceMember).toBe(false)
+  })
 })
 
 describe('GET /docs/recent/creators — listRecentCreatorsHandler', () => {

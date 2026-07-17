@@ -82,4 +82,36 @@ describe('GET /api/v1/docs — listDocsHandler membership gate (P1-a, XIN-1297 R
     expect(isSpaceMemberMock).not.toHaveBeenCalled()
     expect(vi.mocked(docMetaRepo.listForUser).mock.calls[0]![0].isSpaceMember).toBe(true)
   })
+
+  it('RC#2 fail-closed: a rejected isSpaceMember lookup degrades to non-member, never a 500', async () => {
+    // isSpaceMember documents a fail-closed `false`, but a REJECTED promise would
+    // bubble to a 500 on /docs. resolveViewerSpaceMembership must .catch(()=>false)
+    // so a transient identity-service failure drops the share branch instead.
+    isSpaceMemberMock.mockRejectedValue(new Error('identity service unavailable'))
+    const res = mockRes()
+    await listDocsHandler(req({ spaceId: 's_target' }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docMetaRepo.listForUser).mock.calls[0]![0].isSpaceMember).toBe(false)
+  })
+})
+
+// Read/write role SYMMETRY at the wire layer: the repo now projects the same
+// numeric role the write side derives (effectiveRole), and the route serializes
+// it verbatim. Locks that an EDIT share-only doc (repo role 2) surfaces as
+// 'writer', not 'reader' — the user-visible half of RC#1.
+describe('GET /api/v1/docs — role serialization mirrors the projected numeric role (RC#1)', () => {
+  it.each([
+    [3, 'admin'],
+    [2, 'writer'],
+    [1, 'reader'],
+  ])('repo role %i => wire role %s', async (numeric, wire) => {
+    isSpaceMemberMock.mockResolvedValue(true)
+    vi.mocked(docMetaRepo.listForUser).mockResolvedValue({
+      total: 1,
+      items: [{ doc_id: 'd_1', title: 't', owner_id: 'u_2', doc_type: 'doc', role: numeric, updated_at: new Date(0) }] as never,
+    })
+    const res = mockRes()
+    await listDocsHandler(req({ spaceId: 's_target' }), res as never)
+    expect((res.body as { items: { role: string }[] }).items[0]!.role).toBe(wire)
+  })
 })

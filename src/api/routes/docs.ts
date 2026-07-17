@@ -53,7 +53,14 @@ function toStringArray(v: unknown): string[] {
  */
 async function resolveViewerSpaceMembership(req: Request): Promise<boolean> {
   if (req.botToken !== undefined) return true
-  return getOctoIdentity().isSpaceMember(req.uid!, req.spaceId!, req.octoToken ?? '')
+  // isSpaceMember documents a fail-closed `false` on lookup errors, but a rejected
+  // promise would still bubble to a 500 on /docs, /docs/recent and
+  // /docs/recent/creators instead of merely dropping the share branch. Catch it
+  // here so a transient identity-service failure degrades to "not a member" —
+  // symmetric with the write-side gate's fail-closed intent — never a 500.
+  return getOctoIdentity()
+    .isSpaceMember(req.uid!, req.spaceId!, req.octoToken ?? '')
+    .catch(() => false)
 }
 
 /**
