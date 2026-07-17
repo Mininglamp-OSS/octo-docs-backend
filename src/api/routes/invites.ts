@@ -5,7 +5,7 @@
  *   DELETE /api/v1/docs/{docId}/invites/{inviteToken}  (needs admin)
  *   POST   /api/v1/docs/invites/{inviteToken}/accept   (octo login; §4.6 flow)
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { docInviteRepo } from '../../db/repos/docInviteRepo.js'
 import { requireDocRole } from '../guard.js'
 import { newInviteToken } from '../../util/ids.js'
@@ -13,7 +13,7 @@ import { roleToNumber, type Role } from '../../permission/role.js'
 import { acceptInvite, acceptInviteForUid } from '../services/acceptInvite.js'
 import { extractOctoToken } from '../middleware/auth.js'
 
-export const invitesRouter = Router()
+export const invitesRouter: ExpressRouter = Router()
 
 const roleName = (n: number): string => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
 
@@ -97,7 +97,7 @@ invitesRouter.delete('/:docId/invites/:inviteToken', async (req: Request, res: R
  * SEPARATE router so it can be mounted BEFORE authMiddleware (it returns its
  * own 401 login_required; the accept service verifies identity itself).
  */
-export const acceptInviteRouter = Router()
+export const acceptInviteRouter: ExpressRouter = Router()
 
 acceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res: Response) => {
   const octoToken = extractOctoToken(req)

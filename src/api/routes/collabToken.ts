@@ -13,11 +13,11 @@
  * current space (XIN-1237 space 口径统一). A missing header is not an error — the
  * ingest falls back to the document's home space.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { issueCollabToken } from '../../auth/issueCollabToken.js'
 import { extractOctoToken } from '../middleware/auth.js'
 
-export const collabTokenRouter = Router()
+export const collabTokenRouter: ExpressRouter = Router()
 
 collabTokenRouter.post('/collab-token', async (req: Request, res: Response) => {
   const { documentName } = req.body ?? {}

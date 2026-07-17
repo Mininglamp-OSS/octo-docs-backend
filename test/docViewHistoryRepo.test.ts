@@ -248,6 +248,14 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     expect(cur.viewedAt).toBe('2026-07-15T06:00:01.000Z')
   })
 
+  it('projects m.octo_doc_slug in the items SELECT so html rows can carry a slug', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
+    mockQuery.mockResolvedValueOnce([] as never) // items
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 20 })
+    const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
+    expect(itemsSql).toContain('m.octo_doc_slug')
+  })
+
   it('returns nextCursor=null when the page is not full (no further page)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 1 }] as never)
     mockQuery.mockResolvedValueOnce([

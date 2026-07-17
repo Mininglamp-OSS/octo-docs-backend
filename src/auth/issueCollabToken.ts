@@ -23,6 +23,7 @@ import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
 import { config } from '../config/env.js'
 import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
+import { HTML_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -106,6 +107,15 @@ export async function issueCollabToken(
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
+  // Security clamp (chokepoint = token issuance, where meta.doc_type is known):
+  // an html doc's body is rendered by the external octo-doc service, so its Yjs
+  // collab channel must be read-only — a signed writable token would let a
+  // client mutate a body the backend does not own. Clamp any would-be writable
+  // role (author/admin/editor) to 'reader', the role authenticate.ts already
+  // treats as readOnly=true, so the whole downstream write-reject path engages
+  // with no further change.
+  const effRole = meta.doc_type === HTML_DOC_TYPE ? 'reader' : role
+
   // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
   // read-only INCLUDED — passes through here, so this is the reliable "open ==
   // viewed" seam even if the front-end never calls POST /docs/{id}/view. We now
@@ -144,7 +154,7 @@ export async function issueCollabToken(
   const result = signCollabToken({
     uid,
     documentName,
-    role,
+    role: effRole,
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
     ...(spaceMember ? { space_member: true } : {}),

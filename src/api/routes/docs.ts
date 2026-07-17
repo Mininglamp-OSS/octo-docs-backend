@@ -2,12 +2,13 @@
  * Document CRUD routes (§8.4): create / list / rename / soft-delete.
  * Mounted under /api/v1/docs.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import { DocOwnershipError } from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
-import { normalizeTypeFilter } from '../../db/docType.js'
-import { buildDocumentName, DocumentNameError } from '../../permission/documentName.js'
+import { normalizeTypeFilter, HTML_DOC_TYPE } from '../../db/docType.js'
+import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
 import {
@@ -25,7 +26,7 @@ import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
 
-export const docsRouter = Router()
+export const docsRouter: ExpressRouter = Router()
 
 const DEFAULT_FOLDER = 'f_default'
 
@@ -69,6 +70,10 @@ async function resolveViewerSpaceMembership(req: Request): Promise<boolean> {
  * else is a rich-text document under the 4-segment key.
  */
 const WHITEBOARD_DOC_TYPE = 'board'
+// Re-export the shared read-only html kind constant (defined in db/docType.ts,
+// the doc_type source of truth) so existing importers of this module keep
+// working while the collab-token chokepoint reuses the same value.
+export { HTML_DOC_TYPE }
 
 /**
  * Build the canonical persistence/routing document_name for a freshly created
@@ -80,6 +85,7 @@ const WHITEBOARD_DOC_TYPE = 'board'
  *     so collab-token issuance + WS auth resolve the row by the same key the
  *     browser joins with. Minting a 4-seg `d_` key here was the hop-2 join 404:
  *     persistence wrote 4-seg while the client/auth path addressed 5-seg `:wb:`.
+ *   - html registration: `octo:{space}:{folder}:html:{docId}` (5-seg).
  *   - document: `octo:{space}:{folder}:{docId}` (4-seg).
  *
  * Throws DocumentNameError / WhiteboardNameError on an illegal segment.
@@ -91,57 +97,13 @@ export function buildCreatedDocumentName(
   docType: string,
 ): string {
   // documentName 3rd segment MUST equal folder_id (§8.1 invariant).
-  return docType === WHITEBOARD_DOC_TYPE
-    ? buildWhiteboardName(spaceId, folder, docId)
-    : buildDocumentName(spaceId, folder, docId)
+  if (docType === WHITEBOARD_DOC_TYPE) return buildWhiteboardName(spaceId, folder, docId)
+  if (docType === HTML_DOC_TYPE) return buildHtmlDocumentName(spaceId, folder, docId)
+  return buildDocumentName(spaceId, folder, docId)
 }
 
-/** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
-export async function createDocHandler(req: Request, res: Response) {
+async function grantBotOwnerAdmin(req: Request, docId: string, documentName: string): Promise<void> {
   const uid = req.uid!
-  const { folderId, title, docType } = req.body ?? {}
-  // Space isolation (P3): the space is sourced solely from the enforced
-  // X-Space-Id header (req.spaceId, set by spaceContextMiddleware, guaranteed
-  // non-empty). The transitional body.spaceId fallback (P1) is removed — any
-  // spaceId in the request body is ignored; the header is the single source of
-  // truth. The empty guard below stays as defense-in-depth for the header.
-  const spaceId = req.spaceId ?? ''
-  if (spaceId === '') {
-    res.status(400).json({ error: 'spaceId required' })
-    return
-  }
-  const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
-  const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
-  const docId = newDocId()
-  let documentName: string
-  try {
-    documentName = buildCreatedDocumentName(spaceId, folder, docId, resolvedDocType)
-  } catch (err) {
-    if (err instanceof DocumentNameError || err instanceof WhiteboardNameError) {
-      res.status(400).json({ error: err.message })
-      return
-    }
-    throw err
-  }
-  await docMetaRepo.create({
-    docId,
-    documentName,
-    title: typeof title === 'string' ? title : '',
-    ownerId: uid,
-    spaceId,
-    folderId: folder,
-    docType: resolvedDocType,
-    createdBy: uid,
-  })
-  // Bot path only: the doc owner is the bot itself (ownerId = bot uid), so the
-  // bot's human owner would otherwise have no membership and could not see the
-  // doc. Auto-grant that human owner admin. req.botOwnerUid is set solely by
-  // verifyBot (from octo-server's robot.creator_uid reverse lookup) and only when
-  // a real human creator exists — it is never set on the human mount, so this
-  // block is a no-op there. Skip when the owner is the bot itself (no distinct
-  // human owner, e.g. a platform bot) to avoid a redundant self-membership row.
-  // This is purely additive: the doc's owner field and the bot's own access are
-  // unchanged (§4.2 owner is implicit admin); the human owner is added on top.
   const botOwnerUid = req.botOwnerUid
   if (botOwnerUid && botOwnerUid !== uid) {
     await docMemberRepo.upsertDirect({
@@ -154,20 +116,135 @@ export async function createDocHandler(req: Request, res: Response) {
     // broadcasts the invalidation (§4.5) so any listener recomputes access.
     await bumpEpoch(docId, documentName, botOwnerUid)
   }
-  const meta = await docMetaRepo.getByDocId(docId)
-  res.status(201).json({
+}
+
+/** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
+export async function createDocHandler(req: Request, res: Response) {
+  const uid = req.uid!
+  const { folderId, title, docType, octoDocSlug, mountType } = req.body ?? {}
+  // Space isolation (P3): the space is sourced solely from the enforced
+  // X-Space-Id header (req.spaceId, set by spaceContextMiddleware, guaranteed
+  // non-empty). The transitional body.spaceId fallback (P1) is removed — any
+  // spaceId in the request body is ignored; the header is the single source of
+  // truth. The empty guard below stays as defense-in-depth for the header.
+  const spaceId = req.spaceId ?? ''
+  if (spaceId === '') {
+    res.status(400).json({ error: 'spaceId required' })
+    return
+  }
+  if (typeof title === 'string' && title.length > 512) {
+    res.status(400).json({ error: 'title too long' })
+    return
+  }
+  const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
+  const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
+  if (resolvedDocType === HTML_DOC_TYPE) {
+    if (!req.botToken) {
+      res.status(400).json({ error: 'html registration requires bot mount' })
+      return
+    }
+    if (mountType === 'thread') {
+      res.status(200).json({ skipped: true, reason: 'thread_mount_not_registered' })
+      return
+    }
+    if (mountType !== 'group' && mountType !== 'space') {
+      res.status(400).json({ error: 'mountType must be group or space' })
+      return
+    }
+    if (typeof octoDocSlug !== 'string' || octoDocSlug === '') {
+      res.status(400).json({ error: 'octoDocSlug required' })
+      return
+    }
+    if (octoDocSlug.length > 128) {
+      res.status(400).json({ error: 'octoDocSlug too long' })
+      return
+    }
+  }
+  const docId = newDocId()
+  let documentName: string
+  try {
+    documentName = buildCreatedDocumentName(spaceId, folder, docId, resolvedDocType)
+  } catch (err) {
+    if (err instanceof DocumentNameError || err instanceof WhiteboardNameError) {
+      res.status(400).json({ error: err.message })
+      return
+    }
+    throw err
+  }
+  const createInput = {
     docId,
     documentName,
-    title: meta?.title ?? '',
+    title: typeof title === 'string' ? title : '',
+    ownerId: uid,
     spaceId,
     folderId: folder,
-    ownerId: uid,
     docType: resolvedDocType,
+    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug } : {}),
+    createdBy: uid,
+  }
+  let writeResult
+  if (resolvedDocType === HTML_DOC_TYPE) {
+    try {
+      writeResult = await docMetaRepo.upsertHtmlByOctoDocSlug({ ...createInput, octoDocSlug })
+    } catch (err) {
+      // Default-deny (P0): a non-owner upsert of an existing slug is rejected
+      // rather than silently overwriting/reviving another bot's row. Mirrors the
+      // 403 the sibling rename/delete (requireDocRole('admin')) paths return.
+      if (err instanceof DocOwnershipError) {
+        res.status(403).json({ error: 'forbidden' })
+        return
+      }
+      throw err
+    }
+  } else {
+    await docMetaRepo.create(createInput)
+    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true }
+  }
+  const meta = writeResult.meta
+  // Bot path only: the doc owner is the bot itself (ownerId = bot uid), so the
+  // bot's human owner would otherwise have no membership and could not see the
+  // doc. Auto-grant that human owner admin. req.botOwnerUid is set solely by
+  // verifyBot (from octo-server's robot.creator_uid reverse lookup) and only when
+  // a real human creator exists — it is never set on the human mount, so this
+  // block is a no-op there. Skip when the owner is the bot itself (no distinct
+  // human owner, e.g. a platform bot) to avoid a redundant self-membership row.
+  // This is purely additive: the doc's owner field and the bot's own access are
+  // unchanged (§4.2 owner is implicit admin); the human owner is added on top.
+  //
+  // Run on BOTH the fresh-create AND the html idempotent-recovery path
+  // (created:false): a prior partial failure could have written doc_meta but
+  // never granted the human owner admin, leaving them unable to see their own
+  // doc. grantBotOwnerAdmin is idempotent (upsertDirect + bumpEpoch) and
+  // self-no-ops when botOwnerUid is absent or equals uid, so calling it
+  // unconditionally heals that recovery case with no double-work regression.
+  if (meta) {
+    await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
+  }
+  const responseDocId = resolvedDocType === HTML_DOC_TYPE ? (meta?.doc_id ?? docId) : docId
+  const responseDocumentName = resolvedDocType === HTML_DOC_TYPE ? (meta?.document_name ?? documentName) : documentName
+  const responseSpaceId = resolvedDocType === HTML_DOC_TYPE ? (meta?.space_id ?? spaceId) : spaceId
+  const responseFolderId = resolvedDocType === HTML_DOC_TYPE ? (meta?.folder_id ?? folder) : folder
+  const responseOwnerId = resolvedDocType === HTML_DOC_TYPE ? (meta?.owner_id ?? uid) : uid
+  res.status(201).json({
+    docId: responseDocId,
+    documentName: responseDocumentName,
+    title: meta?.title ?? '',
+    spaceId: responseSpaceId,
+    folderId: responseFolderId,
+    ownerId: responseOwnerId,
+    docType: resolvedDocType,
+    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { created: writeResult.created } : {}),
+    // The caller is always admin on this response: a fresh create makes the
+    // caller the owner (implicit admin, §4.2), and the idempotent update branch
+    // (created:false) is now reachable ONLY by the owning bot — the repo's
+    // owner固化 gate 403s every non-owner before this line. So 'admin' is the
+    // caller's TRUE role on every surviving path (no fail-open).
     role: 'admin',
     createdAt: meta?.created_at,
     // Canonical browser-facing link a caller can pass straight to chat. See
     // buildDocShareUrl / config.webOrigin.
-    shareUrl: buildDocShareUrl(config.webOrigin, docId, spaceId),
+    shareUrl: buildDocShareUrl(config.webOrigin, responseDocId, responseSpaceId),
   })
 }
 
@@ -188,6 +265,7 @@ export async function getDocHandler(req: Request, res: Response) {
     spaceId: meta.space_id,
     folderId: meta.folder_id,
     docType: meta.doc_type,
+    ...(meta.octo_doc_slug ? { octoDocSlug: meta.octo_doc_slug } : {}),
     role,
     createdAt: meta.created_at,
     updatedAt: meta.updated_at,
@@ -216,6 +294,10 @@ export async function listDocsHandler(req: Request, res: Response) {
   // shared-with-me); `q` is a filename substring search. Both are optional and
   // additive — omitting them preserves the pre-FEAT-B behavior verbatim.
   const owner = req.query.owner === 'me' ? 'me' : undefined
+  // FEAT: for owner=me, "my documents" also includes docs owned by bots this
+  // human owns (req.ownedBots, from octo verify). Defaults to [] so listForUser
+  // degrades to strictly the caller's own docs when absent.
+  const ownedBots = req.ownedBots ?? []
   const q = typeof req.query.q === 'string' ? req.query.q : undefined
   // FEAT-B/XIN-1188: optional multi-value `?type=` kind filter (repeated param,
   // never CSV). Validated against the fixed enum; unknown/absent => no filter.
@@ -229,7 +311,7 @@ export async function listDocsHandler(req: Request, res: Response) {
   // branch outright, so skip the membership lookup entirely in that case.
   const isSpaceMember = owner === 'me' ? false : await resolveViewerSpaceMembership(req)
 
-  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, isSpaceMember, folderId, owner, q, types, page, pageSize, sort })
+  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, isSpaceMember, folderId, owner, ownedBots, q, types, page, pageSize, sort })
   res.status(200).json({
     total,
     items: items.map((d) => ({
@@ -237,6 +319,7 @@ export async function listDocsHandler(req: Request, res: Response) {
       title: d.title,
       ownerId: d.owner_id,
       docType: d.doc_type,
+      ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
       role: roleName(Number(d.role)),
       updatedAt: d.updated_at,
     })),
@@ -320,6 +403,7 @@ export async function listRecentHandler(req: Request, res: Response) {
       title: d.title,
       ownerId: d.owner_id,
       docType: d.doc_type,
+      ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
       role: roleName(Number(d.role)),
       updatedAt: d.updated_at,
       updatedBy:
@@ -367,26 +451,38 @@ docsRouter.get('/recent/creators', listRecentCreatorsHandler)
 // the single-doc route (Express treats '/' and '/:docId' as separate paths).
 docsRouter.get('/:docId', getDocHandler)
 
-/** PATCH /api/v1/docs/{docId} — rename (needs admin). */
-docsRouter.patch('/:docId', async (req: Request, res: Response) => {
-  const uid = req.uid!
-  const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+async function resolveDocIdBySlug(req: Request, res: Response): Promise<string | null> {
+  const octoDocSlug = req.params.octoDocSlug!
+  // Tenant isolation (P0): resolve the slug within the caller's enforced space
+  // (req.spaceId; set by spaceContextMiddleware on the human mount and injected
+  // by verifyBot on the bot mount). A slug is only unique per space, so this
+  // never resolves another space's row (which requireDocRole would 404 anyway).
+  const meta = await docMetaRepo.getByOctoDocSlug(octoDocSlug, req.spaceId!)
+  if (!meta || meta.status === 0) {
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+  return meta.doc_id
+}
+
+async function renameDocById(req: Request, res: Response, docId: string): Promise<void> {
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const { title } = req.body ?? {}
   if (typeof title !== 'string' || title === '') {
     res.status(400).json({ error: 'title required' })
     return
   }
-  await docMetaRepo.rename(docId, title)
+  if (title.length > 512) {
+    res.status(400).json({ error: 'title too long' })
+    return
+  }
+  await docMetaRepo.rename(docId, title, req.uid!)
   res.status(200).json({ docId, title })
-})
+}
 
-/** DELETE /api/v1/docs/{docId} — soft delete (needs admin). */
-docsRouter.delete('/:docId', async (req: Request, res: Response) => {
-  const uid = req.uid!
-  const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+async function deleteDocById(req: Request, res: Response, docId: string): Promise<void> {
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const deleted = await docMetaRepo.softDelete(docId)
   // Broadcast the epoch invalidation so connected writers recheck and get cut
@@ -396,6 +492,28 @@ docsRouter.delete('/:docId', async (req: Request, res: Response) => {
     await refreshAndPublish(deleted.documentName, deleted.permissionEpoch)
   }
   res.status(200).json({ docId, status: 'deleted' })
+}
+
+docsRouter.patch('/octo-doc/:octoDocSlug', async (req: Request, res: Response) => {
+  const docId = await resolveDocIdBySlug(req, res)
+  if (!docId) return
+  await renameDocById(req, res, docId)
+})
+
+docsRouter.delete('/octo-doc/:octoDocSlug', async (req: Request, res: Response) => {
+  const docId = await resolveDocIdBySlug(req, res)
+  if (!docId) return
+  await deleteDocById(req, res, docId)
+})
+
+/** PATCH /api/v1/docs/{docId} — rename (needs admin). */
+docsRouter.patch('/:docId', async (req: Request, res: Response) => {
+  await renameDocById(req, res, req.params.docId!)
+})
+
+/** DELETE /api/v1/docs/{docId} — soft delete (needs admin). */
+docsRouter.delete('/:docId', async (req: Request, res: Response) => {
+  await deleteDocById(req, res, req.params.docId!)
 })
 
 /**

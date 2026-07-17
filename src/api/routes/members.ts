@@ -4,14 +4,14 @@
  *   PUT    /api/v1/docs/{docId}/members           (direct add/upsert by uid)
  *   DELETE /api/v1/docs/{docId}/members/{uid}
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { requireDocRole } from '../guard.js'
 import { bumpEpoch } from '../../permission/epoch.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { roleToNumber, type Role } from '../../permission/role.js'
 
-export const membersRouter = Router()
+export const membersRouter: ExpressRouter = Router()
 
 const roleName = (n: number): string => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
 

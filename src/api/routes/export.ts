@@ -23,7 +23,7 @@
  * — exactly how the HTML path treats an unresolved attachment. In prod (S3/MinIO)
  * the signed GET URL is a real endpoint and the bytes embed normally.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { persistence } from '../../collab/persistence.js'
 import { yDocStateToProsemirrorJSON } from '../../agent/conversion.js'
@@ -41,7 +41,7 @@ import {
   type TypstImageInput,
 } from '../../export/typstService.js'
 
-export const exportRouter = Router()
+export const exportRouter: ExpressRouter = Router()
 
 const EMPTY_DOC = { type: 'doc', content: [] }
 

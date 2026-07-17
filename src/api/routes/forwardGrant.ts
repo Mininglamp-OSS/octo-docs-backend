@@ -18,13 +18,13 @@
  * shared grantForwardAccess service. upsertDirect (admin precise set) is NOT
  * touched — this is a physically separate write path.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { roleToNumber } from '../../permission/role.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 
-export const forwardGrantRouter = Router()
+export const forwardGrantRouter: ExpressRouter = Router()
 
 /** Only reader|writer are grantable via forward (no commenter, admin not forward-grantable). */
 function parseGrantRole(v: unknown): 'reader' | 'writer' | null {

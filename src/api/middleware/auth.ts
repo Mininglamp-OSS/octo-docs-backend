@@ -16,6 +16,11 @@ declare global {
     interface Request {
       uid?: string
       octoToken?: string
+      // Set on the human path (authMiddleware): the uids of bots this human user
+      // owns (octo-server verify `owned_bots`). Used so "my documents"
+      // (owner=me) also surfaces docs a user's bots own. Defaults to [] when the
+      // identity source omits it (fail-closed: caller sees only their own docs).
+      ownedBots?: string[]
       // Set only on the bot mount (verifyBot): the bot's own bearer token, used
       // to authenticate bot-realm octo-server lookups (the anti ghost-member
       // existence check in members/forwardGrant). Never set on the human path.
@@ -49,6 +54,9 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
     return
   }
   req.uid = identity.uid
+  // Bots this human user owns (octo verify `owned_bots`). Defaults to [] when
+  // absent so the owner=me listing never widens beyond the caller's own docs.
+  req.ownedBots = identity.ownedBots ?? []
   // Stash the raw caller token so downstream handlers can authenticate their
   // own octo-server lookups (e.g. members.ts getUser). Never logged.
   req.octoToken = token

@@ -85,9 +85,9 @@ function deriveSnapshotTarget(
 ): { docId: string; schemaVersion: number } | null {
   try {
     const parsed = parseDocumentName(documentName)
-    return parsed.kind === 'document'
-      ? { docId: parsed.doc, schemaVersion: SCHEMA_VERSION }
-      : { docId: parsed.board, schemaVersion: WB_SCHEMA_VERSION }
+    if (parsed.kind === 'document') return { docId: parsed.doc, schemaVersion: SCHEMA_VERSION }
+    if (parsed.kind === 'whiteboard') return { docId: parsed.board, schemaVersion: WB_SCHEMA_VERSION }
+    return null
   } catch {
     return null
   }

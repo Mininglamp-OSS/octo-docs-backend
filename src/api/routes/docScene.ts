@@ -20,7 +20,7 @@
  * inside editBoardScene, because the live write bypasses onAuthenticate — the same
  * safety contract the doc-body / sheet writes enforce.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { readLiveBoard } from '../../collab/liveBoardWrite.js'
 import { editBoardScene } from '../services/editBoardScene.js'
@@ -34,7 +34,7 @@ import { WB_SCHEMA_VERSION } from '../../whiteboard/schema/index.js'
 import type { BoardOps } from '../../whiteboard/boardEdit.js'
 import { config } from '../../config/env.js'
 
-export const docSceneRouter = Router()
+export const docSceneRouter: ExpressRouter = Router()
 
 /**
  * Reject a target whose doc_type is not 'board'. Writes a 409 unsupported_doc_type

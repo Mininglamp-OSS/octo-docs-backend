@@ -24,8 +24,13 @@ export interface OctoIdentity {
   /**
    * (a) Resolve an octo session token to a trusted uid. Returns null when the
    * token is missing/invalid (caller => 401 / login_required).
+   *
+   * `ownedBots` is octo-server's `owned_bots`: the uids of the bots this human
+   * user owns (robot.creator_uid == uid). Surfaced so "my documents" can also
+   * include docs a user's bots own. Absent/non-array from octo-server => treated
+   * as `[]` (fail-CLOSED: fall back to just the user's own docs, never wider).
    */
-  verifyToken(token: string): Promise<{ uid: string; name?: string } | null>
+  verifyToken(token: string): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null>
 
   /**
    * (a-bot) Resolve a bot bearer token to its trusted bot uid, the bot's space,
@@ -115,7 +120,7 @@ export class HttpOctoIdentity implements OctoIdentity {
     config.octoIdentity.membershipCacheTtlSeconds * 1000,
   )
 
-  async verifyToken(token: string): Promise<{ uid: string; name?: string } | null> {
+  async verifyToken(token: string): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null> {
     if (!token) return null
     let res: Response
     try {
@@ -129,9 +134,21 @@ export class HttpOctoIdentity implements OctoIdentity {
       return null
     }
     if (!res.ok) return null
-    const body = (await res.json().catch(() => null)) as { uid?: string; name?: string } | null
+    const body = (await res.json().catch(() => null)) as
+      | { uid?: string; name?: string; owned_bots?: Array<{ uid?: string } | string> }
+      | null
     if (!body || typeof body.uid !== 'string' || body.uid === '') return null
-    return { uid: body.uid, name: body.name }
+    // octo-server sends `owned_bots` (snake_case) as an OBJECT array
+    // [{uid,name},...] (authVerifyTokenResp.ownedBot); older/other shapes may
+    // send a bare uid string. Accept both, extracting the bot uid. FAIL-CLOSED:
+    // a missing / non-array value degrades to [] (caller then sees only its own
+    // docs) — it is NEVER allowed to widen visibility.
+    const ownedBots = Array.isArray(body.owned_bots)
+      ? body.owned_bots
+          .map((b) => (typeof b === 'string' ? b : b && typeof b.uid === 'string' ? b.uid : ''))
+          .filter((uid) => uid !== '')
+      : []
+    return { uid: body.uid, name: body.name, ownedBots }
   }
 
   async verifyBot(token: string): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null> {
@@ -297,9 +314,10 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
   // by the middleware. Kept as an HTTP delegate so this remains runnable.
   constructor(private readonly delegate: OctoIdentity = new HttpOctoIdentity()) {}
 
-  async verifyToken(token: string): Promise<{ uid: string; name?: string } | null> {
+  async verifyToken(token: string): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null> {
     // In-process: octo AuthMiddleware would already have populated the uid.
-    // Until wired, delegate to the HTTP introspection endpoint.
+    // Until wired, delegate to the HTTP introspection endpoint (which already
+    // parses owned_bots -> ownedBots, keeping the contract identical).
     return this.delegate.verifyToken(token)
   }
 

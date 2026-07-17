@@ -56,8 +56,12 @@ describe('docMetaRepo.listForUser — owner=me / q (FEAT-B)', () => {
     expect(sql).not.toContain('OR dm.uid IS NOT NULL')
     // "my documents" is authorship, not access: a space-shared doc is NOT mine.
     expect(sql).not.toContain('share_scope')
-    // still keyed on the owner predicate.
-    expect(sql).toMatch(/AND m\.owner_id = \?/)
+    // Still keyed strictly on the owner predicate. With no ownedBots the owner
+    // set is the lone caller uid, so the predicate is the single-value
+    // `m.owner_id IN (?)` — semantically identical to the old `m.owner_id = ?`,
+    // just expressed as an IN so the caller+owned-bots widening can share one
+    // code path. (See paginationBind.test.ts for the bot-owned widening.)
+    expect(sql).toMatch(/AND m\.owner_id IN \(\?\)/)
   })
 
   it('q adds an escaped CI substring title match (trimmed, wildcards literal)', async () => {

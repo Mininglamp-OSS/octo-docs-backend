@@ -27,6 +27,7 @@ export interface RecentViewItem {
   title: string
   owner_id: string
   doc_type: string
+  octo_doc_slug: string | null
   role: number // 1=reader 2=writer 3=admin (owner => 3)
   updated_at: Date
   updated_by: string // last editor uid (doc_meta.updated_by; '' when never edited)
@@ -286,7 +287,7 @@ export const docViewHistoryRepo = {
     const cursorSql = cursor ? ' AND (v.viewed_at, v.doc_id) < (?, ?)' : ''
     const cursorArgs = cursor ? [new Date(cursor.viewedAt), cursor.docId] : []
     const items = await query<RecentViewItem>(
-      `SELECT m.doc_id, m.title, m.owner_id, m.doc_type, m.updated_at, m.updated_by, v.viewed_at,
+      `SELECT m.doc_id, m.title, m.owner_id, m.doc_type, m.octo_doc_slug, m.updated_at, m.updated_by, v.viewed_at,
               ${roleProjection(params.isSpaceMember === true)} AS role
        ${base}${cursorSql}
        ORDER BY v.viewed_at DESC, v.doc_id DESC

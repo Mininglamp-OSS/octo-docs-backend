@@ -12,7 +12,7 @@
  * role + permission_epoch recheck happens again under the row lock inside the
  * editDocBody service, because the live write path bypasses onAuthenticate.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { readLiveForEdit } from '../../collab/liveDocWrite.js'
 import { editDocBody } from '../services/editDocBody.js'
@@ -20,7 +20,7 @@ import { encodeBaseVersion, parseBaseVersion, type DocEditOp } from '../../colla
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
 
-export const docContentRouter = Router()
+export const docContentRouter: ExpressRouter = Router()
 
 /**
  * The only doc_type this rich-text body-edit surface accepts. board/whiteboard

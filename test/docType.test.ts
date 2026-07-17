@@ -4,14 +4,15 @@ import { DOC_TYPES, isDocType, normalizeTypeFilter } from '../src/db/docType.js'
 // FEAT-B/XIN-1188 type-filter enum. The wire values MUST stay in lockstep with the frontend
 // DOC_TYPES (octo-web docsApi.ts); this pins the canonical set + the query-param normalizer.
 describe('docType enum (XIN-1188)', () => {
-  it('exposes exactly the three canonical kinds', () => {
-    expect([...DOC_TYPES]).toEqual(['doc', 'sheet', 'board'])
+  it('exposes exactly the four canonical kinds', () => {
+    expect([...DOC_TYPES]).toEqual(['doc', 'sheet', 'board', 'html'])
   })
 
   it('isDocType accepts the enum values and rejects everything else', () => {
     expect(isDocType('doc')).toBe(true)
     expect(isDocType('sheet')).toBe(true)
     expect(isDocType('board')).toBe(true)
+    expect(isDocType('html')).toBe(true)
     expect(isDocType('slides')).toBe(false)
     expect(isDocType('')).toBe(false)
     expect(isDocType(undefined)).toBe(false)

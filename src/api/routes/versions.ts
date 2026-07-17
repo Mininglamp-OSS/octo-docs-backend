@@ -24,7 +24,7 @@
  * admin-only is UX; this is the authority. A safety snapshot of the pre-restore
  * state is recorded first so the restore is itself undoable.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { docVersionRepo, KIND_NAMED } from '../../db/repos/docVersionRepo.js'
 import { readLiveDocState } from '../../collab/liveDocRead.js'
@@ -42,7 +42,7 @@ import {
   BoardSnapshotInvalidError,
 } from '../../collab/versionRestore.js'
 
-export const versionsRouter = Router()
+export const versionsRouter: ExpressRouter = Router()
 
 const MAX_NAME_LEN = 256
 
