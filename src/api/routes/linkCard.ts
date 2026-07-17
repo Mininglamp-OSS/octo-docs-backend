@@ -9,7 +9,7 @@
  * ogFetch/ssrfGuard. Results are cached in Redis (success 24h, failure short) so
  * the same link pasted across docs/users does not re-fetch.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { createHash } from 'node:crypto'
 import { requireDocRole } from '../guard.js'
 import { config } from '../../config/env.js'
@@ -17,7 +17,7 @@ import { getRedis, rkey } from '../../db/redis.js'
 import { fetchOgCard, type OgCard } from '../../util/ogFetch.js'
 import { LinkCardError, type LinkCardErrorCode } from '../../util/ssrfGuard.js'
 
-export const linkCardRouter = Router()
+export const linkCardRouter: ExpressRouter = Router()
 
 /** Wire code -> HTTP status (§3.5 ⑰ error table). */
 const STATUS: Record<LinkCardErrorCode, number> = {

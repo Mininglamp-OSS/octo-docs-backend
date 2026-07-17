@@ -116,6 +116,29 @@ describe('GET /docs/recent — listRecentHandler', () => {
     expect(arg.cursor).toBe('X')
   })
 
+  it('surfaces octo_doc_slug as octoDocSlug on html rows (so the front-end can fetch the body) and omits it on non-html rows', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 2,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_html', title: 'Web', owner_id: 'u_o', doc_type: 'html', octo_doc_slug: 'sp/fd/html-slug', role: 1,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: '',
+          viewed_at: new Date('2026-07-15T06:00:00.000Z') },
+        { doc_id: 'd_doc', title: 'Doc', owner_id: 'u_o', doc_type: 'doc', octo_doc_slug: null, role: 1,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: '',
+          viewed_at: new Date('2026-07-15T05:00:00.000Z') },
+      ],
+    } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { items: Array<Record<string, unknown>> }
+    // html row carries the slug under the wire key octoDocSlug (same shape as GET /docs).
+    expect(body.items[0]!.octoDocSlug).toBe('sp/fd/html-slug')
+    // non-html row omits the key entirely (not null/undefined value).
+    expect('octoDocSlug' in body.items[1]!).toBe(false)
+  })
+
   it('resolves updatedBy (last editor) to { uid, name } server-side, authenticated with the caller token (XIN-1240)', async () => {
     vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
       total: 1,

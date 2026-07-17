@@ -21,6 +21,8 @@ const BOARD_ID = 'd_6a115afc1dea9ec20287117c'
 const BOARD_KEY = `octo:${SPACE}:${FOLDER}:wb:${BOARD_ID}`
 const DOC_ID = 'd_abc123'
 const DOC_KEY = `octo:${SPACE}:${FOLDER}:${DOC_ID}`
+const HTML_DOC_ID = 'd_html789'
+const HTML_KEY = `octo:${SPACE}:${FOLDER}:html:${HTML_DOC_ID}`
 
 const boardMeta = (ownerId: string) =>
   ({
@@ -46,6 +48,18 @@ const docMeta = (ownerId: string) =>
     doc_type: 'doc',
     status: 1,
     permission_epoch: 2,
+  }) as never
+
+const htmlMeta = (ownerId: string) =>
+  ({
+    doc_id: HTML_DOC_ID,
+    document_name: HTML_KEY,
+    owner_id: ownerId,
+    space_id: SPACE,
+    folder_id: FOLDER,
+    doc_type: 'html',
+    status: 1,
+    permission_epoch: 7,
   }) as never
 
 /** Inject a stub identity that maps any non-empty token to a fixed uid. */
@@ -233,5 +247,70 @@ describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () 
     if (!out.ok) return
     expect('name' in out.result).toBe(false)
     expect('name' in verifyCollabToken(out.result.token)).toBe(false)
+  })
+})
+
+describe('issueCollabToken (PR #93 blocking-1) — html docs clamp to read-only', () => {
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(docMetaRepo.getByDocumentName).mockReset()
+    vi.mocked(docMemberRepo.getRole).mockReset()
+  })
+
+  it('clamps an html doc OWNER (would-be admin) to a read-only reader token', async () => {
+    // Security: an html doc's body is rendered by octo-doc, so its collab channel
+    // must never be writable. The owner would otherwise resolve to admin.
+    asUser('html_owner')
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('html_owner'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('html_owner'))
+
+    const out = await issueCollabToken('octo_session_owner', HTML_KEY)
+
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    // Clamped: not 'admin'. The signed token carries the read-only 'reader' role
+    // that authenticate.ts turns into readOnly=true. Reverting the clamp makes
+    // this assert 'admin' and fail.
+    expect(out.result.role).toBe('reader')
+    const claims = verifyCollabToken(out.result.token)
+    expect(claims.role).toBe('reader')
+    expect(claims.documentName).toBe(HTML_KEY)
+  })
+
+  it('clamps an html doc WRITER member to a read-only reader token', async () => {
+    asUser('html_writer')
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('someone_else'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('writer')
+
+    const out = await issueCollabToken('octo_session_writer', HTML_KEY)
+
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(out.result.role).toBe('reader')
+    expect(verifyCollabToken(out.result.token).role).toBe('reader')
+  })
+
+  it('a non-member on an html doc is still 403 (clamp does not grant access)', async () => {
+    asUser('html_stranger')
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('someone_else'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+
+    const out = await issueCollabToken('octo_session_x', HTML_KEY)
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('does NOT clamp a normal rich-text doc: an owner still gets an admin token', async () => {
+    // Guard against over-clamping: only doc_type==='html' is affected.
+    asUser('doc_owner')
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('doc_owner'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('doc_owner'))
+
+    const out = await issueCollabToken('octo_session_doc_owner', DOC_KEY)
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(out.result.role).toBe('admin')
+    expect(verifyCollabToken(out.result.token).role).toBe('admin')
   })
 })

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { parseDocumentName, buildDocumentName, DocumentNameError } from '../src/permission/documentName.js'
+import {
+  parseDocumentName,
+  buildDocumentName,
+  buildHtmlDocumentName,
+  DocumentNameError,
+} from '../src/permission/documentName.js'
 
 describe('parseDocumentName matrix (§4.1 step 5 / §8.1 / appendix B)', () => {
   it('parses a valid 4-segment document key', () => {
@@ -10,6 +15,11 @@ describe('parseDocumentName matrix (§4.1 step 5 / §8.1 / appendix B)', () => {
   it('parses a 5-segment whiteboard key (parts[3]==="wb") as whiteboard', () => {
     const parsed = parseDocumentName('octo:s_001:f_888:wb:board_1')
     expect(parsed).toEqual({ kind: 'whiteboard', space: 's_001', folder: 'f_888', board: 'board_1' })
+  })
+
+  it('parses a 5-segment html registration key (parts[3]==="html") as html', () => {
+    const parsed = parseDocumentName('octo:s_001:f_888:html:d_html1')
+    expect(parsed).toEqual({ kind: 'html', space: 's_001', folder: 'f_888', doc: 'd_html1' })
   })
 
   it('rejects {doc} === "wb" (ambiguous with whiteboard prefix)', () => {
@@ -58,5 +68,14 @@ describe('buildDocumentName (§8.1)', () => {
 
   it('refuses illegal segment characters', () => {
     expect(() => buildDocumentName('s_001', 'f 888', 'd_abc')).toThrow(DocumentNameError)
+  })
+})
+
+describe('buildHtmlDocumentName', () => {
+  it('builds a 5-segment :html: key without changing doc/board key formats', () => {
+    const name = buildHtmlDocumentName('s_001', 'f_888', 'd_abc123')
+    expect(name).toBe('octo:s_001:f_888:html:d_abc123')
+    expect(parseDocumentName(name)).toEqual({ kind: 'html', space: 's_001', folder: 'f_888', doc: 'd_abc123' })
+    expect(buildDocumentName('s_001', 'f_888', 'd_abc123')).toBe('octo:s_001:f_888:d_abc123')
   })
 })

@@ -16,7 +16,7 @@
  * outbound IM capability today; octoIdentity only verifies tokens / looks up
  * users), intentionally NOT built here.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import {
   docAccessRequestRepo,
@@ -29,7 +29,7 @@ import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
 
-export const accessRequestsRouter = Router()
+export const accessRequestsRouter: ExpressRouter = Router()
 
 const roleName = (n: number): string => (n === 2 ? 'writer' : 'reader')
 

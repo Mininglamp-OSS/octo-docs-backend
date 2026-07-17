@@ -8,6 +8,32 @@
 import { query, transaction, type Tx } from '../pool.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
 
+/**
+ * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
+ * as `code: 'ER_DUP_ENTRY'` / `errno: 1062`; we check both so the TOCTOU
+ * recovery in upsertHtmlByOctoDocSlug is robust to how the driver labels it.
+ */
+function isDupEntry(err: unknown): boolean {
+  const e = err as { code?: string; errno?: number } | null
+  return e?.code === 'ER_DUP_ENTRY' || e?.errno === 1062
+}
+
+/**
+ * Broken-object-level-authorization guard (P0 default-deny). Thrown when a
+ * non-owner tries to upsert a slug an existing row already owns: the space-scoped
+ * lookup resolves the OTHER bot's row, so mutating it here would overwrite its
+ * title, restamp updated_by, and revive a soft-deleted row with no ownership
+ * check. The route maps this to 403 (never fail-open). Ownership is owner-only
+ * here (owner is implicit admin, §4.2); an admin-member override would need a
+ * doc_member round-trip this repo layer does not carry, and is not required.
+ */
+export class DocOwnershipError extends Error {
+  constructor(message = 'forbidden') {
+    super(message)
+    this.name = 'DocOwnershipError'
+  }
+}
+
 export interface DocMeta {
   doc_id: string
   document_name: string
@@ -16,6 +42,7 @@ export interface DocMeta {
   space_id: string
   folder_id: string
   doc_type: string
+  octo_doc_slug: string | null
   status: number // 1=active 0=deleted 2=archived
   permission_epoch: number
   /**
@@ -43,6 +70,7 @@ export interface CreateDocInput {
   spaceId: string
   folderId: string
   docType: string
+  octoDocSlug?: string
   createdBy: string
 }
 
@@ -50,8 +78,8 @@ export const docMetaRepo = {
   async create(input: CreateDocInput): Promise<void> {
     await query(
       `INSERT INTO doc_meta
-         (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, status, permission_epoch, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+         (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug, status, permission_epoch, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
       [
         input.docId,
         input.documentName,
@@ -60,9 +88,64 @@ export const docMetaRepo = {
         input.spaceId,
         input.folderId,
         input.docType,
+        input.docType === 'html' ? (input.octoDocSlug ?? null) : null,
         input.createdBy,
       ],
     )
+  },
+
+  async upsertHtmlByOctoDocSlug(input: CreateDocInput & { octoDocSlug: string }): Promise<{ meta: DocMeta; created: boolean }> {
+    // Tenant isolation (P0): resolve the slug WITHIN the caller's space only. A
+    // slug is unique per (space_id, octo_doc_slug), so a same-slug row in another
+    // space is invisible here and can never be updated/revived across tenants.
+    const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
+    if (existing) {
+      // Re-authorize before mutating the resolved row (P0). The space-scoped
+      // lookup can resolve a DIFFERENT bot's row for the same slug; updating it
+      // would overwrite its title/updated_by and revive a soft-deleted row with
+      // no auth. Owner固化: only the owning bot converges idempotently.
+      if (existing.owner_id !== input.createdBy) throw new DocOwnershipError()
+      // space_id in the WHERE is defense-in-depth: `existing` is already
+      // space-scoped, so pinning the space here means no cross-tenant row can
+      // ever be the UPDATE target.
+      await query(
+        `UPDATE doc_meta
+         SET title = ?, updated_by = ?, status = 1
+         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
+        [input.title, input.createdBy, existing.doc_id, input.spaceId],
+      )
+      const updated = await docMetaRepo.getByDocId(existing.doc_id)
+      if (!updated) throw new Error('html doc disappeared after upsert')
+      return { meta: updated, created: false }
+    }
+
+    try {
+      await docMetaRepo.create(input)
+    } catch (err) {
+      // TOCTOU: two concurrent registrations of the same (space, slug) both miss
+      // the SELECT, then race on INSERT. The composite unique key makes the loser
+      // fail with ER_DUP_ENTRY — re-fetch the now-committed row and fall through
+      // to the idempotent UPDATE branch instead of surfacing a 500.
+      if (!isDupEntry(err)) throw err
+      const raced = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
+      if (!raced) throw err
+      // Same P0 re-authorization on the TOCTOU recovery branch: the racing
+      // winner may be another bot's row, so a non-owner loser must be rejected
+      // rather than silently overwriting/reviving it.
+      if (raced.owner_id !== input.createdBy) throw new DocOwnershipError()
+      await query(
+        `UPDATE doc_meta
+         SET title = ?, updated_by = ?, status = 1
+         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
+        [input.title, input.createdBy, raced.doc_id, input.spaceId],
+      )
+      const updated = await docMetaRepo.getByDocId(raced.doc_id)
+      if (!updated) throw new Error('html doc disappeared after upsert')
+      return { meta: updated, created: false }
+    }
+    const created = await docMetaRepo.getByDocId(input.docId)
+    if (!created) throw new Error('html doc missing after create')
+    return { meta: created, created: true }
   },
 
   async getByDocId(docId: string): Promise<DocMeta | null> {
@@ -78,6 +161,20 @@ export const docMetaRepo = {
     return rows[0] ?? null
   },
 
+  async getByOctoDocSlug(octoDocSlug: string, spaceId: string): Promise<DocMeta | null> {
+    // Tenant isolation (P0): the slug is only globally unique WITHIN a space
+    // (uk_octo_doc_slug is (space_id, octo_doc_slug)). Scoping the lookup by
+    // space_id stops space B from resolving — and thus reviving / rewriting /
+    // leaking — space A's row for the same slug.
+    const rows = await query<DocMeta>(
+      `SELECT * FROM doc_meta
+       WHERE octo_doc_slug = ? AND doc_type = 'html' AND space_id = ?
+       LIMIT 1`,
+      [octoDocSlug, spaceId],
+    )
+    return rows[0] ?? null
+  },
+
   /** Resolve the canonical document_name for a doc_id (§7.3 resolveDocumentName). */
   async resolveDocumentName(docId: string): Promise<string | null> {
     const rows = await query<{ document_name: string }>(
@@ -87,8 +184,8 @@ export const docMetaRepo = {
     return rows[0]?.document_name ?? null
   },
 
-  async rename(docId: string, title: string): Promise<void> {
-    await query('UPDATE doc_meta SET title = ? WHERE doc_id = ?', [title, docId])
+  async rename(docId: string, title: string, updatedBy = ''): Promise<void> {
+    await query('UPDATE doc_meta SET title = ?, updated_by = ? WHERE doc_id = ?', [title, updatedBy, docId])
   },
 
   /**
@@ -163,6 +260,7 @@ export const docMetaRepo = {
     isSpaceMember?: boolean
     folderId?: string
     owner?: 'me'
+    ownedBots?: string[]
     q?: string
     types?: string[]
     page: number
@@ -201,34 +299,46 @@ export const docMetaRepo = {
       where.push(`m.doc_type IN (${types.map(() => '?').join(', ')})`)
       filterArgs.push(...types)
     }
-    // Visibility predicate. Default: owner OR doc_member OR space-scoped share
-    // (share_scope = anyone_in_space). The share branch mirrors the write side
-    // (#64 resolveEffectiveRole) so a Space member sees anyone_in_space docs in
-    // their "shared with me" list without a doc_member row.
-    //
-    // The share branch is gated on `isSpaceMember` — the SAME membership check the
-    // write side runs (resolveEffectiveRole -> isSpaceMember(uid, space, token)).
-    // The unconditional `m.space_id = ?` filter above only pins the result to the
-    // space the CALLER named via the X-Space-Id header; it does NOT prove the
-    // caller belongs to it. Without the gate a non-member could name another space
-    // and read its anyone_in_space doc metadata — the cross-space leak this closes.
-    // When the caller is NOT a confirmed member, the share branch is dropped and
-    // visibility collapses to owner OR doc_member (the pre-#64 behavior).
-    // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind), so the
-    // trailing uid bind is identical whether or not the branch is present.
-    // owner='me': strictly owner, excluding shared-with-me AND space-shared (FEAT-B
-    // Q7 — "my documents" is authorship, not access). Both bind a single trailing uid.
+    // Visibility predicate — two orthogonal concerns merged:
+    //  (a) owner='me' authorship widening: "owner" spans the caller AND any bot
+    //      the caller owns, so docs a user's bots created show up in "my
+    //      documents". ownerSet = [uid, ...ownedBots] de-duped, empties stripped;
+    //      degrades to exactly [uid] when ownedBots empty (backward compatible).
+    //      FAIL-CLOSED: ownedBots only ADDS the caller's own bots. owner='me'
+    //      still excludes shared-with-me AND space-share (FEAT-B Q7 — authorship,
+    //      not access), so no share branch here.
+    //  (b) non-me space share (#64): owner OR doc_member OR share_scope=anyone,
+    //      gated on isSpaceMember (same check the write side runs). space_id filter
+    //      pins the named space but does NOT prove membership; without the gate a
+    //      non-member could read another space's anyone_in_space metadata
+    //      (cross-space leak). Non-member => collapses to owner OR doc_member.
+    // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const includeSpaceShare = params.owner !== 'me' && params.isSpaceMember === true
-    const visibility =
-      params.owner === 'me'
-        ? 'm.owner_id = ?'
-        : includeSpaceShare
-          ? `(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
-          : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+    let visibility: string
+    // Bind values contributed by the visibility clause, in placeholder order.
+    const visibilityArgs: unknown[] = []
+    if (params.owner === 'me') {
+      const ownerSet = [
+        params.uid,
+        ...(params.ownedBots ?? []).filter((b) => typeof b === 'string' && b !== ''),
+      ].filter((v, i, arr) => arr.indexOf(v) === i)
+      // ownerSet always has >=1 element (params.uid); empty ownedBots => IN (?).
+      visibility = `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
+      visibilityArgs.push(...ownerSet)
+    } else if (includeSpaceShare) {
+      visibility = `(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
+      visibilityArgs.push(params.uid)
+    } else {
+      visibility = '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+      visibilityArgs.push(params.uid)
+    }
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
-    // space/folder/q filters, then the trailing visibility `m.owner_id = ?`. The
-    // join uid leads and the owner uid trails — they are not interchangeable.
-    const args: unknown[] = [params.uid, ...filterArgs, params.uid]
+    // space/folder/q filters, then the trailing visibility `m.owner_id IN (...)`
+    // (1 bind for the default branch, 1+N for owner=me). The join uid leads and
+    // the visibility owner set(s) trail — they are not interchangeable. The bind
+    // count MUST match the placeholder count exactly or mysql2 execute errno
+    // 1210 fires.
+    const args: unknown[] = [params.uid, ...filterArgs, ...visibilityArgs]
     const whereSql = where.join(' AND ')
     const order = params.sort === 'updatedAt:asc' ? 'ASC' : 'DESC'
     // `query()` runs on mysql2 `.execute()` (a prepared statement), which rejects

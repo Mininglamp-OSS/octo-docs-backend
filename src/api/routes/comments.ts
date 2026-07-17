@@ -21,7 +21,7 @@
  * reader role. Resolving/reopening a thread needs writer; deleting your own
  * comment (soft) needs to be its author; hard delete needs admin.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { roleAtLeast } from '../../permission/role.js'
 import { docCommentRepo, type DocComment } from '../../db/repos/docCommentRepo.js'
@@ -32,7 +32,7 @@ import {
 } from '../../collab/anchorResolve.js'
 import type { BlockPath } from '../../collab/docBodyEdit.js'
 
-export const commentsRouter = Router()
+export const commentsRouter: ExpressRouter = Router()
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100

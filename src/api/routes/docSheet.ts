@@ -21,7 +21,7 @@
  * inside editDocSheet, because the live write bypasses onAuthenticate — the same
  * safety contract the doc-body write (editDocBody) enforces (gate b).
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { editDocSheet } from '../services/editDocSheet.js'
@@ -36,7 +36,7 @@ import {
 } from '../services/sheetPagination.js'
 import { config } from '../../config/env.js'
 
-export const docSheetRouter = Router()
+export const docSheetRouter: ExpressRouter = Router()
 
 /**
  * The only doc_type this sheet-content surface accepts. A 'doc' (rich text) or a

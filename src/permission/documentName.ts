@@ -3,6 +3,7 @@
  *
  * documentName format: `octo:{space}:{folder}:{doc}` (4 segments).
  * Whiteboard key: `octo:{space}:{folder}:wb:{board}` (5 segments, parts[3]==='wb').
+ * Html doc registration key: `octo:{space}:{folder}:html:{doc}` (5 segments).
  *
  * parseDocumentName runs an EXECUTABLE validation matrix and REJECTS invalid
  * input (it does NOT do best-effort parsing):
@@ -30,7 +31,14 @@ export interface ParsedWhiteboard {
   board: string
 }
 
-export type ParsedName = ParsedDocument | ParsedWhiteboard
+export interface ParsedHtmlDocument {
+  kind: 'html'
+  space: string
+  folder: string
+  doc: string
+}
+
+export type ParsedName = ParsedDocument | ParsedWhiteboard | ParsedHtmlDocument
 
 export class DocumentNameError extends Error {
   constructor(message: string) {
@@ -56,6 +64,14 @@ export function parseDocumentName(name: string): ParsedName {
       throw new DocumentNameError('bad seg')
     }
     return { kind: 'whiteboard', space: space!, folder: folder!, board: board! }
+  }
+
+  if (parts.length === 5 && parts[3] === 'html') {
+    const [, space, folder, , doc] = parts
+    if (![space, folder, doc].every((s) => s !== undefined && SEG.test(s))) {
+      throw new DocumentNameError('bad seg')
+    }
+    return { kind: 'html', space: space!, folder: folder!, doc: doc! }
   }
 
   // Otherwise must be EXACTLY 4 segments => document key.
@@ -87,4 +103,15 @@ export function buildDocumentName(space: string, folder: string, doc: string): s
   }
   if (doc === 'wb') throw new DocumentNameError('doc segment must not be "wb"')
   return `octo:${space}:${folder}:${doc}`
+}
+
+export function buildHtmlDocumentName(space: string, folder: string, doc: string): string {
+  for (const [label, seg] of [
+    ['space', space],
+    ['folder', folder],
+    ['doc', doc],
+  ] as const) {
+    if (!SEG.test(seg)) throw new DocumentNameError(`invalid ${label} segment: ${seg}`)
+  }
+  return `octo:${space}:${folder}:html:${doc}`
 }

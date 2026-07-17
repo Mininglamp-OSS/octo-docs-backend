@@ -9,7 +9,7 @@
  * (or a controlled URL) — never base64 — so the Y.Doc stays small. At read time
  * the reference is exchanged for a freshly signed, time-limited GET URL.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { newAttachId } from '../../util/ids.js'
 import { config } from '../../config/env.js'
@@ -22,7 +22,7 @@ import { fetchExternalImage } from '../../util/fetchExternalImage.js'
 import { LinkCardError } from '../../util/ssrfGuard.js'
 import { sniffImageMime } from '../../import/docx/media.js'
 
-export const attachmentsRouter = Router()
+export const attachmentsRouter: ExpressRouter = Router()
 
 /** Allowed MIME entries from config (e.g. 'image/,application/pdf,text/plain'). */
 function allowedMimeEntries(): string[] {
