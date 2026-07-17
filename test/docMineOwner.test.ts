@@ -26,15 +26,36 @@ function itemsCall(): { sql: string; params: unknown[] } {
 }
 
 describe('docMetaRepo.listForUser — owner=me / q (FEAT-B)', () => {
-  it('default (no owner) keeps the owner-OR-member visibility predicate', async () => {
-    await docMetaRepo.listForUser({ uid: 'u_1', spaceId: 's1', page: 1, pageSize: 20, sort: 'updatedAt:desc' })
-    expect(itemsCall().sql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+  it('default (no owner) keeps owner OR member OR space-share visibility for a SPACE MEMBER', async () => {
+    await docMetaRepo.listForUser({ uid: 'u_1', spaceId: 's1', isSpaceMember: true, page: 1, pageSize: 20, sort: 'updatedAt:desc' })
+    // #64 write/read symmetry: the shared-with-me list surfaces anyone_in_space
+    // docs (share_scope = 1) to a confirmed Space member without a doc_member row.
+    // The unconditional `m.space_id = ?` filter keeps this within the caller's
+    // space, so cross-space isolation is preserved (see docMetaSpaceFilter.test.ts).
+    expect(itemsCall().sql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = 1)')
   })
 
-  it("owner='me' tightens to strictly owner_id==uid, dropping the shared-with-me branch", async () => {
+  it('CROSS-SPACE GATE: a NON-member (or unconfirmed membership) drops the space-share branch (XIN-1295)', async () => {
+    // The read side must be symmetric with the write side (resolveEffectiveRole ->
+    // isSpaceMember). req.spaceId is an unverified header, so a caller who is not a
+    // confirmed member of the queried space must NOT see its anyone_in_space docs —
+    // visibility collapses to owner OR doc_member (pre-#64). isSpaceMember omitted
+    // (undefined) is treated the same as false: fail-closed, no share branch.
+    await docMetaRepo.listForUser({ uid: 'u_1', spaceId: 's1', isSpaceMember: false, page: 1, pageSize: 20, sort: 'updatedAt:desc' })
+    const sqlFalse = itemsCall().sql
+    expect(sqlFalse).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+    expect(sqlFalse).not.toContain('share_scope')
+
+    await docMetaRepo.listForUser({ uid: 'u_1', spaceId: 's1', page: 1, pageSize: 20, sort: 'updatedAt:desc' })
+    expect(itemsCall().sql).not.toContain('share_scope')
+  })
+
+  it("owner='me' tightens to strictly owner_id==uid, dropping shared-with-me AND space-share", async () => {
     await docMetaRepo.listForUser({ uid: 'u_1', spaceId: 's1', owner: 'me', page: 1, pageSize: 20, sort: 'updatedAt:desc' })
     const { sql } = itemsCall()
     expect(sql).not.toContain('OR dm.uid IS NOT NULL')
+    // "my documents" is authorship, not access: a space-shared doc is NOT mine.
+    expect(sql).not.toContain('share_scope')
     // still keyed on the owner predicate.
     expect(sql).toMatch(/AND m\.owner_id = \?/)
   })

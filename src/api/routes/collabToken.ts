@@ -5,6 +5,13 @@
  * taken from the octo session token directly (the issuance service verifies it)
  * so it does NOT go through authMiddleware — it accepts the raw octo token and
  * returns 401 itself when identity is missing.
+ *
+ * This route is mounted BEFORE spaceContextMiddleware, so it never gets a
+ * required `req.spaceId`. It reads the `X-Space-Id` header OPTIONALLY here and
+ * threads it to issueCollabToken purely for the recent-view fallback ingest, so
+ * a document opened from a chat share link is recorded under the viewer's
+ * current space (XIN-1237 space 口径统一). A missing header is not an error — the
+ * ingest falls back to the document's home space.
  */
 import { Router, type Request, type Response } from 'express'
 import { issueCollabToken } from '../../auth/issueCollabToken.js'
@@ -19,7 +26,9 @@ collabTokenRouter.post('/collab-token', async (req: Request, res: Response) => {
     return
   }
   const octoToken = extractOctoToken(req)
-  const out = await issueCollabToken(octoToken, documentName)
+  const rawSpace = req.header('X-Space-Id')
+  const viewerSpaceId = typeof rawSpace === 'string' ? rawSpace.trim() : ''
+  const out = await issueCollabToken(octoToken, documentName, viewerSpaceId)
   if (!out.ok) {
     res.status(out.status).json({ error: out.error })
     return

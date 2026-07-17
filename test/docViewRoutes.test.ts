@@ -11,9 +11,12 @@ vi.mock('../src/db/repos/docViewHistoryRepo.js', () => ({
     listCreators: vi.fn(),
   },
 }))
-const { getUsersMock } = vi.hoisted(() => ({ getUsersMock: vi.fn() }))
+const { getUsersMock, isSpaceMemberMock } = vi.hoisted(() => ({
+  getUsersMock: vi.fn(),
+  isSpaceMemberMock: vi.fn(),
+}))
 vi.mock('../src/auth/octoIdentity.js', () => ({
-  getOctoIdentity: () => ({ getUsers: getUsersMock }),
+  getOctoIdentity: () => ({ getUsers: getUsersMock, isSpaceMember: isSpaceMemberMock }),
 }))
 
 import {
@@ -48,6 +51,8 @@ beforeEach(() => {
   vi.mocked(docViewHistoryRepo.listRecent).mockReset()
   vi.mocked(docViewHistoryRepo.listCreators).mockReset()
   getUsersMock.mockReset()
+  isSpaceMemberMock.mockReset()
+  isSpaceMemberMock.mockResolvedValue(true)
 })
 
 describe('POST /docs/:docId/view — recordDocViewHandler', () => {
@@ -217,6 +222,33 @@ describe('GET /docs/recent — listRecentHandler', () => {
     const arg = vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0]
     expect(arg.types).toEqual([])
   })
+
+  it('CROSS-SPACE GATE: resolves the caller space membership and forwards isSpaceMember=true for a member (XIN-1295)', async () => {
+    isSpaceMemberMock.mockResolvedValue(true)
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({ total: 0, nextCursor: null, items: [] } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    // membership resolved against the QUERIED space, with the caller's own token.
+    expect(isSpaceMemberMock).toHaveBeenCalledWith('u_1', 's1', 'tok')
+    expect(vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0].isSpaceMember).toBe(true)
+  })
+
+  it('CROSS-SPACE GATE: forwards isSpaceMember=false for a NON-member so the share branch is dropped (XIN-1295)', async () => {
+    isSpaceMemberMock.mockResolvedValue(false)
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({ total: 0, nextCursor: null, items: [] } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect(vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0].isSpaceMember).toBe(false)
+  })
+
+  it('RC#2 fail-closed: a rejected isSpaceMember lookup degrades to non-member, never a 500', async () => {
+    isSpaceMemberMock.mockRejectedValue(new Error('identity service unavailable'))
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({ total: 0, nextCursor: null, items: [] } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0].isSpaceMember).toBe(false)
+  })
 })
 
 describe('GET /docs/recent/creators — listRecentCreatorsHandler', () => {
@@ -247,5 +279,14 @@ describe('GET /docs/recent/creators — listRecentCreatorsHandler', () => {
     await listRecentCreatorsHandler(req({ query: {} }), res as never)
     expect(res.body).toEqual({ creators: [] })
     expect(getUsersMock).not.toHaveBeenCalled()
+  })
+
+  it('CROSS-SPACE GATE: forwards the resolved isSpaceMember flag to listCreators (XIN-1295)', async () => {
+    isSpaceMemberMock.mockResolvedValue(false)
+    vi.mocked(docViewHistoryRepo.listCreators).mockResolvedValue([])
+    const res = mockRes()
+    await listRecentCreatorsHandler(req({ query: {} }), res as never)
+    expect(isSpaceMemberMock).toHaveBeenCalledWith('u_1', 's1', 'tok')
+    expect(vi.mocked(docViewHistoryRepo.listCreators).mock.calls[0]![0].isSpaceMember).toBe(false)
   })
 })

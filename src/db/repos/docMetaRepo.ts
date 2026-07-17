@@ -6,6 +6,7 @@
  * persistence key, unique). See appendix B for the naming convention.
  */
 import { query, transaction, type Tx } from '../pool.js'
+import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
 
 export interface DocMeta {
   doc_id: string
@@ -159,6 +160,7 @@ export const docMetaRepo = {
   async listForUser(params: {
     uid: string
     spaceId: string
+    isSpaceMember?: boolean
     folderId?: string
     owner?: 'me'
     q?: string
@@ -199,10 +201,30 @@ export const docMetaRepo = {
       where.push(`m.doc_type IN (${types.map(() => '?').join(', ')})`)
       filterArgs.push(...types)
     }
-    // Visibility predicate. Default: owner OR member. owner='me': strictly owner,
-    // excluding shared-with-me (FEAT-B Q7). Both bind a single trailing uid.
+    // Visibility predicate. Default: owner OR doc_member OR space-scoped share
+    // (share_scope = anyone_in_space). The share branch mirrors the write side
+    // (#64 resolveEffectiveRole) so a Space member sees anyone_in_space docs in
+    // their "shared with me" list without a doc_member row.
+    //
+    // The share branch is gated on `isSpaceMember` — the SAME membership check the
+    // write side runs (resolveEffectiveRole -> isSpaceMember(uid, space, token)).
+    // The unconditional `m.space_id = ?` filter above only pins the result to the
+    // space the CALLER named via the X-Space-Id header; it does NOT prove the
+    // caller belongs to it. Without the gate a non-member could name another space
+    // and read its anyone_in_space doc metadata — the cross-space leak this closes.
+    // When the caller is NOT a confirmed member, the share branch is dropped and
+    // visibility collapses to owner OR doc_member (the pre-#64 behavior).
+    // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind), so the
+    // trailing uid bind is identical whether or not the branch is present.
+    // owner='me': strictly owner, excluding shared-with-me AND space-shared (FEAT-B
+    // Q7 — "my documents" is authorship, not access). Both bind a single trailing uid.
+    const includeSpaceShare = params.owner !== 'me' && params.isSpaceMember === true
     const visibility =
-      params.owner === 'me' ? 'm.owner_id = ?' : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+      params.owner === 'me'
+        ? 'm.owner_id = ?'
+        : includeSpaceShare
+          ? `(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
+          : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
     // space/folder/q filters, then the trailing visibility `m.owner_id = ?`. The
     // join uid leads and the owner uid trails — they are not interchangeable.
@@ -227,8 +249,28 @@ export const docMetaRepo = {
     const total = Number(countRows[0]?.cnt ?? 0)
 
     // tie-break on doc_id keeps offset paging stable when rows share updated_at.
+    // role projection MUST mirror the write side (effectiveRole, shareScope.ts):
+    // owner => admin(3); otherwise the MAX of the direct doc_member role and the
+    // share-derived role. When the caller is a confirmed Space member and the doc
+    // is anyone_in_space, an EDIT share yields writer(2) / any other share yields
+    // reader(1) — so a share-only doc (no doc_member row => dm.role NULL) is
+    // labeled writer, not silently reader (Number(null)=0). GREATEST(COALESCE...)
+    // keeps the share path RAISE-only: a direct writer/admin is never lowered by a
+    // reader share. The share arm is only present on the same includeSpaceShare
+    // gate as the visibility predicate, so a non-member never gets a share label.
+    // SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are numeric constants inlined (no bind),
+    // so the leading owner-uid bind is identical whether or not the arm is present.
+    const roleExpr = includeSpaceShare
+      ? `CASE WHEN m.owner_id = ? THEN 3
+              ELSE GREATEST(
+                COALESCE(dm.role, 0),
+                CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
+                     THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
+                     ELSE 0 END
+              ) END`
+      : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
     const items = await query<DocMeta & { role: number }>(
-      `SELECT m.*, CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END AS role
+      `SELECT m.*, ${roleExpr} AS role
        ${base}
        ORDER BY m.updated_at ${order}, m.doc_id ${order}
        LIMIT ${pageSize} OFFSET ${offset}`,

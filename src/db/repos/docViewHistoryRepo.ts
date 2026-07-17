@@ -1,19 +1,25 @@
 /**
  * doc_view_history repository (FEAT-B recent-view).
  *
- * Per-user document view records ("recent viewed"). One row per (uid, doc_id):
- * opening a document UPSERTs the row and refreshes viewed_at, so a re-open never
- * creates a second row (idempotent dedup, PK (uid, doc_id)).
+ * Per-user, per-space document view records ("recent viewed"). One row per
+ * (uid, doc_id, space_id): opening a document from a space UPSERTs that space's
+ * row and refreshes its viewed_at, so a re-open in the SAME space never creates a
+ * second row (idempotent dedup, PK (uid, doc_id, space_id)). A doc reachable from
+ * two spaces keeps an independent row per space, so it stays "recent" in BOTH —
+ * recent-view is per-space independent, not last-space-wins (P1-b, XIN-1297).
  *
  * Two responsibilities, kept strictly separate:
- *   - WRITE (upsertViewWithPrune): idempotent UPSERT + synchronous per-uid
- *     retention prune in ONE transaction (mirrors docVersionRepo.createAutoWithPrune).
- *     Pruning is capacity maintenance only.
+ *   - WRITE (upsertViewWithPrune): idempotent UPSERT + synchronous retention
+ *     prune in ONE transaction (mirrors docVersionRepo.createAutoWithPrune).
+ *     Pruning is capacity maintenance only. The count pass is scoped per
+ *     (uid, space_id) so each space's recent list is retained independently; the
+ *     age pass is per-uid so stale rows are reaped across every space.
  *   - READ (listRecent / listCreators): joins doc_meta (+ doc_member) and filters
  *     at QUERY TIME on status=1 + the visibility predicate. This — never pruning —
  *     is what makes a revoked / deleted / archived doc drop out of the next query.
  */
 import { query, transaction } from '../pool.js'
+import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
 
 /** A recent-view row joined with its doc_meta business columns. */
 export interface RecentViewItem {
@@ -77,10 +83,69 @@ function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (c) => `\\${c}`)
 }
 
+/**
+ * Read-side visibility predicate for the recent-view queries. Mirrors the WRITE
+ * side (POST /view -> requireDocRole -> resolveEffectiveRole): a doc is visible
+ * when the caller is the owner, holds a doc_member row, OR the doc is
+ * space-scoped-shared (share_scope = anyone_in_space) and lives in the SAME space
+ * as the view record.
+ *
+ * The space-share branch is gated on `isSpaceMember` — the SAME membership check
+ * the write side runs (resolveEffectiveRole -> isSpaceMember(uid, space, token)).
+ * `v.space_id = ?` in the surrounding WHERE only pins the query to a space the
+ * CALLER named (the unverified X-Space-Id header); it does NOT prove the caller
+ * belongs to it. Without the membership gate a non-member could name another
+ * space and read its anyone_in_space docs via a stray view row — the cross-space
+ * metadata leak this predicate closes. When the caller is NOT a confirmed member
+ * of the queried space, the share branch is dropped entirely, so visibility
+ * collapses to owner OR doc_member (the pre-#64 behavior) and no share-only doc
+ * of that space is ever returned.
+ *
+ * When the caller IS a member, the branch is added but stays same-space-guarded:
+ * `m.space_id = v.space_id` requires the doc's HOME space to equal the view
+ * record's space, so a doc shared in a DIFFERENT space never leaks in even for a
+ * member. SHARE_SCOPE_ANYONE is a numeric module constant, inlined (not bound),
+ * and the branch adds no positional bind, so the bind arrays are identical in
+ * both forms and paging stays stable; it carries no injection surface.
+ */
+function visibilityPredicate(isSpaceMember: boolean): string {
+  return isSpaceMember
+    ? `(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
+    : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+}
+
+/**
+ * Role projection for the recent list — the read-side twin of `effectiveRole`
+ * (shareScope.ts). owner => admin(3); otherwise the MAX of the direct doc_member
+ * role and the share-derived role. A doc that is visible ONLY via the space-share
+ * branch has no doc_member row (dm.role NULL), so without the share arm its role
+ * collapses to Number(null)=0 => reader in the route — mislabeling an EDIT-shared
+ * doc as read-only. GREATEST(COALESCE(...)) keeps the share path RAISE-only, so a
+ * direct writer/admin is never lowered by a reader share.
+ *
+ * The share arm carries the SAME same-space guard as the visibility predicate
+ * (`m.share_scope = ANYONE AND m.space_id = v.space_id`) and is only emitted when
+ * the caller is a confirmed member — a non-member (or a doc shared in a different
+ * space) never gets a share label. SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are
+ * numeric constants inlined (no bind); the single owner-uid `?` is unchanged
+ * whether or not the arm is present, so the bind arrays stay stable.
+ */
+function roleProjection(isSpaceMember: boolean): string {
+  return isSpaceMember
+    ? `CASE WHEN m.owner_id = ? THEN 3
+            ELSE GREATEST(
+              COALESCE(dm.role, 0),
+              CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
+                   THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
+                   ELSE 0 END
+            ) END`
+    : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+}
+
 export const docViewHistoryRepo = {
   /**
-   * Idempotent UPSERT of one (uid, doc_id) view + synchronous per-uid retention
-   * prune, in ONE transaction. Returns the row's post-write viewed_at.
+   * Idempotent UPSERT of one (uid, doc_id, space_id) view + synchronous
+   * retention prune, in ONE transaction. Returns the row's post-write viewed_at.
    *
    * Mirrors docVersionRepo.createAutoWithPrune: doing the UPSERT and both prune
    * passes under a single transaction avoids the race where two concurrent
@@ -89,7 +154,10 @@ export const docViewHistoryRepo = {
    * LIMIT / INTERVAL with ER_WRONG_ARGUMENTS; the clamped integers carry no
    * injection surface — same rationale as listForUser's LIMIT).
    *
-   * Uses the `VALUES(col)` UPSERT form for broad MySQL 8 compatibility; the
+   * Uses the `VALUES(col)` UPSERT form for broad MySQL 8 compatibility. Only
+   * viewed_at is refreshed on a duplicate — space_id is part of the PK now
+   * (P1-b), so a re-open in the SAME space matches the exact triple and just
+   * bumps viewed_at, while an open in a DIFFERENT space is a distinct row. The
    * explicit viewed_at = VALUES(viewed_at) assignment overrides the column's
    * ON UPDATE CURRENT_TIMESTAMP so the write time is deterministic (= NOW(3)).
    */
@@ -106,26 +174,31 @@ export const docViewHistoryRepo = {
       await tx.query(
         `INSERT INTO doc_view_history (uid, doc_id, space_id, viewed_at)
          VALUES (?, ?, ?, NOW(3))
-         ON DUPLICATE KEY UPDATE viewed_at = VALUES(viewed_at), space_id = VALUES(space_id)`,
+         ON DUPLICATE KEY UPDATE viewed_at = VALUES(viewed_at)`,
         [input.uid, input.docId, input.spaceId],
       )
-      // count-based prune (keep most-recent N view rows for this uid; 0 = unbounded).
+      // count-based prune (keep most-recent N view rows for this uid IN THIS
+      // SPACE; 0 = unbounded). Scoped per (uid, space_id) so a space's recent
+      // list is retained independently — heavy activity in one space never
+      // evicts another space's rows (P1-b per-space independence).
       if (keep > 0) {
         await tx.query(
           `DELETE FROM doc_view_history
-           WHERE uid = ?
+           WHERE uid = ? AND space_id = ?
              AND doc_id NOT IN (
                SELECT doc_id FROM (
                  SELECT doc_id FROM doc_view_history
-                 WHERE uid = ?
+                 WHERE uid = ? AND space_id = ?
                  ORDER BY viewed_at DESC, doc_id DESC
                  LIMIT ${keep}
                ) AS keep
              )`,
-          [input.uid, input.uid],
+          [input.uid, input.spaceId, input.uid, input.spaceId],
         )
       }
       // age-based prune (drop view rows older than retainDays; 0 = unbounded).
+      // Kept per-uid (space-agnostic) so stale rows are reaped across EVERY
+      // space on any open, including spaces the user no longer visits.
       if (days > 0) {
         await tx.query(
           `DELETE FROM doc_view_history
@@ -134,8 +207,8 @@ export const docViewHistoryRepo = {
         )
       }
       const rows = await tx.query<{ viewed_at: Date }>(
-        'SELECT viewed_at FROM doc_view_history WHERE uid = ? AND doc_id = ? LIMIT 1',
-        [input.uid, input.docId],
+        'SELECT viewed_at FROM doc_view_history WHERE uid = ? AND doc_id = ? AND space_id = ? LIMIT 1',
+        [input.uid, input.docId, input.spaceId],
       )
       return rows[0]?.viewed_at ?? new Date()
     })
@@ -153,6 +226,7 @@ export const docViewHistoryRepo = {
   async listRecent(params: {
     uid: string
     spaceId: string
+    isSpaceMember?: boolean
     q?: string
     creators?: string[]
     types?: string[]
@@ -164,7 +238,9 @@ export const docViewHistoryRepo = {
 
     // WHERE fragments + binds, assembled in positional order. The role CASE and
     // the doc_member join both bind :uid, so the leading binds are (uid, uid, spaceId).
-    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', '(m.owner_id = ? OR dm.uid IS NOT NULL)']
+    // The visibility predicate binds exactly one trailing uid whether or not the
+    // space-share branch is present, so the membership gate never shifts the args.
+    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', visibilityPredicate(params.isSpaceMember === true)]
     // filter binds follow the base binds; the base binds are added when building `args`.
     const filterArgs: unknown[] = []
 
@@ -211,7 +287,7 @@ export const docViewHistoryRepo = {
     const cursorArgs = cursor ? [new Date(cursor.viewedAt), cursor.docId] : []
     const items = await query<RecentViewItem>(
       `SELECT m.doc_id, m.title, m.owner_id, m.doc_type, m.updated_at, m.updated_by, v.viewed_at,
-              CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END AS role
+              ${roleProjection(params.isSpaceMember === true)} AS role
        ${base}${cursorSql}
        ORDER BY v.viewed_at DESC, v.doc_id DESC
        LIMIT ${pageSize + 1}`,
@@ -237,8 +313,8 @@ export const docViewHistoryRepo = {
    * full distinct owner set BEFORE the creator facet is applied. Name resolution
    * is done by the caller (route), which holds the octo session token.
    */
-  async listCreators(params: { uid: string; spaceId: string; q?: string }): Promise<string[]> {
-    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', '(m.owner_id = ? OR dm.uid IS NOT NULL)']
+  async listCreators(params: { uid: string; spaceId: string; isSpaceMember?: boolean; q?: string }): Promise<string[]> {
+    const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', visibilityPredicate(params.isSpaceMember === true)]
     const args: unknown[] = [params.uid, params.spaceId, params.uid]
     const q = (params.q ?? '').trim()
     if (q !== '') {

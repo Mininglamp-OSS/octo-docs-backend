@@ -41,6 +41,29 @@ function toStringArray(v: unknown): string[] {
 }
 
 /**
+ * Resolve whether the caller is a member of the space they are querying — the
+ * READ-side twin of resolveEffectiveRole's write-side membership gate. A bot's
+ * `req.spaceId` is server-resolved (verifyBot reverse lookup, anti-spoof), so a
+ * bot is by definition a member of it — this mirrors resolveEffectiveRole's isBot
+ * short-circuit. A human carries an UNVERIFIED `X-Space-Id`, so membership is
+ * confirmed via isSpaceMember, which fails closed to `false` on any lookup error.
+ * The space-share read branch therefore only opens on a confirmed membership,
+ * never on a spoofed header or a transient failure — keeping the read side
+ * symmetric with the write side and closing the cross-space metadata leak.
+ */
+async function resolveViewerSpaceMembership(req: Request): Promise<boolean> {
+  if (req.botToken !== undefined) return true
+  // isSpaceMember documents a fail-closed `false` on lookup errors, but a rejected
+  // promise would still bubble to a 500 on /docs, /docs/recent and
+  // /docs/recent/creators instead of merely dropping the share branch. Catch it
+  // here so a transient identity-service failure degrades to "not a member" —
+  // symmetric with the write-side gate's fail-closed intent — never a 500.
+  return getOctoIdentity()
+    .isSpaceMember(req.uid!, req.spaceId!, req.octoToken ?? '')
+    .catch(() => false)
+}
+
+/**
  * docType value the front-end stamps on whiteboards (DocsHome create menu /
  * docsApi). Boards persist + address under the 5-segment `:wb:` key; everything
  * else is a rich-text document under the 4-segment key.
@@ -182,7 +205,7 @@ export async function getDocHandler(req: Request, res: Response) {
 }
 
 /** GET /api/v1/docs — list docs the caller owns or is a member of. */
-docsRouter.get('/', async (req: Request, res: Response) => {
+export async function listDocsHandler(req: Request, res: Response) {
   const uid = req.uid!
   // Space isolation (P1): the space is the enforced X-Space-Id header
   // (req.spaceId, set by spaceContextMiddleware), never a client-supplied query
@@ -201,7 +224,12 @@ docsRouter.get('/', async (req: Request, res: Response) => {
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
   const sort = req.query.sort === 'updatedAt:asc' ? 'updatedAt:asc' : 'updatedAt:desc'
 
-  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, folderId, owner, q, types, page, pageSize, sort })
+  // Space-share visibility must match the write side: only a confirmed member of
+  // the queried space sees its anyone_in_space docs. owner='me' excludes the share
+  // branch outright, so skip the membership lookup entirely in that case.
+  const isSpaceMember = owner === 'me' ? false : await resolveViewerSpaceMembership(req)
+
+  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, isSpaceMember, folderId, owner, q, types, page, pageSize, sort })
   res.status(200).json({
     total,
     items: items.map((d) => ({
@@ -213,7 +241,9 @@ docsRouter.get('/', async (req: Request, res: Response) => {
       updatedAt: d.updated_at,
     })),
   })
-})
+}
+
+docsRouter.get('/', listDocsHandler)
 
 /**
  * POST /api/v1/docs/{docId}/view — record that the caller opened this doc
@@ -256,9 +286,10 @@ export async function listRecentHandler(req: Request, res: Response) {
   const types = normalizeTypeFilter(req.query.type)
   const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20) || 20))
+  const isSpaceMember = await resolveViewerSpaceMembership(req)
   let result
   try {
-    result = await docViewHistoryRepo.listRecent({ uid, spaceId, q, creators, types, cursor, pageSize })
+    result = await docViewHistoryRepo.listRecent({ uid, spaceId, isSpaceMember, q, creators, types, cursor, pageSize })
   } catch (err) {
     if (err instanceof Error && err.message === 'invalid_cursor') {
       res.status(400).json({ error: 'invalid_cursor' })
@@ -315,7 +346,8 @@ export async function listRecentCreatorsHandler(req: Request, res: Response) {
   const uid = req.uid!
   const spaceId = req.spaceId!
   const q = typeof req.query.q === 'string' ? req.query.q : undefined
-  const ownerIds = await docViewHistoryRepo.listCreators({ uid, spaceId, q })
+  const isSpaceMember = await resolveViewerSpaceMembership(req)
+  const ownerIds = await docViewHistoryRepo.listCreators({ uid, spaceId, isSpaceMember, q })
   const nameByUid = new Map<string, string>()
   if (ownerIds.length > 0) {
     const users = await getOctoIdentity().getUsers(ownerIds, req.octoToken)
