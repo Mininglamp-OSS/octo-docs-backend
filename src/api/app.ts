@@ -49,6 +49,23 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // rather than the proxy address. Configurable per deployment (config.trustProxy).
   app.set('trust proxy', opts.trustProxy ?? config.trustProxy)
 
+  // Route access log. Mounted FIRST so it covers EVERY request — including the
+  // HMAC card-action callback and CORS preflight — and logs one line per request
+  // on response finish: method, full path, status, latency. This is a route log
+  // (not a business log): it always fires regardless of handler outcome, so a
+  // decide callback that 401s (bad signature) / 503s (grant failed) / 200s is
+  // visible in the access log even when business-level console logs are dropped
+  // by the log pipeline.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const startedAt = Date.now()
+    res.on('finish', () => {
+      const ms = Date.now() - startedAt
+      // eslint-disable-next-line no-console
+      console.log(`[octo-docs] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`)
+    })
+    next()
+  })
+
   // CORS + preflight (XIN-717). Mounted FIRST — ahead of the body parser, rate
   // limiter and auth — so a cross-origin OPTIONS preflight from the front-end is
   // answered 2xx with the CORS headers without being throttled, body-parsed or
