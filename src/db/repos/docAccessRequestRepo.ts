@@ -23,6 +23,7 @@ export interface DocAccessRequestRow {
   status: number // 1=pending 2=approved 3=denied 4=cancelled
   request_id: string
   decided_by: string
+  decision_note: string
   created_at: Date
   updated_at: Date
 }
@@ -100,12 +101,17 @@ export const docAccessRequestRepo = {
     requestId: string
     status: number
     decidedBy: string
+    note?: string
   }): Promise<boolean> {
+    // decision_note is written in the SAME CAS-guarded UPDATE as the status
+    // flip, so the note is recorded atomically with (and only on) the
+    // pending→approved/denied transition — a losing racer / replay that finds
+    // the row already decided flips nothing and cannot clobber the note.
     const rows = await query<{ affectedRows?: number }>(
       `UPDATE doc_access_request
-         SET status = ?, decided_by = ?
+         SET status = ?, decided_by = ?, decision_note = ?
        WHERE doc_id = ? AND request_id = ? AND status = ${REQUEST_STATUS_PENDING}`,
-      [params.status, params.decidedBy, params.docId, params.requestId],
+      [params.status, params.decidedBy, params.note ?? '', params.docId, params.requestId],
     )
     return (rows as unknown as { affectedRows?: number }).affectedRows! > 0
   },
