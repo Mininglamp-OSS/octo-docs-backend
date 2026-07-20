@@ -40,6 +40,7 @@ import { docSceneRouter } from './routes/docScene.js'
 import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
 import { importRouter } from './routes/import.js'
+import { sanitizeUrlForLog } from './accessLog.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
   const app = express()
@@ -48,6 +49,28 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // per-IP rate limiter below — reflects the real client from X-Forwarded-For
   // rather than the proxy address. Configurable per deployment (config.trustProxy).
   app.set('trust proxy', opts.trustProxy ?? config.trustProxy)
+
+  // Route access log. Mounted FIRST so it covers EVERY request — including the
+  // HMAC card-action callback and CORS preflight — and logs one line per request
+  // on response finish: method, sanitized path, status, latency. This is a route
+  // log (not a business log): it always fires regardless of handler outcome, so a
+  // decide callback that 401s (bad signature) / 503s (grant failed) / 200s is
+  // visible in the access log even when business-level console logs are dropped
+  // by the log pipeline.
+  //
+  // Secrets are stripped before logging. `req.originalUrl` carries the full query
+  // string, which for the blob gateway includes short-lived HMAC `X-Signature`
+  // (and AWS-style `X-Amz-*`) params; invite tokens ride in the path. We redact
+  // both so signed URLs / invite links can never be replayed from log access.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const startedAt = Date.now()
+    res.on('finish', () => {
+      const ms = Date.now() - startedAt
+      // eslint-disable-next-line no-console
+      console.log(`[octo-docs] ${req.method} ${sanitizeUrlForLog(req.originalUrl)} ${res.statusCode} ${ms}ms`)
+    })
+    next()
+  })
 
   // CORS + preflight (XIN-717). Mounted FIRST — ahead of the body parser, rate
   // limiter and auth — so a cross-origin OPTIONS preflight from the front-end is
