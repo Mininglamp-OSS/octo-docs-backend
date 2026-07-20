@@ -43,6 +43,10 @@ interface DocsCardBody {
   kind: string
   title: string
   actor_name: string
+  /** Requester uid. When actor_name is empty octo-server resolves the display
+   *  name from this server-side (identity authority), so a valid OCTO_SERVER_TOKEN
+   *  is not required for the name to render. */
+  actor_uid: string
   excerpt: string
   updated_at: string
 }
@@ -171,6 +175,7 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       kind: KIND_ACCESS_REQUESTED,
       title: p.title,
       actor_name: actorName,
+      actor_uid: p.requesterUid,
       excerpt: p.reason,
       updated_at: formatTimestamp(new Date()),
     }
