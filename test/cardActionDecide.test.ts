@@ -294,6 +294,42 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
     await resetRequestMock()
   })
 
+  it('persists the reviewer deny reason (inputs.deny_reason) via decide().note', async () => {
+    const { docAccessRequestRepo, REQUEST_STATUS_DENIED } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const denyBody = JSON.stringify({
+      event_id: '4010',
+      action_id: 'approval-deny',
+      decision: 'deny',
+      operator_uid: 'op-1',
+      inputs: { deny_reason: '  范围不符，请对齐后再申请  ' }, // whitespace trimmed on store
+      data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
+      doc_id: 'doc-1',
+      request_id: 'req-1',
+      message_id: 'm-1',
+      channel_id: 'notification',
+      channel_type: 1,
+      space_id: 'space-1',
+      acted_at: Number(ts),
+    })
+    await resetRequestMock()
+    vi.mocked(docAccessRequestRepo.decide).mockClear()
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true)
+
+    const sig = sign(CARD_ACTION_DECIDE_PATH, denyBody, ts, '4010', HANDLER_SECRET)
+    const { req, res } = makeReqRes(
+      { 'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': '4010', 'X-Octo-Signature': sig },
+      denyBody,
+    )
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+
+    expect(res.statusCode).toBe(200)
+    expect(docAccessRequestRepo.decide).toHaveBeenCalledWith(
+      expect.objectContaining({ status: REQUEST_STATUS_DENIED, note: '范围不符，请对齐后再申请' }),
+    )
+    await resetRequestMock()
+  })
+
+
   it('CONCURRENT claim-loser (isOwnEventRecovery-style) on an already-approved request grants NOTHING', async () => {
     // The exact interleaving lml2468 reported: same event_id, sibling delivery B
     // loses claim() (A holds it, not yet finalized) → getResponse()=null → B

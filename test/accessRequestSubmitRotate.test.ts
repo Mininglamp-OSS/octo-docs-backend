@@ -55,4 +55,18 @@ describe('docAccessRequestRepo.submit — request_id rotation on re-submit', () 
     expect(out.requestId).toBe('rotated-id-2')
     expect(out.status).toBe(REQUEST_STATUS_PENDING)
   })
+
+  it('clears decision_note on resubmit so a rotated pending request carries no stale deny reason', async () => {
+    query
+      .mockResolvedValueOnce(undefined) // INSERT ... ON DUPLICATE KEY UPDATE
+      .mockResolvedValueOnce([{ request_id: 'rotated-id-2', status: REQUEST_STATUS_PENDING }])
+
+    await docAccessRequestRepo.submit(params)
+
+    const [insertSql] = query.mock.calls[0]!
+    // Without this reset a denied→resubmitted request retains the prior cycle's
+    // reason, which octo-server would then surface to the requester as if it
+    // belonged to the new request.
+    expect(insertSql).toContain("decision_note  = ''")
+  })
 })

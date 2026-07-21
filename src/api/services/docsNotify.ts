@@ -85,6 +85,10 @@ interface DocsCardBody {
   kind: string
   title: string
   actor_name: string
+  /** Requester uid. When actor_name is empty octo-server resolves the display
+   *  name from this server-side (identity authority), so a valid OCTO_SERVER_TOKEN
+   *  is not required for the name to render. */
+  actor_uid: string
   excerpt: string
   updated_at: string
 }
@@ -266,6 +270,7 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       kind: KIND_ACCESS_REQUESTED,
       title: p.title,
       actor_name: actorName,
+      actor_uid: p.requesterUid,
       excerpt: p.reason,
       updated_at: formatTimestamp(new Date()),
     }
@@ -338,6 +343,9 @@ export async function notifyDocMentioned(p: MentionNotifyParams): Promise<number
       kind: KIND_COMMENTED,
       title: p.title,
       actor_name: actorName,
+      // Mirror the access-request card: when actorName lookup fails, octo-server
+      // resolves the commenter's display name server-side from this uid.
+      actor_uid: p.authorUid,
       excerpt: toExcerpt(p.body),
       updated_at: formatTimestamp(new Date()),
     }
