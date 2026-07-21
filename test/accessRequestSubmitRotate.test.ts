@@ -46,6 +46,27 @@ describe('docAccessRequestRepo.submit — request_id rotation on re-submit', () 
     expect(insertBinds).toEqual(['d_1', 'u_req', 2, 'need writer', 'rotated-id-2'])
   })
 
+  it('clears decision_note in the ON DUPLICATE KEY UPDATE so a re-submit drops the prior denial reason', async () => {
+    // Re-submit reuses the (doc_id, uid) row and resets it to pending. A previously
+    // denied request leaves decision_note populated; without an explicit reset the
+    // fresh pending row would carry the prior cycle's reviewer reason, which the
+    // companion octo-server outcome card surfaces to the requester — misattributing
+    // a stale denial to a brand-new request. submit() must clear it alongside
+    // decided_by. (review blocker: stale-note leak on re-submit.)
+    query
+      .mockResolvedValueOnce(undefined) // INSERT ... ON DUPLICATE KEY UPDATE
+      .mockResolvedValueOnce([{ request_id: 'rotated-id-2', status: REQUEST_STATUS_PENDING }]) // read-back
+
+    await docAccessRequestRepo.submit(params)
+
+    const [insertSql] = query.mock.calls[0]!
+    // The reset clause — without this a resubmitted request keeps the old deny reason.
+    expect(insertSql).toContain("decision_note  = ''")
+    // Reset sits inside the duplicate-key update, right next to decided_by.
+    expect(insertSql).toContain("decided_by     = ''")
+    expect(insertSql).toContain('ON DUPLICATE KEY UPDATE')
+  })
+
   it('returns the read-back authoritative request_id (the rotated value)', async () => {
     query
       .mockResolvedValueOnce(undefined)
