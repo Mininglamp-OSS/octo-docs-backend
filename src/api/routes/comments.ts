@@ -30,6 +30,7 @@ import {
   AmbiguousAnchorError,
   AnchorTextNotFoundError,
 } from '../../collab/anchorResolve.js'
+import { notifyDocMentioned } from '../services/docsNotify.js'
 import type { BlockPath } from '../../collab/docBodyEdit.js'
 
 export const commentsRouter: ExpressRouter = Router()
@@ -251,6 +252,8 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       anchorEnd: null,
       anchorText: '',
     })
+    // Best-effort: notify anyone @-mentioned in the reply. Never blocks/fails the 201.
+    void notifyDocMentioned({ docId, spaceId: req.spaceId!, title: guard.meta.title, authorUid: req.uid!, body })
     res.status(201).json({ id })
     return
   }
@@ -327,6 +330,8 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     anchorEnd: end,
     anchorText: typeof anchorText === 'string' ? anchorText.slice(0, 512) : '',
   })
+  // Best-effort: notify anyone @-mentioned in the comment. Never blocks/fails the 201.
+  void notifyDocMentioned({ docId, spaceId: req.spaceId!, title: guard.meta.title, authorUid: req.uid!, body })
   res.status(201).json({ id })
 }
 
