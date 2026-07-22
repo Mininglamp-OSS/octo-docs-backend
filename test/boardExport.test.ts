@@ -28,6 +28,7 @@ import {
   readImagePixelArea,
 } from '../src/whiteboard/exportScene.js'
 import { exportBoardHandler } from '../src/api/routes/boardExport.js'
+import { sanitizeSceneImage } from '../src/api/routes/boardExport.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { COLLAB_FIELD } from '../src/schema/index.js'
 
@@ -67,6 +68,14 @@ const docGuard = {
   meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc' },
   role: 'reader',
 } as never
+
+it('embeds sanitized SVG bytes rather than the untrusted stored object', () => {
+  const dirty = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="1" height="1"/></svg>')
+  const image = sanitizeSceneImage(dirty)
+  expect(image?.mime).toBe('image/svg+xml')
+  expect(image?.bytes.toString()).toContain('<rect')
+  expect(image?.bytes.toString()).not.toContain('<script')
+})
 
 interface MockRes {
   statusCode: number
@@ -134,6 +143,16 @@ describe('serializeSceneToSvg', () => {
     // Text content is XML-escaped, never injected raw.
     expect(svg).toContain('Hello &amp; &lt;world&gt;')
     expect(svg).not.toContain('<world>')
+  })
+
+  it('uses the CJK-capable font stack for frame labels as well as text elements', () => {
+    const svg = serializeSceneToSvg({
+      elements: [el('f1', 'frame', { x: 40, y: 80, width: 300, height: 160, name: '流程分组' })],
+      files: {},
+    })
+    expect(svg).toContain('流程分组')
+    expect(svg).toContain('font-family="Arial Unicode MS, Heiti SC, Noto Sans CJK SC, sans-serif"')
+    expect(svg).not.toContain('font-family="sans-serif" font-size="14"')
   })
 
   it('renders an empty scene as a small blank white canvas (valid, openable)', () => {

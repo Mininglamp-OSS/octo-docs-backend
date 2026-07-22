@@ -31,6 +31,7 @@ const parser = new XMLParser({
   trimValues: false,
   parseTagValue: false,
   parseAttributeValue: false,
+  maxNestedTags: 512,
 })
 
 /** Parse an OOXML part buffer into a plain object tree. Never throws on entities. */
@@ -52,6 +53,11 @@ const orderedParser = new XMLParser({
   trimValues: false,
   parseTagValue: false,
   parseAttributeValue: false,
+  // Structured OMML can legitimately be very deep: the real acceptance file
+  // 11-docx-fixed.docx is valid OOXML with a measured XML element depth of 361.
+  // Keep a finite ceiling (512, with ~40% headroom) for hostile input while
+  // accepting that document and our own deeply nested export format.
+  maxNestedTags: 512,
 })
 
 /** An ordered-mode node: exactly one tag key plus an optional `:@` attrs group. */
