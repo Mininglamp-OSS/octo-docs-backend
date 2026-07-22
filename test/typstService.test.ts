@@ -23,6 +23,22 @@ const para = (content: unknown[]) => ({ type: 'paragraph', content })
 const text = (t: string, marks?: unknown[]) => ({ type: 'text', text: t, ...(marks ? { marks } : {}) })
 
 d('typstService — real compile (integration)', () => {
+  it('embeds a sanitized SVG image in the compiled PDF', async () => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40" fill="#e11d48"/><circle cx="40" cy="20" r="12" fill="white"/></svg>')
+    const src = renderTypst(
+      doc([{ type: 'image', attrs: { attachId: 'svg-1', width: '80px' } }]),
+      {
+        title: 'SVG image',
+        attachments: new Map([['svg-1', { url: '', fileName: 'shape.svg', mime: 'image/svg+xml', sizeBytes: svg.length }]]),
+        imagePaths: new Map([['svg-1', 'img_0.svg']]),
+      },
+    )
+    expect(src).toContain('__capImage("img_0.svg"')
+    const pdf = await compileTypst(src, [{ fileName: 'img_0.svg', bytes: svg }])
+    expect(pdf.subarray(0, 5).toString('latin1')).toBe('%PDF-')
+    expect(pdf.length).toBeGreaterThan(1000)
+  })
+
   it('compiles a rich CJK + math + table + code document to a valid PDF', async () => {
     const src = renderTypst(
       doc([

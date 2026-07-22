@@ -1103,12 +1103,26 @@ interface RenderCtx {
    *  reliably resolve a `layout()` measurement inside deeply nested `1fr`
    *  columns — so a plain page cap let deep-nested images overflow their cell. */
   inCell?: boolean
+  /** Alignment inherited from a containing text block. Images are block nodes in
+   *  the canonical schema, but imported/legacy PM JSON can still place one in a
+   *  paragraph; preserve that paragraph's alignment as a fallback. */
+  imageAlign?: 'left' | 'center' | 'right'
 }
 
 function alignArg(attrs: Record<string, unknown> | undefined): string {
   const a = attrs?.textAlign as string | null | undefined
   if (!a || !VALID_TEXT_ALIGNS.has(a)) return ''
   return a === 'justify' ? '' : a // justify handled via par(justify) globally; l/r/c map directly
+}
+
+function imageAlignArg(attrs: Record<string, unknown> | undefined, inherited?: string): 'left' | 'center' | 'right' {
+  const own = attrs?.align
+  if (own === 'left' || own === 'center' || own === 'right') return own
+  if (inherited === 'left' || inherited === 'center' || inherited === 'right') return inherited
+  // The editor's unaligned image wrapper is fit-content at the left margin.
+  // Typst figures center themselves by default, so make the product default
+  // explicit instead of relying on Typst's different default.
+  return 'left'
 }
 
 /**
@@ -1173,13 +1187,15 @@ function renderImage(node: PMNode, ctx: RenderCtx): string {
   if (!path) return ''
   if (meta?.mime && !meta.mime.startsWith('image/')) return ''
   const width = attrs.width != null ? String(attrs.width) : null
+  const align = imageAlignArg(attrs, ctx.imageAlign)
+  const figure = (image: string): string => `\n#align(${align})[#figure(${image})]\n`
   const m = width && /^(\d+(?:\.\d+)?)(px|%)?$/.exec(width)
   if (m) {
     const num = parseFloat(m[1]!)
     if (Number.isFinite(num) && num > 0) {
       // Explicit width, but never let it exceed the content width.
       const w = m[2] === '%' ? `${Math.min(num, 100)}%` : `${(num * 0.75).toFixed(1)}pt`
-      return `\n#figure(__capImage("${esc(path)}", w: ${w}))\n`
+      return figure(`__capImage("${esc(path)}", w: ${w})`)
     }
   }
   // Inside a table cell, constrain to the cell width (100%). Typst resolves
@@ -1187,11 +1203,11 @@ function renderImage(node: PMNode, ctx: RenderCtx): string {
   // column, whereas the `layout()` cap could not — so this stops nested-cell
   // images from overflowing their cell / overlapping the table borders.
   if (ctx.inCell) {
-    return `\n#figure(__capImage("${esc(path)}", w: 100%))\n`
+    return figure(`__capImage("${esc(path)}", w: 100%)`)
   }
   // No explicit width: cap to the page content width so large images don't
   // overflow, but don't upscale small ones (max-width: 100% behavior).
-  return `\n#figure(__capImage("${esc(path)}"))\n`
+  return figure(`__capImage("${esc(path)}")`)
 }
 
 function humanSize(bytes: number): string {
@@ -1233,8 +1249,12 @@ function renderNode(node: PMNode, ctx: RenderCtx): string {
     case 'text':
       return renderTextNode(node)
     case 'paragraph': {
-      const body = renderChildren(node, c)
       const al = alignArg(attrs)
+      const childCtx: RenderCtx = {
+        ...c,
+        imageAlign: al === 'left' || al === 'center' || al === 'right' ? al : c.imageAlign,
+      }
+      const body = renderChildren(node, childCtx)
       const aligned = al ? `#align(${al})[${body}]` : body
       const inner = applyParSpacing(attrs, aligned)
       return `\n${inner}\n`

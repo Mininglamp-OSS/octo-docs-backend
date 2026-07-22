@@ -464,6 +464,55 @@ describe('renderTypst — nodes', () => {
     expect(out).not.toContain('#figure(')
   })
 
+  it('uses the image align attr for raster and SVG assets instead of Typst figure centering', () => {
+    const attachments = new Map<string, ResolvedAttachment>([
+      ['png-left', { url: '', fileName: 'left.png', mime: 'image/png', sizeBytes: 1 }],
+      ['svg-center', { url: '', fileName: 'center.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
+      ['svg-right', { url: '', fileName: 'right.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
+    ])
+    const out = renderTypst(doc([
+      { type: 'image', attrs: { attachId: 'png-left', align: 'left' } },
+      { type: 'image', attrs: { attachId: 'svg-center', align: 'center', width: 80 } },
+      { type: 'image', attrs: { attachId: 'svg-right', align: 'right' } },
+    ]), {
+      title: 'T',
+      attachments,
+      imagePaths: new Map([
+        ['png-left', 'left.png'],
+        ['svg-center', 'center.svg'],
+        ['svg-right', 'right.svg'],
+      ]),
+    })
+
+    expect(out).toContain('#align(left)[#figure(__capImage("left.png"))]')
+    expect(out).toContain('#align(center)[#figure(__capImage("center.svg", w: 60.0pt))]')
+    expect(out).toContain('#align(right)[#figure(__capImage("right.svg"))]')
+  })
+
+  it('defaults an image without align to the editor left alignment, not Typst center', () => {
+    const out = renderTypst(doc([
+      { type: 'image', attrs: { attachId: 'plain' } },
+    ]), {
+      title: 'T',
+      attachments: new Map([['plain', { url: '', fileName: 'plain.png', mime: 'image/png', sizeBytes: 1 }]]),
+      imagePaths: new Map([['plain', 'plain.png']]),
+    })
+    expect(out).toContain('#align(left)[#figure(__capImage("plain.png"))]')
+  })
+
+  it('inherits paragraph alignment for legacy/imported image children when image align is absent', () => {
+    const out = renderTypst(doc([
+      { type: 'paragraph', attrs: { textAlign: 'right' }, content: [
+        { type: 'image', attrs: { attachId: 'legacy' } },
+      ] },
+    ]), {
+      title: 'T',
+      attachments: new Map([['legacy', { url: '', fileName: 'legacy.svg', mime: 'image/svg+xml', sizeBytes: 1 }]]),
+      imagePaths: new Map([['legacy', 'legacy.svg']]),
+    })
+    expect(out).toContain('#align(right)[#figure(__capImage("legacy.svg"))]')
+  })
+
   it('clamps pathological table span attrs (DoS guard)', () => {
     const out = typ([{ type: 'table', content: [
       { type: 'tableRow', content: [
