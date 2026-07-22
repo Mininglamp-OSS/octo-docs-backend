@@ -30,6 +30,7 @@ import { yDocStateToProsemirrorJSON } from '../../agent/conversion.js'
 import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { config } from '../../config/env.js'
+import { InvalidSvgError, sanitizeSvg } from '../../util/sanitizeSvg.js'
 import { renderTypst, type ResolvedAttachment } from '../../export/renderTypst.js'
 import {
   compileTypst,
@@ -54,12 +55,40 @@ const EMPTY_DOC = { type: 'doc', content: [] }
  * format lets typst decode it correctly. Returns null for bytes we don't
  * recognise (caller drops the image). Kept in sync with isSupportedImage.
  */
-export function sniffImageExt(buf: Buffer): 'png' | 'jpg' | 'gif' | null {
+export function sniffImageExt(buf: Buffer): 'png' | 'jpg' | 'gif' | 'svg' | null {
   if (buf.length < 4) return null
   if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png'
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg'
   if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif'
+  // SVG has no binary magic. Only classify a UTF-8 XML document whose first
+  // element is <svg>; prepareTypstImage still parses and sanitizes it before it
+  // can reach the compile root. Do not infer SVG from the declared MIME alone.
+  const head = buf.subarray(0, Math.min(buf.length, 4096)).toString('utf8')
+    .replace(/^\uFEFF/, '')
+    .replace(/^\s*<\?xml[^>]*>\s*/i, '')
+    .replace(/^\s*<!--(?:[\s\S]*?)-->\s*/i, '')
+  if (/^\s*<svg(?:\s|>)/i.test(head)) return 'svg'
   return null
+}
+
+/**
+ * Turn downloaded bytes into a safe Typst image input. Raster formats are
+ * accepted by magic bytes. SVG is parsed and sanitized again at export time
+ * (including legacy/imported objects which may predate the sanitized SVG
+ * upload route), and the sanitized XML is written with a truthful `.svg`
+ * extension. Typst 0.13.1 supports SVG natively, so no lossy raster step is
+ * needed and SVG bytes are never disguised as PNG.
+ */
+export function prepareTypstImage(buf: Buffer): { ext: 'png' | 'jpg' | 'gif' | 'svg'; bytes: Buffer } | null {
+  const ext = sniffImageExt(buf)
+  if (!ext) return null
+  if (ext !== 'svg') return { ext, bytes: buf }
+  try {
+    return { ext, bytes: sanitizeSvg(buf) }
+  } catch (err) {
+    if (err instanceof InvalidSvgError) return null
+    throw err
+  }
 }
 
 /**
@@ -114,23 +143,24 @@ async function resolveInputs(
     // the WHOLE typst compile with a decode error. Sniff the magic bytes and
     // drop anything that isn't a real image, matching the best-effort intent
     // (a bad image is skipped, not fatal).
-    const sniffedExt = sniffImageExt(bytes)
-    if (!sniffedExt) continue
-    // Aggregate byte budget: enforce on the real downloaded size too (a lying/
-    // absent sizeBytes can't smuggle past the per-image cap into the total).
-    if (totalBytes + bytes.byteLength > maxImageTotalBytes) continue
-    totalBytes += bytes.byteLength
-    const fileName = `img_${imgIdx++}.${sniffedExt}`
+    const prepared = prepareTypstImage(bytes)
+    if (!prepared) continue
+    // Re-check both budgets after SVG sanitation, which can change byte length.
+    // A lying/absent sizeBytes cannot smuggle past either cap.
+    if (prepared.bytes.byteLength > maxImageBytes) continue
+    if (totalBytes + prepared.bytes.byteLength > maxImageTotalBytes) continue
+    totalBytes += prepared.bytes.byteLength
+    const fileName = `img_${imgIdx++}.${prepared.ext}`
     imagePaths.set(a.attachId, fileName)
-    images.push({ fileName, bytes })
+    images.push({ fileName, bytes: prepared.bytes })
   }
   return { attachments, imagePaths, images }
 }
 
 /**
  * Sniff the leading magic bytes to confirm a buffer is an image format the
- * pinned typst engine (v0.13.1) can actually decode: PNG, JPEG, or GIF.
- * (typst v0.13.1 also decodes SVG, but SVG is blocked at upload; and it does
+ * pinned typst engine (v0.13.1) can actually decode: PNG, JPEG, GIF, or SVG.
+ * (SVG is accepted only after prepareTypstImage sanitizes it; Typst does
  * NOT decode WebP or BMP — those raise `unknown image format` and would abort
  * the whole compile, which is exactly what this guard exists to prevent.)
  * Guards against a corrupt, renamed, or undecodable attachment sinking the
@@ -139,9 +169,9 @@ async function resolveInputs(
 export function isSupportedImage(buf: Buffer): boolean {
   // Delegate to sniffImageExt so the accepted-format list and the extension
   // used for the compile-root filename can never drift apart. typst v0.13.1
-  // decodes PNG/JPEG/GIF; WebP and BMP are intentionally rejected (they would
+  // decodes PNG/JPEG/GIF/SVG; WebP and BMP are intentionally rejected (they would
   // fail the whole compile). Revisit if TYPST_VERSION is bumped.
-  return sniffImageExt(buf) !== null
+  return prepareTypstImage(buf) !== null
 }
 
 /**

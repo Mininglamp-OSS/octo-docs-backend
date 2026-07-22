@@ -622,17 +622,33 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     expect(body.notCopied[0]!.reason).toBe('source_not_found')
   })
 
-  it('re-validates the stored mime against the current denylist (a now-blocked SVG is refused)', async () => {
+  it('re-sanitizes a readable stored SVG before copying it to another document', async () => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect fill="#ffff00"/></svg>')
+    const storedSvg = { ...srcAttachment, mime: 'image/svg+xml', size_bytes: svg.length, object_key: 'd_src/att_src/x.svg', file_name: 'x.svg' }
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
     vi.mocked(resolveRole).mockResolvedValue('reader' as never)
-    vi.mocked(query).mockResolvedValueOnce([
-      { ...srcAttachment, mime: 'image/svg+xml', object_key: 'd_src/att_src/x.svg', file_name: 'x.svg' },
-    ] as never)
+    vi.mocked(query)
+      .mockResolvedValueOnce([storedSvg] as never)
+      .mockResolvedValueOnce([] as never)
+      .mockResolvedValueOnce([{ ...storedSvg, attach_id: 'att_new', doc_id: 'd_1', object_key: 'd_1/att_new/x.svg' }] as never)
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+      init?.method === 'PUT'
+        ? ({ ok: true, status: 200 })
+        : ({ ok: true, status: 200, headers: { get: () => String(svg.length) }, body: null, arrayBuffer: async () => svg.buffer.slice(svg.byteOffset, svg.byteOffset + svg.byteLength) }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
     const res = mockRes()
     await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+
     expect(res.statusCode).toBe(200)
-    const body = res.body as { notCopied: Array<{ reason: string }> }
-    expect(body.notCopied[0]!.reason).toBe('mime_not_allowed')
+    const body = res.body as { mappings: Array<{ mime: string }>; notCopied: unknown[] }
+    expect(body.notCopied).toEqual([])
+    expect(body.mappings[0]!.mime).toBe('image/svg+xml')
+    const put = fetchMock.mock.calls.find((call) => call[1]?.method === 'PUT')!
+    const uploaded = Buffer.from(put[1]!.body as Uint8Array).toString('utf8')
+    expect(uploaded).not.toContain('<script')
+    expect(uploaded).toContain('fill="#ffff00"')
   })
 
   it('404-style notCopied when the source attachment does not belong to the claimed source doc', async () => {
@@ -651,6 +667,7 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
 describe('POST attachments/ingest (external-image re-hosting)', () => {
   // A minimal valid PNG header so sniffImageMime returns image/png.
   const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
+  const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect fill="#ffff00" width="10" height="10"/></svg>')
 
   beforeEach(() => {
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
@@ -681,6 +698,43 @@ describe('POST attachments/ingest (external-image re-hosting)', () => {
     expect(body.mappings[0]!.sourceUrl).toBe('https://example.com/pic.png')
     expect(verifySignedUrl(body.mappings[0]!.url).valid).toBe(true)
     vi.unstubAllGlobals()
+  })
+
+  it('downloads and sanitizes an external SVG through the SSRF-guarded ingest path', async () => {
+    vi.mocked(fetchExternalImage).mockResolvedValue({ bytes: SVG, declaredContentType: 'image/svg+xml' } as never)
+    vi.mocked(query).mockResolvedValueOnce([] as never) // register INSERT
+    vi.mocked(query).mockResolvedValueOnce([
+      { attach_id: 'att_svg', doc_id: 'd_1', object_key: 'd_1/att_svg/vector.svg+xml', mime: 'image/svg+xml', size_bytes: SVG.length, file_name: 'vector.svg+xml', created_by: 'u', created_at: new Date(0) },
+    ] as never)
+    const put = vi.fn(async (_url: string, init?: RequestInit) => ({ ok: true, status: 200, init }))
+    vi.stubGlobal('fetch', put)
+
+    const res = mockRes()
+    await ingestHandler(req({ docId: 'd_1' }, { urls: ['https://example.com/vector.svg'] }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { mappings: Array<{ mime: string }>; notIngested: unknown[] }
+    expect(body.notIngested).toEqual([])
+    expect(body.mappings[0]!.mime).toBe('image/svg+xml')
+    const uploaded = put.mock.calls[0]![1]!.body as Uint8Array
+    const text = Buffer.from(uploaded).toString('utf8')
+    expect(text).not.toContain('<script')
+    expect(text).toContain('fill="#ffff00"')
+    vi.unstubAllGlobals()
+  })
+
+  it('rejects active external XML that is not a sanitizable SVG', async () => {
+    vi.mocked(fetchExternalImage).mockResolvedValue({
+      bytes: Buffer.from('<!DOCTYPE svg [<!ENTITY x SYSTEM "file:///etc/passwd">]><svg>&x;</svg>'),
+      declaredContentType: 'image/svg+xml',
+    } as never)
+    const res = mockRes()
+
+    await ingestHandler(req({ docId: 'd_1' }, { urls: ['https://example.com/active.svg'] }), res as never)
+
+    const body = res.body as { mappings: unknown[]; notIngested: Array<{ reason: string }> }
+    expect(body.mappings).toEqual([])
+    expect(body.notIngested[0]!.reason).toBe('not_an_image')
   })
 
   it('rejects bytes that are not a real image (magic-number sniff), keeping the URL for the caller', async () => {
