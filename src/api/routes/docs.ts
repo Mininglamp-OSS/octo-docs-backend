@@ -22,6 +22,7 @@ import {
 import { buildWhiteboardName, WhiteboardNameError } from '../../whiteboard/schema/index.js'
 import { newDocId } from '../../util/ids.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
+import { enqueueDocIndex } from '../../search/docIndexQueue.js'
 import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
@@ -219,6 +220,18 @@ export async function createDocHandler(req: Request, res: Response) {
   // unconditionally heals that recovery case with no double-work regression.
   if (meta) {
     await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
+  }
+
+  // §3.3a (html search-index seam — the SECOND producer). An html doc's body is
+  // owned/rendered by the external octo-doc service and never flows through the
+  // Yjs store hooks, so the collab afterStoreDocument feed can't see it. This
+  // registration/upsert IS the html "content changed" signal (create AND the
+  // idempotent re-register both land here), so enqueue it as the index trigger;
+  // the consumer parses the html documentName and fetches the body from the
+  // external service. Best-effort, fire-and-forget, gated OFF by default — must
+  // never affect the create response.
+  if (resolvedDocType === HTML_DOC_TYPE && config.search.indexEnabled && meta?.document_name) {
+    void enqueueDocIndex(meta.document_name, 'body')
   }
   const responseDocId = resolvedDocType === HTML_DOC_TYPE ? (meta?.doc_id ?? docId) : docId
   const responseDocumentName = resolvedDocType === HTML_DOC_TYPE ? (meta?.document_name ?? documentName) : documentName

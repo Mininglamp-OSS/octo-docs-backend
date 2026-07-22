@@ -594,6 +594,15 @@ export const config = {
     retainDays: num('AUTO_RETAIN_DAYS', 7),
   },
 
+  // Full-text search index feed (§3.3a). When enabled, the collab
+  // afterStoreDocument hook enqueues a tiny {documentName} signal onto a Redis
+  // list for a separate indexer to consume. Default OFF (gray release): while
+  // disabled the hook is inert, so the queue never grows before a consumer
+  // exists.
+  search: {
+    indexEnabled: bool('SEARCH_INDEX_ENABLED', false),
+  },
+
   // FEAT-B recent-view retention. doc_view_history rows are pruned synchronously
   // (piggyback) inside the same transaction as each ingest UPSERT, per uid, so a
   // returned ingest leaves the window already trimmed (deterministic for tests).
