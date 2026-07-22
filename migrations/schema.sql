@@ -20,6 +20,7 @@
 --   doc_attachment        OPTIONAL attachment reference table (§3.5)
 --   doc_version           version history snapshots (snapshot + restore, §4 #4)
 --   card_action_receipt   signed card-action callback idempotency receipts
+--   doc_access_notify_card approver access-request card coordinates (decision card sync)
 
 -- 文档元数据（业务库）
 CREATE TABLE doc_meta (
@@ -255,4 +256,24 @@ CREATE TABLE card_action_receipt (
   created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Ledger of the notification cards delivered to a document's approvers
+-- (owner + admins) when someone submits an access request. One row per
+-- (request_id, recipient) records the IM coordinates (channel + message id) of
+-- that recipient's card, so a later approve/deny can drive EVERY approver's card
+-- to a terminal state — not just the one the decider clicked.
+-- PRIVACY: stores only the opaque Octo uid needed to locate the card; no display
+-- names or account handles (consistent with doc_member.uid etc.).
+CREATE TABLE doc_access_notify_card (
+  request_id    VARCHAR(64)  NOT NULL,               -- doc_access_request.request_id this card belongs to
+  recipient_uid VARCHAR(64)  NOT NULL,               -- approver who received the card (owner or admin)
+  channel_id    VARCHAR(64)  NOT NULL,               -- IM channel the card was delivered on (DM = recipient)
+  channel_type  TINYINT      NOT NULL DEFAULT 1,     -- IM channel type (1=person)
+  message_id    VARCHAR(64)  NOT NULL,               -- IM message id (string: int64 exceeds JS safe integer)
+  client_msg_no VARCHAR(64)  NOT NULL DEFAULT '',    -- IM client message no (idempotency / audit)
+  status        TINYINT      NOT NULL DEFAULT 1,     -- 1=active(sent) 2=terminalized
+  created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (request_id, recipient_uid)            -- leftmost prefix serves the decision-time lookup by request_id
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

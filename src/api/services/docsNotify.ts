@@ -25,6 +25,7 @@ import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import { docAccessNotifyCardRepo, type NotifyCardCoord } from '../../db/repos/docAccessNotifyCardRepo.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
 import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
 
@@ -92,10 +93,21 @@ interface DocsCardBody {
   updated_at: string
 }
 
-/** octo-server NotifyResp. */
+/** octo-server DeliveredCard: IM coordinates of one delivered card. message_id
+ *  is a decimal STRING (int64 exceeds JS safe-integer range). */
+interface DeliveredCard {
+  uid: string
+  channel_id: string
+  channel_type: number
+  message_id: string
+  client_msg_no: string
+}
+
+/** octo-server NotifyResp. delivered_cards is additive (docs-card path only). */
 interface NotifyResp {
   delivered: string[]
   filtered: Record<string, string>
+  delivered_cards?: DeliveredCard[]
 }
 
 export interface AccessRequestNotifyParams {
@@ -185,13 +197,18 @@ function formatTimestamp(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
-/** POST one docs_card notification to a single recipient. Returns true on delivery. */
+/**
+ * POST one docs_card notification to a single recipient. Returns whether the
+ * server confirmed delivery (for the delivered count — unchanged contract) and,
+ * separately, the delivered card's coordinates for persistence when the response
+ * carries a locator (absent on the text-fallback path).
+ */
 async function postNotify(
   spaceId: string,
   recipientUid: string,
   docsCard: DocsCardBody,
   internalToken: string,
-): Promise<boolean> {
+): Promise<{ delivered: boolean; card: NotifyCardCoord | null }> {
   const url = `${config.octoIdentity.serverBaseUrl}${INTERNAL_NOTIFY_PATH}`
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), NOTIFY_TIMEOUT_MS)
@@ -216,19 +233,36 @@ async function postNotify(
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[octo-docs] docs-notify send failed (network)', { recipientUid, err: String(err) })
-      return false
+      return { delivered: false, card: null }
     }
     if (!res.ok) {
       // eslint-disable-next-line no-console
       console.error('[octo-docs] docs-notify rejected', { recipientUid, status: res.status })
-      return false
+      return { delivered: false, card: null }
     }
     // Only `delivered[]` counts as truly sent; `filtered` entries (not_space_member
     // / busy / dispatch_failed / …) are the caller's to retry per business rules.
     // The body read stays inside the AbortController window so a trickled/hung
     // response body is bounded by the same NOTIFY_TIMEOUT_MS, not just connect.
     const body = (await res.json().catch(() => null)) as NotifyResp | null
-    return !!body && Array.isArray(body.delivered) && body.delivered.includes(recipientUid)
+    if (!body || !Array.isArray(body.delivered) || !body.delivered.includes(recipientUid)) {
+      return { delivered: false, card: null }
+    }
+    // Locate this recipient's card coordinates for later in-place mutation. A
+    // text-fallback delivery carries no card locator → delivered, but nothing to
+    // persist. Delivery status is independent of the locator's presence so the
+    // delivered count is unchanged from before.
+    const found = body.delivered_cards?.find((c) => c.uid === recipientUid)
+    const card: NotifyCardCoord | null = found
+      ? {
+          recipientUid,
+          channelId: found.channel_id,
+          channelType: found.channel_type,
+          messageId: found.message_id,
+          clientMsgNo: found.client_msg_no,
+        }
+      : null
+    return { delivered: true, card }
   } finally {
     clearTimeout(timer)
   }
@@ -277,7 +311,28 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
     const results = await Promise.all(
       approvers.map((uid) => postNotify(p.spaceId, uid, docsCard, docsToken)),
     )
-    return results.filter(Boolean).length
+    // Persist the delivered cards' coordinates so a later approve/deny can locate
+    // and terminalize every approver's card. Best-effort: a persistence failure
+    // must not affect the submit 201 or the delivered count (the pull-based flow
+    // stays authoritative). Keyed by request_id; the requester is already excluded
+    // from `approvers`, so no self-card is recorded.
+    const cards = results
+      .map((r) => r.card)
+      .filter((c): c is NotifyCardCoord => c !== null)
+    if (cards.length > 0) {
+      try {
+        await docAccessNotifyCardRepo.record(p.requestId, cards)
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[octo-docs] docs-notify card ledger persist failed', {
+          requestId: p.requestId,
+          err: String(err),
+        })
+      }
+    }
+    // Return the delivered count (unchanged contract): a delivery still counts
+    // even when it carried no card locator (text fallback) and thus no ledger row.
+    return results.filter((r) => r.delivered).length
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[octo-docs] docs-notify access-request failed', { docId: p.docId, err: String(err) })
@@ -351,7 +406,9 @@ export async function notifyDocMentioned(p: MentionNotifyParams): Promise<number
     const results = await mapWithConcurrency(targets, NOTIFY_CONCURRENCY, (uid) =>
       postNotify(p.spaceId, uid, docsCard, docsToken),
     )
-    return results.filter(Boolean).length
+    // commented kind has no request_id, so no card ledger is kept; only the
+    // delivered count matters here (postNotify now returns {delivered, card}).
+    return results.filter((r) => r.delivered).length
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[octo-docs] docs-notify mention failed', { docId: p.docId, err: String(err) })
