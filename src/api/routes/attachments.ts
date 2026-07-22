@@ -126,7 +126,7 @@ function dispositionFileName(fileName: string): string {
  * download decision is likewise taken from that trusted registered mime. The
  * single read and batch resolve endpoints share this one path so they never drift.
  */
-function presignReadUrl(attachment: DocAttachment, ttl: number): string {
+export function presignAttachmentReadUrl(attachment: DocAttachment, ttl: number): string {
   const contentDisposition = isInlineType(attachment.mime)
     ? undefined
     : `attachment; filename="${dispositionFileName(attachment.fileName)}"`
@@ -228,7 +228,7 @@ export async function svgUploadHandler(req: Request, res: Response): Promise<voi
     mime,
     sizeBytes: bytes.length,
     fileName: safeName,
-    url: attachment ? presignReadUrl(attachment, config.attachments.readUrlTtlSeconds) : null,
+    url: attachment ? presignAttachmentReadUrl(attachment, config.attachments.readUrlTtlSeconds) : null,
   })
 }
 
@@ -329,7 +329,7 @@ export async function readHandler(req: Request, res: Response): Promise<void> {
   }
 
   const ttl = config.attachments.readUrlTtlSeconds
-  const url = presignReadUrl(attachment, ttl)
+  const url = presignAttachmentReadUrl(attachment, ttl)
 
   res.status(200).json({
     attachId: attachment.attachId,
@@ -405,7 +405,7 @@ export async function resolveHandler(req: Request, res: Response): Promise<void>
     // RES-3: same presign + Content-Disposition path as the single read endpoint.
     items.push({
       attachId: attachment.attachId,
-      url: presignReadUrl(attachment, ttl),
+      url: presignAttachmentReadUrl(attachment, ttl),
       expiresInSec: ttl,
       mime: attachment.mime,
       sizeBytes: attachment.sizeBytes,
@@ -540,7 +540,7 @@ export async function copyHandler(req: Request, res: Response): Promise<void> {
         sourceDocId: ref.docId,
         sourceAttachId: ref.attachId,
         attachId,
-        url: presignReadUrl(created, ttl),
+        url: presignAttachmentReadUrl(created, ttl),
         mime: created.mime,
         sizeBytes: created.sizeBytes,
         fileName: created.fileName,
@@ -591,7 +591,7 @@ async function readCapped(resp: Awaited<ReturnType<typeof fetch>>, cap: number):
  * Never touches a client-supplied URL — only object keys the DB already vouches for. Returns the
  * new attachId.
  */
-async function copyStoredObject(
+export async function copyStoredObject(
   src: DocAttachment,
   targetDocId: string,
   uid: string,
@@ -622,23 +622,39 @@ async function copyStoredObject(
   const attachId = newAttachId()
   // src.fileName was sanitized at its own register time; keep it (it is already a safe segment).
   const objectKey = `${targetDocId}/${attachId}/${src.fileName}`
-  await docAttachmentRepo.register({
-    attachId,
-    docId: targetDocId,
-    objectKey,
-    mime: src.mime,
-    sizeBytes: bytes.length,
-    fileName: src.fileName,
-    createdBy: uid,
-  })
-  const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
-  const putResp = await fetch(put.uploadUrl, {
-    method: 'PUT',
-    body: new Uint8Array(bytes),
-    headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
-  })
-  if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
-  return attachId
+  try {
+    const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
+    const putResp = await fetch(put.uploadUrl, {
+      method: 'PUT',
+      body: new Uint8Array(bytes),
+      headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
+    })
+    if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
+    await docAttachmentRepo.register({
+      attachId,
+      docId: targetDocId,
+      objectKey,
+      mime: src.mime,
+      sizeBytes: bytes.length,
+      fileName: src.fileName,
+      createdBy: uid,
+    })
+    return attachId
+  } catch (err) {
+    await Promise.allSettled([
+      docAttachmentRepo.deleteById(attachId),
+      store.delete(objectKey),
+    ])
+    throw err
+  }
+}
+
+/** Compensate a successful copy when the enclosing document edit does not commit. */
+export async function cleanupCopiedAttachment(attachId: string): Promise<void> {
+  const attachment = await docAttachmentRepo.getById(attachId)
+  if (!attachment) return
+  await getObjectStore().delete(attachment.objectKey)
+  await docAttachmentRepo.deleteById(attachId)
 }
 
 /**
@@ -698,7 +714,10 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
       // Raster formats use their binary magic. A real SVG root is parsed and sanitized before it
       // can reach storage; active/malformed XML fails closed as not_an_image.
       let mime = sniffImageMime(bytes)
-      if (!mime) {
+      // sniffImageMime deliberately recognizes an SVG *candidate* because SVG
+      // has no binary magic. Candidate recognition is never a sanitation
+      // boundary: every SVG must still pass the active-XML sanitizer here.
+      if (!mime || mime === 'image/svg+xml') {
         try {
           bytes = sanitizeSvg(bytes)
           mime = 'image/svg+xml'
@@ -727,7 +746,7 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
       if (!putResp.ok) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
       const created = await docAttachmentRepo.getById(attachId)
       if (!created) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
-      mappings.push({ sourceUrl, attachId, url: presignReadUrl(created, ttl), mime, sizeBytes: bytes.length })
+      mappings.push({ sourceUrl, attachId, url: presignAttachmentReadUrl(created, ttl), mime, sizeBytes: bytes.length })
     } catch (err) {
       // SSRF-blocked / oversized / dead host / bad scheme all land here; keep the original URL.
       const reason = err instanceof LinkCardError ? err.code : 'fetch_failed'
