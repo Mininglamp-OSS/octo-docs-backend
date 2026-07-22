@@ -11,7 +11,7 @@
  *   4. metadata routers (docs / members / invites-admin / attachments).
  *
  * A second, bot-facing mount (§ v4.3) re-mounts the same metadata routers under
- * /v1/bot/docs behind verifyBot (bot token -> req.uid + server-resolved
+ * /docs/v1/bot behind verifyBot (bot token -> req.uid + server-resolved
  * req.spaceId) instead of authMiddleware + spaceContextMiddleware. The human
  * mount below is unchanged.
  */
@@ -170,7 +170,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
 
   // Bot-facing entry (§ v4.3): the SAME nine metadata routers, re-mounted behind
   // a bot identity middleware at a physically distinct prefix so nginx can route
-  // /v1/bot/docs -> docs-backend while other /v1/bot/* -> octo-server. No handler
+  // /docs/v1/bot -> docs-backend while other /v1/bot/* -> octo-server. No handler
   // code is copied or forked — each router only reads req.uid / req.spaceId, both
   // of which verifyBot injects (uid from the bot token, spaceId from octo-server's
   // server-side reverse lookup). The bot invite-accept route (docs #61) is the one
@@ -184,7 +184,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // mount), mounted ahead of verifyBot so the authorizing bot routes are covered.
   botApi.use(createRateLimiter(opts.rateLimit))
   botApi.use(verifyBotMiddleware)
-  botApi.use(botAcceptInviteRouter) // POST /v1/bot/docs/invites/:inviteToken/accept (docs #61)
+  botApi.use(botAcceptInviteRouter) // POST /docs/v1/bot/invites/:inviteToken/accept (docs #61)
   botApi.use(docsRouter)
   botApi.use(membersRouter)
   botApi.use(forwardGrantRouter)
@@ -197,8 +197,8 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   botApi.use(docContentRouter)
   botApi.use(docSheetRouter)
   botApi.use(docSceneRouter)
-  botApi.use(boardExportRouter) // /v1/bot/docs/:docId/export (whiteboard PNG/SVG, W3)
-  app.use('/v1/bot/docs', botApi)
+  botApi.use(boardExportRouter) // /docs/v1/bot/:docId/export (whiteboard PNG/SVG, W3)
+  app.use('/docs/v1/bot', botApi)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {

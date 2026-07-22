@@ -1,7 +1,7 @@
 /**
  * Bot document-body content endpoints (design §2). Incremental edit + live read
  * of a document's ProseMirror body, mounted on BOTH the human /api/v1/docs chain
- * and the bot /v1/bot/docs chain (see app.ts) so each reads req.uid / req.spaceId
+ * and the bot /docs/v1/bot chain (see app.ts) so each reads req.uid / req.spaceId
  * from whichever identity middleware ran.
  *
  *   PATCH /:docId/content   writer  — incremental edit under a strict If-Match

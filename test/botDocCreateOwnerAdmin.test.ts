@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 
 // Integration test for the bot doc-create owner-grant (XIN-576): when a bot
-// creates a doc via POST /v1/bot/docs, the bot's human owner (robot.creator_uid,
+// creates a doc via POST /docs/v1/bot, the bot's human owner (robot.creator_uid,
 // surfaced by verifyBot as ownerUid) must be auto-added as an admin member so the
 // owner can see the doc. The repos and epoch broadcast are mocked so no MySQL /
 // Redis is needed; the create handler and both mounts run for real.
@@ -124,7 +124,7 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
     setOctoIdentity(
       stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }),
     )
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({ title: 'Bot Doc' }),
@@ -150,7 +150,7 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
     setOctoIdentity(
       stub({ verifyBot: async () => ({ uid: 's_plat_bot', spaceId: 's_1', ownerUid: 's_plat_bot' }) }),
     )
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({ title: 'Platform Doc' }),
@@ -162,7 +162,7 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
 
   it('skips the grant when the bot has no human owner at all (ownerUid absent)', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_bot', spaceId: 's_1' }) }))
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({ title: 'No Owner Doc' }),
@@ -211,7 +211,7 @@ describe('bot html doc registration', () => {
     )
     upsertHtmlByOctoDocSlug.mockResolvedValue({ meta: htmlMeta, created: true } as never)
 
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -264,7 +264,7 @@ describe('bot html doc registration', () => {
     )
     upsertHtmlByOctoDocSlug.mockResolvedValue({ meta: { ...htmlMeta, title: 'Renamed' }, created: false } as never)
 
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -305,7 +305,7 @@ describe('bot html doc registration', () => {
     )
     upsertHtmlByOctoDocSlug.mockResolvedValue({ meta: htmlMeta, created: false } as never)
 
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -323,7 +323,7 @@ describe('bot html doc registration', () => {
 
   it('skips thread-mounted html docs without writing doc_meta', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -343,7 +343,7 @@ describe('bot html doc registration', () => {
   it('rejects html registration with an octo-doc slug longer than 128 chars before writing', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
 
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -367,7 +367,7 @@ describe('bot html doc registration', () => {
       items: [{ ...htmlMeta, owner_id: 's_tmos_bot', role: 3 }],
     } as never)
 
-    const res = await fetch(`${base}/v1/bot/docs`, { headers: { authorization: 'Bearer bot-tok' } })
+    const res = await fetch(`${base}/docs/v1/bot`, { headers: { authorization: 'Bearer bot-tok' } })
 
     expect(res.status).toBe(200)
     const body = (await res.json()) as { total: number; items: Array<{ docType: string; octoDocSlug: string }> }
@@ -395,7 +395,7 @@ describe('bot html doc registration', () => {
     }
     upsertHtmlByOctoDocSlug.mockResolvedValue({ meta: bMeta, created: true } as never)
 
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -435,7 +435,7 @@ describe('bot html doc registration', () => {
     getByOctoDocSlug.mockResolvedValue(htmlMeta as never)
     getByDocId.mockResolvedValue(htmlMeta as never)
 
-    const renameRes = await fetch(`${base}/v1/bot/docs/octo-doc/${encodeURIComponent('html-slug-1')}`, {
+    const renameRes = await fetch(`${base}/docs/v1/bot/octo-doc/${encodeURIComponent('html-slug-1')}`, {
       method: 'PATCH',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({ title: 'HTML Renamed' }),
@@ -444,7 +444,7 @@ describe('bot html doc registration', () => {
     expect(renameRes.status).toBe(200)
     expect(rename).toHaveBeenCalledWith('d_html', 'HTML Renamed', 's_tmos_bot')
 
-    const deleteRes = await fetch(`${base}/v1/bot/docs/octo-doc/${encodeURIComponent('html-slug-1')}`, {
+    const deleteRes = await fetch(`${base}/docs/v1/bot/octo-doc/${encodeURIComponent('html-slug-1')}`, {
       method: 'DELETE',
       headers: { authorization: 'Bearer bot-tok' },
     })
@@ -464,7 +464,7 @@ describe('bot html doc registration', () => {
     )
     upsertHtmlByOctoDocSlug.mockRejectedValue(new DocOwnershipError())
 
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({

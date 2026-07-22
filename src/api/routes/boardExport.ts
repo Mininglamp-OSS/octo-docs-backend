@@ -19,7 +19,7 @@
  * plus a prebuilt native rasterizer, mirroring the short-lived/network-less
  * philosophy of the Typst PDF path. See the W3 renderer-selection spike.
  *
- * Mounted on BOTH the human /api/v1/docs chain and the bot /v1/bot/docs chain
+ * Mounted on BOTH the human /api/v1/docs chain and the bot /docs/v1/bot chain
  * (app.ts), so it reads req.uid / req.spaceId from whichever identity ran.
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'

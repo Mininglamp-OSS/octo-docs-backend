@@ -164,7 +164,7 @@ export const config = {
 
   // Per-IP request throttle applied to the REST route chains (§8.4). Guards the
   // authenticated/authorizing metadata endpoints on both the human (/api/v1/docs)
-  // and bot (/v1/bot/docs) mounts against abuse. Keyed on the real client IP,
+  // and bot (/docs/v1/bot) mounts against abuse. Keyed on the real client IP,
   // which requires `trustProxy` above to be set correctly for the deployment.
   // Defaults are generous enough not to affect normal interactive/bot usage;
   // tune down only if abuse is observed. The /healthz probe is mounted ahead of
@@ -218,7 +218,7 @@ export const config = {
     // GET /v1/users/:uid, which requires auth) on the HUMAN path. Empty = not
     // configured; callers then fall back to the authenticated user's own session
     // token. OPTIONAL for the human path (/api/v1/docs). No longer required for
-    // the bot path (/v1/bot/docs): the bot resolves the target user with its own
+    // the bot path (/docs/v1/bot): the bot resolves the target user with its own
     // bearer token via GET /v1/bot/user/info (see octoIdentity.getUserAsBot), so
     // the anti ghost-member existence check in members/forwardGrant works with
     // OCTO_SERVER_TOKEN empty.

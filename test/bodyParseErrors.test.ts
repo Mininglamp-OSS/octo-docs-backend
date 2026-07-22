@@ -26,7 +26,7 @@ afterAll(async () => {
 
 describe('body-parser error mapping (§③)', () => {
   it('malformed JSON body → 400 invalid_body (not 500)', async () => {
-    const res = await fetch(`${base}/v1/bot/docs/d_1/content`, {
+    const res = await fetch(`${base}/docs/v1/bot/d_1/content`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json', authorization: 'Bearer x' },
       body: '{bad-json',
@@ -38,7 +38,7 @@ describe('body-parser error mapping (§③)', () => {
   it('body over the 1mb limit → 413 doc_too_large (not 500)', async () => {
     // ~6 MiB JSON body, well over express.json's 1mb cap.
     const huge = JSON.stringify({ ops: 'x'.repeat(6 * 1024 * 1024) })
-    const res = await fetch(`${base}/v1/bot/docs/d_1/content`, {
+    const res = await fetch(`${base}/docs/v1/bot/d_1/content`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json', authorization: 'Bearer x' },
       body: huge,
@@ -53,7 +53,7 @@ describe('body-parser error mapping (§③)', () => {
     // sheet-specific code so the /:docId/sheet 1MB rejection matches the read
     // guard's sheet_too_large (issue #69 sheet contract), not doc_too_large.
     const huge = JSON.stringify({ cells: { 'default!0:0': { v: 'x'.repeat(6 * 1024 * 1024) } } })
-    const res = await fetch(`${base}/v1/bot/docs/d_1/sheet`, {
+    const res = await fetch(`${base}/docs/v1/bot/d_1/sheet`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json', authorization: 'Bearer x' },
       body: huge,
@@ -65,7 +65,7 @@ describe('body-parser error mapping (§③)', () => {
   it('a well-formed JSON body is not caught by the parse-error mapping', async () => {
     // Valid JSON parses fine; it flows past the body parser to auth (401 here,
     // no valid bot token) — proving the mapping only fires on parse failures.
-    const res = await fetch(`${base}/v1/bot/docs/d_1/content`, {
+    const res = await fetch(`${base}/docs/v1/bot/d_1/content`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json', authorization: 'Bearer x' },
       body: JSON.stringify({ ops: [] }),

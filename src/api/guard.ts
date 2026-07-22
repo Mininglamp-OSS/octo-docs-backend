@@ -42,7 +42,7 @@ export interface DocRoleCaller {
  * space. Writes the 404 and returns false when the doc is out of space.
  *
  * Shared by requireDocRole and the role-less access-request submit handler so
- * both mounts (human /api/v1/docs and bot /v1/bot/docs) enforce identical space
+ * both mounts (human /api/v1/docs and bot /docs/v1/bot) enforce identical space
  * scoping from a single definition rather than a forked bespoke check.
  */
 export function requireSameSpace(res: Response, meta: DocMeta, spaceId: string): boolean {

@@ -3,7 +3,7 @@
  *
  * A per-IP fixed-window throttle mounted at the head of each REST route chain so
  * the authenticated/authorizing metadata endpoints on both the human
- * (/api/v1/docs) and bot (/v1/bot/docs) mounts are protected against request
+ * (/api/v1/docs) and bot (/docs/v1/bot) mounts are protected against request
  * flooding. Backed by express-rate-limit's default in-process memory store,
  * which is sufficient per node; the window is short so restarts do not matter.
  *

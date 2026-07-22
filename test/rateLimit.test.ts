@@ -52,12 +52,12 @@ describe('rate limiter (§8.4)', () => {
     })
   })
 
-  it('throttles the bot /v1/bot/docs chain per IP', async () => {
+  it('throttles the bot /docs/v1/bot chain per IP', async () => {
     const app = createApp({ rateLimit: { windowMs: 60_000, max: 2 } })
     await withServer(app, async (base) => {
-      const first = await fetch(`${base}/v1/bot/docs`, { headers: { authorization: 'Bearer x' } })
-      const second = await fetch(`${base}/v1/bot/docs`, { headers: { authorization: 'Bearer x' } })
-      const third = await fetch(`${base}/v1/bot/docs`, { headers: { authorization: 'Bearer x' } })
+      const first = await fetch(`${base}/docs/v1/bot`, { headers: { authorization: 'Bearer x' } })
+      const second = await fetch(`${base}/docs/v1/bot`, { headers: { authorization: 'Bearer x' } })
+      const third = await fetch(`${base}/docs/v1/bot`, { headers: { authorization: 'Bearer x' } })
       expect(first.status).not.toBe(429)
       expect(second.status).not.toBe(429)
       expect(third.status).toBe(429)

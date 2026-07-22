@@ -13,7 +13,7 @@
  *                                   If-Match(SV) optimistic-concurrency guard
  *
  * The routes are mounted on BOTH the human /api/v1/docs chain and the bot
- * /v1/bot/docs chain (see app.ts), so each reads req.uid / req.spaceId from
+ * /docs/v1/bot chain (see app.ts), so each reads req.uid / req.spaceId from
  * whichever identity middleware ran.
  *
  * The route gate (requireDocRole) is UX / a cheap 404 pass; on the write path the

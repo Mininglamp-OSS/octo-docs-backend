@@ -8,7 +8,7 @@ import type { Server } from 'node:http'
 // handler's space scoping runs for real.
 //
 // It proves the wiring the design requires:
-//   - /v1/bot/docs is guarded by verifyBot (bad token => 401),
+//   - /docs/v1/bot is guarded by verifyBot (bad token => 401),
 //   - the bot path needs NO X-Space-Id header — the space is server-injected,
 //   - a client-supplied X-Space-Id on the bot path is ignored (anti-spoof),
 //   - the human /api/v1/docs chain is unchanged (still hard-400s without a space).
@@ -57,10 +57,10 @@ beforeEach(() => {
   listForUser.mockResolvedValue({ total: 0, items: [] })
 })
 
-describe('bot mount /v1/bot/docs (§ v4.3)', () => {
+describe('bot mount /docs/v1/bot (§ v4.3)', () => {
   it('rejects the bot path with 401 when the bot token is invalid', async () => {
     setOctoIdentity(stub({ verifyBot: async () => null }))
-    const res = await fetch(`${base}/v1/bot/docs`, { headers: { authorization: 'Bearer bad' } })
+    const res = await fetch(`${base}/docs/v1/bot`, { headers: { authorization: 'Bearer bad' } })
     expect(res.status).toBe(401)
     expect(await res.json()).toEqual({ error: 'unauthorized' })
     expect(listForUser).not.toHaveBeenCalled()
@@ -68,7 +68,7 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
 
   it('needs no X-Space-Id: the space is server-injected and reaches the handler', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }) }))
-    const res = await fetch(`${base}/v1/bot/docs`, { headers: { authorization: 'Bearer ok' } })
+    const res = await fetch(`${base}/docs/v1/bot`, { headers: { authorization: 'Bearer ok' } })
     expect(res.status).toBe(200) // NOT 400 space_required
     expect(listForUser).toHaveBeenCalledTimes(1)
     expect(listForUser.mock.calls[0]![0]).toMatchObject({ uid: 'bot_1', spaceId: 's_bot' })
@@ -76,7 +76,7 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
 
   it('ignores a client-supplied X-Space-Id on the bot path (anti-spoof)', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }) }))
-    const res = await fetch(`${base}/v1/bot/docs`, {
+    const res = await fetch(`${base}/docs/v1/bot`, {
       headers: { authorization: 'Bearer ok', 'X-Space-Id': 's_spoofed' },
     })
     expect(res.status).toBe(200)

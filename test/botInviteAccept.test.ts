@@ -125,12 +125,12 @@ beforeEach(() => {
   upsertFromInviteTx.mockClear()
 })
 
-describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () => {
+describe('bot invite accept /docs/v1/bot/invites/:token/accept (docs #61)', () => {
   it('a bot token accepts and lands in doc_member as source=invite with the bot uid', async () => {
     getForUpdateTx.mockResolvedValue(validInvite())
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }) }))
 
-    const res = await fetch(`${base}/v1/bot/docs/invites/tok123/accept`, {
+    const res = await fetch(`${base}/docs/v1/bot/invites/tok123/accept`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok' },
     })
@@ -153,7 +153,7 @@ describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () =
     getForUpdateTx.mockResolvedValue(null) // no active invite row
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }) }))
 
-    const res = await fetch(`${base}/v1/bot/docs/invites/gone/accept`, {
+    const res = await fetch(`${base}/docs/v1/bot/invites/gone/accept`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok' },
     })
@@ -167,7 +167,7 @@ describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () =
     getForUpdateTx.mockResolvedValue(validInvite())
     setOctoIdentity(stub({ verifyBot: async () => null }))
 
-    const res = await fetch(`${base}/v1/bot/docs/invites/tok123/accept`, {
+    const res = await fetch(`${base}/docs/v1/bot/invites/tok123/accept`, {
       method: 'POST',
       headers: { authorization: 'Bearer bad' },
     })

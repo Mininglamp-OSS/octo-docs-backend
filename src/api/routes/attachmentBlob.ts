@@ -10,7 +10,7 @@
  *
  * Only signed requests are handled — a request is claimed only when it carries
  * the `X-Method` + `X-Signature` query params the driver mints, so the gateway
- * never shadows the metadata API (/api/v1/docs), the bot mount (/v1/bot/docs) or
+ * never shadows the metadata API (/api/v1/docs), the bot mount (/docs/v1/bot) or
  * /healthz, none of which carry those params. Everything else falls through.
  *
  * CORS (Access-Control-Allow-Origin on the PUT/GET responses, and the OPTIONS
