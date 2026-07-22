@@ -15,7 +15,7 @@
 import type { Document } from '@hocuspocus/server'
 import * as Y from 'yjs'
 import { getCollabServer } from './server.js'
-import { validateSheetCellBatch, validateSheetDimBatch, validateSheetDrawingBatch, validateSheetHyperLinkBatch, SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, type SheetCell, type StoredDrawing, type StoredHyperLink } from '../agent/sheetConversion.js'
+import { validateSheetCellBatch, validateSheetDimBatch, validateSheetDrawingBatch, validateSheetHyperLinkBatch, validateSheetMergeBatch, validateSheetListBatch, SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, type SheetCell, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../agent/sheetConversion.js'
 import { advanceEditVersion } from './liveDocWrite.js'
 import { stateVectorsEqual, BaseVersionStaleError } from './docBodyEdit.js'
 
@@ -85,6 +85,8 @@ export async function commitLiveSheetEdit(
   dims: Record<string, number | null> = {},
   drawings: Record<string, StoredDrawing | null> = {},
   hyperlinks: Record<string, StoredHyperLink | null> = {},
+  merges: Record<string, boolean | null> = {},
+  sheets: Record<string, StoredSheetMeta | null> = {},
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
   const server = getCollabServer()
   const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
@@ -98,7 +100,7 @@ export async function commitLiveSheetEdit(
       if (!stateVectorsEqual(clientBaseVersion, currentSV)) {
         throw new BaseVersionStaleError()
       }
-      // (2) The single, last content mutation. Validate ALL FOUR batches FIRST
+      // (2) The single, last content mutation. Validate ALL SIX batches FIRST
       //     (validate* return the split batches without mutating), THEN apply —
       //     so a bad dim/drawing can't leave cells half-applied. Yjs does NOT roll
       //     back a thrown transact callback and disconnect flushes onStore, so a
@@ -110,6 +112,8 @@ export async function commitLiveSheetEdit(
       const dimBatch = validateSheetDimBatch(dims)
       const drawingBatch = validateSheetDrawingBatch(drawings)
       const linkBatch = validateSheetHyperLinkBatch(hyperlinks)
+      const mergeBatch = validateSheetMergeBatch(merges)
+      const listBatch = validateSheetListBatch(sheets)
       const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
       for (const key of cellBatch.toDelete) ymap.delete(key)
       for (const [key, cell] of cellBatch.toSet) ymap.set(key, cell)
@@ -122,6 +126,12 @@ export async function commitLiveSheetEdit(
       const linkMap = doc.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
       for (const key of linkBatch.toDelete) linkMap.delete(key)
       for (const [key, link] of linkBatch.toSet) linkMap.set(key, link)
+      const mergeMap = doc.getMap<boolean>(SHEET_MERGES_FIELD)
+      for (const key of mergeBatch.toDelete) mergeMap.delete(key)
+      for (const [key, v] of mergeBatch.toSet) mergeMap.set(key, v)
+      const listMap = doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+      for (const key of listBatch.toDelete) listMap.delete(key)
+      for (const [key, meta] of listBatch.toSet) listMap.set(key, meta)
       // (3) Advance the edit-version counter so a delete-only batch also moves
       //     the state vector forward; the token is read AFTER this bump.
       advanceEditVersion(doc)

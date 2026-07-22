@@ -15,7 +15,7 @@ import * as Y from 'yjs'
 import { prosemirrorToYXmlFragment, yDocToProsemirrorJSON } from 'y-prosemirror'
 import { Node as PMNode } from 'prosemirror-model'
 import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../schema/index.js'
-import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, validateSheetCells, validateSheetCell, validateSheetDims, validateSheetDim, validateSheetDrawing, validateSheetHyperLink, validateSheetHyperLinks, type StoredDrawing, type StoredHyperLink } from '../agent/sheetConversion.js'
+import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, validateSheetCells, validateSheetCell, validateSheetDims, validateSheetDim, validateSheetDrawing, validateSheetHyperLink, validateSheetHyperLinks, validateSheetMerge, validateSheetMerges, validateSheetListEntry, validateSheetList, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../agent/sheetConversion.js'
 import { WB_SCHEMA_VERSION } from '../whiteboard/schema/index.js'
 import { getElementsMap, getFilesMap, readEntry, readElements, type YElements } from '../whiteboard/ydoc.js'
 export { SheetSnapshotInvalidError } from '../agent/sheetConversion.js'
@@ -55,7 +55,7 @@ export function currentSchemaVersionFor(kind: VersionContentKind): number {
 // SHEET_YMAP_FIELD is the single shared constant (defined in agent/sheetConversion.ts,
 // the cross-repo contract anchor). A text document never creates this map, so all
 // sheet-aware helpers below are strict no-ops for docs.
-export { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD }
+export { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD }
 
 /**
  * Read the spreadsheet cells out of a snapshot's binary state. Returns a plain
@@ -117,6 +117,37 @@ export function decodeSheetHyperLinksSnapshot(targetState: Uint8Array): Record<s
 }
 
 /**
+ * Read the merged cell ranges out of a snapshot's binary state. Returns a plain
+ * `{ "${logicalId}:sr:sc:er:ec": true }` object (empty for a text doc). Fail-closed
+ * like the other sheet decoders: every entry is validated (key shape + value===true)
+ * before it leaves this function; a violation throws SheetSnapshotInvalidError,
+ * which the route maps to 409. Part of the GET read surface.
+ */
+export function decodeSheetMergesSnapshot(targetState: Uint8Array): Record<string, unknown> {
+  const doc = new Y.Doc()
+  Y.applyUpdate(doc, targetState)
+  const merges = doc.getMap(SHEET_MERGES_FIELD)
+  const raw: Record<string, unknown> = Object.create(null)
+  for (const [key, val] of merges.entries()) raw[key] = val
+  return validateSheetMerges(raw)
+}
+
+/**
+ * Read the sheet-tab registry out of a snapshot's binary state. Returns a plain
+ * `{ logicalId: {name,order} }` object (empty for a text doc). Fail-closed like the
+ * other sheet decoders. Part of the GET read surface — this is how a bot LISTS the
+ * tabs of a multi-sheet doc (name + order + logicalId to address each with cells).
+ */
+export function decodeSheetListSnapshot(targetState: Uint8Array): Record<string, unknown> {
+  const doc = new Y.Doc()
+  Y.applyUpdate(doc, targetState)
+  const sheets = doc.getMap(SHEET_LIST_FIELD)
+  const raw: Record<string, unknown> = Object.create(null)
+  for (const [key, val] of sheets.entries()) raw[key] = val
+  return validateSheetList(raw)
+}
+
+/**
  * Reconcile a snapshot's 'sheet' cell map INTO a live doc's 'sheet' map, in place.
  * MUST be called inside a Yjs transaction. Makes the live cells equal the target's:
  * live-only cells are deleted, target cells are set/overwritten. Returns true if a
@@ -146,35 +177,47 @@ export function reconcileSheetMap(liveDoc: Y.Doc, targetState: Uint8Array): bool
   const liveDrawings = liveDoc.getMap(SHEET_DRAWINGS_FIELD)
   const targetHyper = targetYDoc.getMap(SHEET_HYPERLINKS_FIELD)
   const liveHyper = liveDoc.getMap(SHEET_HYPERLINKS_FIELD)
+  const targetMerges = targetYDoc.getMap(SHEET_MERGES_FIELD)
+  const liveMerges = liveDoc.getMap(SHEET_MERGES_FIELD)
+  const targetSheets = targetYDoc.getMap(SHEET_LIST_FIELD)
+  const liveSheets = liveDoc.getMap(SHEET_LIST_FIELD)
   if (
     targetSheet.size === 0 && liveSheet.size === 0 &&
     targetDims.size === 0 && liveDims.size === 0 &&
     targetDrawings.size === 0 && liveDrawings.size === 0 &&
-    targetHyper.size === 0 && liveHyper.size === 0
+    targetHyper.size === 0 && liveHyper.size === 0 &&
+    targetMerges.size === 0 && liveMerges.size === 0 &&
+    targetSheets.size === 0 && liveSheets.size === 0
   ) {
     return false // pure text doc — untouched
   }
-  // Validate the ENTIRE target of ALL FOUR maps first (fail-closed) so a bad
-  // cell / dimension / drawing / hyperlink aborts before we mutate anything — no
-  // partial, half-restored state.
-  const validatedCells: Record<string, import('../agent/sheetConversion.js').SheetCell> = {}
+  // Validate the ENTIRE target of ALL SIX maps first (fail-closed) so a bad
+  // cell / dimension / drawing / hyperlink / merge / tab aborts before we mutate
+  // anything — no partial, half-restored state. Every map is built with a null
+  // prototype so a reserved key (e.g. `__proto__`) is an ordinary own property,
+  // never a prototype-mutating trap, and membership below uses Object.hasOwn.
+  const validatedCells: Record<string, import('../agent/sheetConversion.js').SheetCell> = Object.create(null)
   for (const [key, val] of targetSheet.entries()) validatedCells[key] = validateSheetCell(key, val)
-  const validatedDims: Record<string, number> = {}
+  const validatedDims: Record<string, number> = Object.create(null)
   for (const [key, val] of targetDims.entries()) validatedDims[key] = validateSheetDim(key, val)
-  const validatedDrawings: Record<string, StoredDrawing> = {}
+  const validatedDrawings: Record<string, StoredDrawing> = Object.create(null)
   for (const [key, val] of targetDrawings.entries()) validatedDrawings[key] = validateSheetDrawing(key, val)
-  const validatedHyper: Record<string, StoredHyperLink> = {}
+  const validatedHyper: Record<string, StoredHyperLink> = Object.create(null)
   for (const [key, val] of targetHyper.entries()) validatedHyper[key] = validateSheetHyperLink(key, val)
+  const validatedMerges: Record<string, true> = Object.create(null)
+  for (const [key, val] of targetMerges.entries()) validatedMerges[key] = validateSheetMerge(key, val)
+  const validatedSheets: Record<string, StoredSheetMeta> = Object.create(null)
+  for (const [key, val] of targetSheets.entries()) validatedSheets[key] = validateSheetListEntry(key, val)
   // Cells: make live equal target (delete live-only, set/overwrite target).
   for (const key of [...liveSheet.keys()]) {
-    if (!(key in validatedCells)) liveSheet.delete(key)
+    if (!Object.hasOwn(validatedCells, key)) liveSheet.delete(key)
   }
   for (const [key, val] of Object.entries(validatedCells)) {
     liveSheet.set(key, val)
   }
   // Dims: same reconcile so a restored sheet's layout matches the target too.
   for (const key of [...liveDims.keys()]) {
-    if (!(key in validatedDims)) liveDims.delete(key)
+    if (!Object.hasOwn(validatedDims, key)) liveDims.delete(key)
   }
   for (const [key, val] of Object.entries(validatedDims)) {
     liveDims.set(key, val)
@@ -183,7 +226,7 @@ export function reconcileSheetMap(liveDoc: Y.Doc, targetState: Uint8Array): bool
   // (a live-only image is removed, a target image is set/overwritten). Without
   // this, restore would roll cells/dims back but leave the current images.
   for (const key of [...liveDrawings.keys()]) {
-    if (!(key in validatedDrawings)) liveDrawings.delete(key)
+    if (!Object.hasOwn(validatedDrawings, key)) liveDrawings.delete(key)
   }
   for (const [key, val] of Object.entries(validatedDrawings)) {
     liveDrawings.set(key, val)
@@ -191,10 +234,26 @@ export function reconcileSheetMap(liveDoc: Y.Doc, targetState: Uint8Array): bool
   // Hyperlinks: same reconcile so a restored sheet's cell links match the target
   // (a live-only link is removed, a target link is set/overwritten).
   for (const key of [...liveHyper.keys()]) {
-    if (!(key in validatedHyper)) liveHyper.delete(key)
+    if (!Object.hasOwn(validatedHyper, key)) liveHyper.delete(key)
   }
   for (const [key, val] of Object.entries(validatedHyper)) {
     liveHyper.set(key, val)
+  }
+  // Merges: same reconcile so a restored sheet's merged ranges match the target
+  // (a live-only merge is un-merged, a target merge is re-applied).
+  for (const key of [...liveMerges.keys()]) {
+    if (!Object.hasOwn(validatedMerges, key)) liveMerges.delete(key)
+  }
+  for (const [key, val] of Object.entries(validatedMerges)) {
+    liveMerges.set(key, val)
+  }
+  // Sheet tabs: same reconcile so a restored doc's tab set (names + order) matches
+  // the target (a live-only tab is dropped, a target tab is re-created).
+  for (const key of [...liveSheets.keys()]) {
+    if (!Object.hasOwn(validatedSheets, key)) liveSheets.delete(key)
+  }
+  for (const [key, val] of Object.entries(validatedSheets)) {
+    liveSheets.set(key, val)
   }
   return true
 }
