@@ -84,6 +84,9 @@ interface DocsCardBody {
   request_id: string
   kind: string
   title: string
+  /** The uid of the actor (requester / comment author). octo-server resolves the
+   *  display name from this uid server-side; actor_name is a client-side fallback. */
+  actor_uid: string
   actor_name: string
   excerpt: string
   updated_at: string
@@ -265,6 +268,7 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       request_id: p.requestId,
       kind: KIND_ACCESS_REQUESTED,
       title: p.title,
+      actor_uid: p.requesterUid,
       actor_name: actorName,
       excerpt: p.reason,
       updated_at: formatTimestamp(new Date()),
@@ -337,6 +341,7 @@ export async function notifyDocMentioned(p: MentionNotifyParams): Promise<number
       request_id: '', // commented kind: no approval CAS key
       kind: KIND_COMMENTED,
       title: p.title,
+      actor_uid: p.authorUid,
       actor_name: actorName,
       excerpt: toExcerpt(p.body),
       updated_at: formatTimestamp(new Date()),

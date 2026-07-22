@@ -94,6 +94,7 @@ describe('docsNotify integration (real HTTP round-trip)', () => {
         kind: 'access_requested',
         title: 'Q3 计划',
         actor_name: '小明',
+        actor_uid: 'u-req',
         excerpt: '需要编辑权限',
       })
       expect(c.body.docs_card.updated_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/)
