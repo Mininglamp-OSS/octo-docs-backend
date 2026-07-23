@@ -168,7 +168,7 @@ export async function importDocxHandler(req: Request, res: Response): Promise<vo
       // the slot indefinitely and starve later imports into 503s.
       const resp = await fetch(put.uploadUrl, {
         method: 'PUT',
-        body: bytes,
+        body: new Uint8Array(bytes),
         headers: { 'Content-Type': mime, ...(put.headers ?? {}) },
         signal: AbortSignal.timeout(config.docxImport.timeoutMs),
       })

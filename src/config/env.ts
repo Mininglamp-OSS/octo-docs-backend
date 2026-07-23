@@ -353,10 +353,10 @@ export const config = {
       ].join(','),
     ),
     // Comma-separated MIME denylist that takes precedence over the allowed list.
-    // SVG is an XML document that can carry inline <script>, so even though it
-    // matches the 'image/' prefix it is an XSS vector when served from our
-    // origin. The rest are HTML/script/executable types that must never be
-    // served inline from our origin even if declared as an allowed type (§3.5).
+    // SVG is accepted only by the dedicated sanitize-and-upload endpoint. It
+    // remains blocked from the generic direct-to-storage presign path because
+    // that path cannot inspect active XML before it is persisted. The rest are
+    // HTML/script/executable types that must never be served inline (§3.5).
     blockedMimes: str(
       'ATTACHMENT_BLOCKED_MIMES',
       [
