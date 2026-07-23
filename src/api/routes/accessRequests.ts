@@ -29,6 +29,7 @@ import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
+import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
 
 export const accessRequestsRouter: ExpressRouter = Router()
@@ -172,6 +173,19 @@ accessRequestsRouter.post(
       roleNum: roleToNumber(grantRole),
       grantedBy: req.uid!,
     })
+    // Drive every approver's sibling card to terminal (task
+    // docs-access-decision-card-sync). Best-effort, fired after the decision
+    // commits. This is the REST path (no card-callback finalizer), so the decider
+    // (req.uid) is an approver holding a live card and must be terminalized too —
+    // deciderCardHandledExternally omitted (false).
+    void syncDecisionCards({
+      requestId: req.params.requestId!,
+      spaceId: guard.meta.space_id,
+      docId: guard.meta.doc_id,
+      title: guard.meta.title,
+      deciderUid: req.uid!,
+      denied: false,
+    }).catch(() => {})
     res.status(200).json({ ok: true, role: result.finalRole })
   },
 )
@@ -207,6 +221,20 @@ accessRequestsRouter.post(
       res.status(409).json({ error: 'not_pending' })
       return
     }
+    // Drive every approver's sibling card to terminal (task
+    // docs-access-decision-card-sync). Best-effort. This is the REST path (no
+    // card-callback finalizer), so the decider (req.uid) is an approver holding a
+    // live card and must be terminalized too — deciderCardHandledExternally
+    // omitted (false). The REST deny carries no reviewer reason, so the terminal
+    // card omits it (same as a reasonless card deny).
+    void syncDecisionCards({
+      requestId: req.params.requestId!,
+      spaceId: guard.meta.space_id,
+      docId: guard.meta.doc_id,
+      title: guard.meta.title,
+      deciderUid: req.uid!,
+      denied: true,
+    }).catch(() => {})
     res.status(200).json({ ok: true })
   },
 )

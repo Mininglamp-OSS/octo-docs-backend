@@ -28,6 +28,7 @@ import {
 import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
+import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 
 /**
  * Exact callback path. octo-server signs the canonical over the PATH of the
@@ -260,6 +261,25 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
       grantedBy: req.operator_uid,
     })
   }
+
+  // Sibling-card sync (task docs-access-decision-card-sync): drive every OTHER
+  // approver's card to terminal. octo-server's finalizer terminalizes the clicked
+  // card; this covers the rest. Gated on transitioned===true so it fires exactly
+  // once (the sole decider execution) and never on a redelivery/replay. On this
+  // card-callback path the finalizer already handled the decider's clicked card,
+  // so it is skipped here (deciderCardHandledExternally: true). Fire-and-forget:
+  // never blocks or fails the callback response, and the 409/receipt guards stay
+  // the authoritative protection.
+  void syncDecisionCards({
+    requestId,
+    spaceId: meta.space_id,
+    docId,
+    title: meta.title,
+    deciderUid: req.operator_uid,
+    deciderCardHandledExternally: true,
+    denied: req.decision === 'deny',
+    denyReason: decisionNote(req),
+  }).catch(() => {})
 
   return {
     disposition: 'applied',
