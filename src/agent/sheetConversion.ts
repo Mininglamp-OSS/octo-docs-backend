@@ -50,6 +50,24 @@ export const SHEET_DRAWINGS_FIELD = 'sheetDrawings'
 export const SHEET_HYPERLINKS_FIELD = 'sheetHyperLinks'
 
 /**
+ * Y.Map field for merged cell ranges, keyed `${logicalId}:sr:sc:er:ec`
+ * (startRow:startCol:endRow:endCol, all 0-based; matches octo-web binding.ts
+ * SHEET_MERGES_FIELD). Value is boolean `true` (the range is merged); deleting the
+ * key un-merges it. Two-way synced + persisted like dims, so version-restore
+ * reconciles it and it rides the GET read surface.
+ */
+export const SHEET_MERGES_FIELD = 'sheetMerges'
+
+/**
+ * Y.Map field for the sheet-tab registry, keyed by logicalId, value
+ * `{ name, order }` (matches octo-web binding.ts SHEET_LIST_FIELD / SheetMeta).
+ * This is what makes a sheet TAB exist in the UI: writing cells to a logicalId
+ * NOT registered here leaves orphan cells the frontend won't render. The first
+ * tab's logicalId is 'default'. Two-way synced + persisted; on the GET read surface.
+ */
+export const SHEET_LIST_FIELD = 'sheetList'
+
+/**
  * Cell shape synced in V1: value, optional formula, optional resolved style, and
  * the two rich-cell fields the live editor also syncs.
  *
@@ -213,8 +231,13 @@ export function validateSheetCells(cells: Record<string, unknown>): Record<strin
   return out
 }
 
-/** Canonical dims-key shape: `c<idx>` (col width) or `r<idx>` (row height). */
-const DIMS_KEY_RE = /^[cr][0-9]{1,7}$/
+/** Canonical dims-key shape: `${logicalId}:c<idx>` / `${logicalId}:r<idx>` (V2
+ * multi-sheet) OR bare `c<idx>` / `r<idx>` (V1 single-sheet, still accepted).
+ * logicalId carries no colon. MUST match octo-web binding.ts: V1 wrote dims keys
+ * UNPREFIXED; V2 prefixes them with the logical sheet id so per-sheet column widths
+ * / row heights don't collide. The optional prefix lets a bot address a specific
+ * sheet's dims (e.g. `default:c0`, `sheet-2:r3`). */
+const DIMS_KEY_RE = /^([^:]{1,64}:)?[cr][0-9]{1,7}$/
 /** Max dimension (px) — guards against a hostile/absurd width or height. */
 const MAX_DIM_PX = 100000
 
@@ -560,6 +583,210 @@ export function validateSheetHyperLinks(
 }
 
 /**
+ * A merged-cell-range batch split into un-merges (deletions) and merges (upserts).
+ * The value is always boolean `true` (a range is merged); un-merge is a key
+ * deletion. Mirrors the frontend's `mergeMap.set(key, true)` / `mergeMap.delete(key)`.
+ */
+export interface SheetMergeBatch {
+  toDelete: string[]
+  toSet: Array<[string, true]>
+}
+
+/** Canonical merge-key shape: `${logicalId}:sr:sc:er:ec` (logicalId + four 0-based
+ * ints startRow:startCol:endRow:endCol). logicalId carries no colon. MUST match
+ * octo-web binding.ts SHEET_MERGES_FIELD keys. */
+const MERGES_KEY_RE = /^[^:]{1,64}:[0-9]{1,7}:[0-9]{1,7}:[0-9]{1,7}:[0-9]{1,7}$/
+
+/**
+ * Validate a single raw merge key + value. Fail-closed. Key must be the canonical
+ * `${logicalId}:sr:sc:er:ec` shape; value must be boolean `true` — the only value
+ * the frontend ever writes (un-merge is a key deletion, handled in the batch).
+ */
+export function validateSheetMerge(key: unknown, value: unknown): true {
+  if (typeof key !== 'string' || !MERGES_KEY_RE.test(key)) {
+    throw new SheetSnapshotInvalidError(
+      `merge key does not match ${'${logicalId}:sr:sc:er:ec'}: ${String(key).slice(0, 64)}`,
+    )
+  }
+  if (value !== true) {
+    throw new SheetSnapshotInvalidError(`merge ${key}: value must be boolean true (un-merge = delete the key)`)
+  }
+  // logicalId carries no colon (MERGES_KEY_RE), so the last four segments are
+  // sr:sc:er:ec. A bot can now write these keys directly (no frontend in the
+  // loop), so guard coordinate ordering here — a start-after-end range like
+  // `default:10:8:2:1` would otherwise persist as an internally-inconsistent
+  // merge. Cheap defense-in-depth; the frontend only ever emits ordered ranges.
+  const parts = key.split(':')
+  const sr = Number(parts.at(-4))
+  const sc = Number(parts.at(-3))
+  const er = Number(parts.at(-2))
+  const ec = Number(parts.at(-1))
+  if (sr > er || sc > ec) {
+    throw new SheetSnapshotInvalidError(
+      `merge ${key}: inverted range (startRow<=endRow and startCol<=endCol required)`,
+    )
+  }
+  return true
+}
+
+/**
+ * Validate a whole `{ key: true|null }` merges batch WITHOUT mutating, fail-closed.
+ * null = un-merge (delete; key-shape-checked so a malformed key can't be smuggled
+ * in); true = merge. The merges counterpart of validateSheetDimBatch.
+ */
+export function validateSheetMergeBatch(
+  merges: Record<string, boolean | null>,
+): SheetMergeBatch {
+  const toDelete: string[] = []
+  const toSet: Array<[string, true]> = []
+  for (const [key, val] of Object.entries(merges)) {
+    if (val == null) {
+      if (typeof key === 'string' && MERGES_KEY_RE.test(key)) toDelete.push(key)
+      else throw new SheetSnapshotInvalidError(`delete: invalid merge key ${String(key).slice(0, 64)}`)
+    } else {
+      toSet.push([key, validateSheetMerge(key, val)])
+    }
+  }
+  return { toDelete, toSet }
+}
+
+/**
+ * Pure mutation applied INSIDE a Yjs transaction. A null value un-merges (deletes
+ * the key); true merges. Validate-all-then-apply (mirrors the other appliers).
+ */
+export function applySheetMergesToYMap(
+  ymap: Y.Map<boolean>,
+  merges: Record<string, boolean | null>,
+): void {
+  const { toDelete, toSet } = validateSheetMergeBatch(merges)
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, v] of toSet) ymap.set(key, v)
+}
+
+/** Read: Y.Doc state -> plain `{ key: true }` merges map (part of the GET surface). */
+export function yDocStateToSheetMerges(state: Uint8Array): Record<string, boolean> {
+  const ydoc = new Y.Doc()
+  Y.applyUpdate(ydoc, state)
+  const ymap = ydoc.getMap<boolean>(SHEET_MERGES_FIELD)
+  const out: Record<string, boolean> = Object.create(null)
+  for (const [key, val] of ymap.entries()) out[key] = val
+  return out
+}
+
+/** Validate a whole `{ key: true }` merges map (read/restore path). */
+export function validateSheetMerges(merges: Record<string, unknown>): Record<string, true> {
+  const out: Record<string, true> = Object.create(null)
+  for (const [key, val] of Object.entries(merges)) out[key] = validateSheetMerge(key, val)
+  return out
+}
+
+/** A sheet-tab registry entry (Univer SheetMeta): the tab's display name + order.
+ * Extra fields are kept verbatim (opaque), like a drawing. */
+export interface StoredSheetMeta {
+  name: string
+  order: number
+  [k: string]: unknown
+}
+
+export interface SheetListBatch {
+  toDelete: string[]
+  toSet: Array<[string, StoredSheetMeta]>
+}
+
+/** Canonical sheetList key: a logicalId carrying no ':' or '!' (so it stays
+ * disjoint from cell / dims / merge keys) and no control chars / DEL (it is
+ * concatenated into cell keys `${logicalId}!row:col`, so keep it a printable id).
+ * The first tab's logicalId is 'default'. */
+const LIST_KEY_RE = /^[^\p{Cc}:!]{1,64}$/u
+
+/** logicalIds that collide with `Object.prototype` slots. sheetList is the first
+ * sheet keyspace that accepts a bare identifier (cell/dims/merge/hyperlink keys all
+ * carry ':' or '!' so they structurally cannot be these), so it is the only surface
+ * where a key like `__proto__` could ever poison a plain-object read map. We
+ * defend in depth — the decode/validate maps are built with `Object.create(null)`
+ * and reconcile uses `Object.hasOwn` — but we ALSO reject these outright so a bot
+ * gets a clean 422 instead of a silently-dropped tab. */
+const RESERVED_LOGICAL_IDS = new Set(['__proto__', 'constructor', 'prototype'])
+
+/**
+ * Validate a single raw sheetList entry. Fail-closed. Key is a logicalId; value is
+ * `{ name: non-empty string, order: finite number }` (extra fields kept verbatim).
+ * This is the tab registry — a bot ADDS a tab by setting a new logicalId here, then
+ * writes that tab's cells with keys `${logicalId}!row:col`.
+ */
+export function validateSheetListEntry(key: unknown, value: unknown): StoredSheetMeta {
+  if (typeof key !== 'string' || !LIST_KEY_RE.test(key)) {
+    throw new SheetSnapshotInvalidError(
+      `sheetList key must be a logicalId (no ':', '!' or control chars): ${String(key).slice(0, 64)}`,
+    )
+  }
+  if (RESERVED_LOGICAL_IDS.has(key)) {
+    throw new SheetSnapshotInvalidError(
+      `sheetList key is a reserved logicalId and not allowed: ${key}`,
+    )
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new SheetSnapshotInvalidError(`sheetList ${key}: value is not a plain object`)
+  }
+  const rec = value as Record<string, unknown>
+  if (typeof rec.name !== 'string' || rec.name.length === 0) {
+    throw new SheetSnapshotInvalidError(`sheetList ${key}: name must be a non-empty string`)
+  }
+  if (typeof rec.order !== 'number' || !Number.isFinite(rec.order)) {
+    throw new SheetSnapshotInvalidError(`sheetList ${key}: order must be a finite number`)
+  }
+  return rec as StoredSheetMeta
+}
+
+/**
+ * Validate a whole `{ logicalId: meta|null }` sheetList batch WITHOUT mutating,
+ * fail-closed. null = delete a tab (key-shape-checked); else validated via
+ * validateSheetListEntry. The sheetList counterpart of validateSheetDrawingBatch.
+ */
+export function validateSheetListBatch(
+  sheets: Record<string, StoredSheetMeta | null>,
+): SheetListBatch {
+  const toDelete: string[] = []
+  const toSet: Array<[string, StoredSheetMeta]> = []
+  for (const [key, val] of Object.entries(sheets)) {
+    if (val == null) {
+      if (typeof key === 'string' && LIST_KEY_RE.test(key) && !RESERVED_LOGICAL_IDS.has(key)) toDelete.push(key)
+      else throw new SheetSnapshotInvalidError(`delete: invalid sheetList key ${String(key).slice(0, 64)}`)
+    } else {
+      toSet.push([key, validateSheetListEntry(key, val)])
+    }
+  }
+  return { toDelete, toSet }
+}
+
+/** Pure mutation applied INSIDE a Yjs transaction. Validate-all-then-apply. */
+export function applySheetListToYMap(
+  ymap: Y.Map<StoredSheetMeta>,
+  sheets: Record<string, StoredSheetMeta | null>,
+): void {
+  const { toDelete, toSet } = validateSheetListBatch(sheets)
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, meta] of toSet) ymap.set(key, meta)
+}
+
+/** Read: Y.Doc state -> plain `{ logicalId: {name,order} }` map (GET read surface). */
+export function yDocStateToSheetList(state: Uint8Array): Record<string, StoredSheetMeta> {
+  const ydoc = new Y.Doc()
+  Y.applyUpdate(ydoc, state)
+  const ymap = ydoc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+  const out: Record<string, StoredSheetMeta> = Object.create(null)
+  for (const [key, meta] of ymap.entries()) out[key] = meta
+  return out
+}
+
+/** Validate a whole sheetList map (read/restore path). */
+export function validateSheetList(sheets: Record<string, unknown>): Record<string, StoredSheetMeta> {
+  const out: Record<string, StoredSheetMeta> = Object.create(null)
+  for (const [key, val] of Object.entries(sheets)) out[key] = validateSheetListEntry(key, val)
+  return out
+}
+
+/**
  * Measure the sheet AFTER applying an edit batch, the two ways its downstream
  * caps are enforced, so the write path can reject an oversized result in its
  * no-lock pre-flight — BEFORE commitLiveSheetEdit applies the cells to the shared
@@ -586,6 +813,8 @@ export function measureSheetAfterEdit(
   dims: Record<string, number | null> = {},
   drawings: Record<string, StoredDrawing | null> = {},
   hyperlinks: Record<string, StoredHyperLink | null> = {},
+  merges: Record<string, boolean | null> = {},
+  sheets: Record<string, StoredSheetMeta | null> = {},
 ): { docBytes: number; payloadBytes: number } {
   const scratch = new Y.Doc()
   Y.applyUpdate(scratch, preEditState)
@@ -593,6 +822,8 @@ export function measureSheetAfterEdit(
   const dimsMap = scratch.getMap<number>(SHEET_DIMS_FIELD)
   const drawingMap = scratch.getMap<StoredDrawing>(SHEET_DRAWINGS_FIELD)
   const linkMap = scratch.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
+  const mergeMap = scratch.getMap<boolean>(SHEET_MERGES_FIELD)
+  const listMap = scratch.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
   // Apply the batch exactly as the live commit will (validate-all-then-apply), so
   // the measured post-edit doc matches what commitLiveSheetEdit would persist.
   scratch.transact(() => {
@@ -600,6 +831,8 @@ export function measureSheetAfterEdit(
     applySheetDimsToYMap(dimsMap, dims)
     applySheetDrawingsToYMap(drawingMap, drawings)
     applySheetHyperLinksToYMap(linkMap, hyperlinks)
+    applySheetMergesToYMap(mergeMap, merges)
+    applySheetListToYMap(listMap, sheets)
   })
   const docBytes = Y.encodeStateAsUpdate(scratch).length
   // Decode + validate the READ maps exactly as GET does (decodeSheetSnapshot /
@@ -613,9 +846,15 @@ export function measureSheetAfterEdit(
   for (const [key, val] of scratch.getMap(SHEET_DIMS_FIELD).entries()) rawDims[key] = val
   const rawLinks: Record<string, unknown> = {}
   for (const [key, val] of scratch.getMap(SHEET_HYPERLINKS_FIELD).entries()) rawLinks[key] = val
+  const rawMerges: Record<string, unknown> = {}
+  for (const [key, val] of scratch.getMap(SHEET_MERGES_FIELD).entries()) rawMerges[key] = val
+  const rawSheets: Record<string, unknown> = {}
+  for (const [key, val] of scratch.getMap(SHEET_LIST_FIELD).entries()) rawSheets[key] = val
   const sheetCells = validateSheetCells(rawCells)
   const sheetDims = validateSheetDims(rawDims)
   const sheetHyperLinks = validateSheetHyperLinks(rawLinks)
-  const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks }))
+  const sheetMerges = validateSheetMerges(rawMerges)
+  const sheetList = validateSheetList(rawSheets)
+  const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks, sheetMerges, sheetList }))
   return { docBytes, payloadBytes }
 }

@@ -26,22 +26,31 @@ import {
   validateSheetDims,
   validateSheetDrawing,
   validateSheetHyperLink,
+  validateSheetMerge,
+  validateSheetListEntry,
   SHEET_HYPERLINKS_FIELD,
+  SHEET_MERGES_FIELD,
+  SHEET_LIST_FIELD,
   SheetSnapshotInvalidError,
   type SheetCell,
   type StoredDrawing,
   type StoredHyperLink,
+  type StoredSheetMeta,
 } from '../src/agent/sheetConversion.js'
 import {
   decodeSheetSnapshot,
   decodeSheetDimsSnapshot,
   decodeSheetHyperLinksSnapshot,
+  decodeSheetMergesSnapshot,
+  decodeSheetListSnapshot,
   reconcileSheetMap,
   decodeTargetSnapshot,
   SHEET_YMAP_FIELD as RESTORE_SHEET_FIELD,
   SHEET_DIMS_FIELD as RESTORE_DIMS_FIELD,
   SHEET_DRAWINGS_FIELD as RESTORE_DRAWINGS_FIELD,
   SHEET_HYPERLINKS_FIELD as RESTORE_HYPERLINKS_FIELD,
+  SHEET_MERGES_FIELD as RESTORE_MERGES_FIELD,
+  SHEET_LIST_FIELD as RESTORE_LIST_FIELD,
 } from '../src/collab/versionRestore.js'
 import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
 import { advanceEditVersion } from '../src/collab/liveDocWrite.js'
@@ -702,6 +711,218 @@ describe('versionRestore — sheetHyperLinks restore + decode', () => {
     })
     expect(touched).toBe(true)
     expect(live.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD).has('default!lnk1')).toBe(true)
+  })
+})
+
+/** Build a Y.Doc state carrying sheetMerges (+ optional cells). */
+function mergesState(
+  merges: Record<string, true>,
+  cells: Record<string, SheetCell> = {},
+): Uint8Array {
+  const doc = new Y.Doc()
+  doc.transact(() => {
+    const cellMap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    for (const [k, v] of Object.entries(cells)) cellMap.set(k, v)
+    const mergeMap = doc.getMap<boolean>(SHEET_MERGES_FIELD)
+    for (const [k, v] of Object.entries(merges)) mergeMap.set(k, v)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+describe('sheetConversion — validateSheetMerge (fail-closed key + value contract)', () => {
+  it('accepts a well-formed merge key `${logicalId}:sr:sc:er:ec` with value true', () => {
+    expect(validateSheetMerge('default:1:2:3:4', true)).toBe(true)
+    expect(validateSheetMerge('sheet-2:0:0:1:1', true)).toBe(true)
+  })
+
+  it('rejects a bad key shape (missing an int segment, or `!` instead of `:`)', () => {
+    expect(() => validateSheetMerge('default:1:2:3', true)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetMerge('default!1:2:3:4', true)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetMerge('1:2:3:4', true)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects any value other than boolean true (un-merge is a key deletion, not false)', () => {
+    expect(() => validateSheetMerge('default:1:2:3:4', false as never)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetMerge('default:1:2:3:4', 1 as never)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetMerge('default:1:2:3:4', null as never)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects an inverted range (start after end) — a bot can write keys directly, no frontend guard', () => {
+    // sr>er, sc>ec (both inverted, yujiawei's example `default:10:8:2:1`)
+    expect(() => validateSheetMerge('default:10:8:2:1', true)).toThrow(SheetSnapshotInvalidError)
+    // only rows inverted
+    expect(() => validateSheetMerge('default:5:0:2:0', true)).toThrow(SheetSnapshotInvalidError)
+    // only cols inverted
+    expect(() => validateSheetMerge('default:0:5:0:2', true)).toThrow(SheetSnapshotInvalidError)
+    // well-ordered and degenerate single-cell ranges still pass
+    expect(validateSheetMerge('default:0:0:1:1', true)).toBe(true)
+    expect(validateSheetMerge('default:1:1:1:1', true)).toBe(true)
+  })
+})
+
+describe('versionRestore — sheetMerges restore + decode', () => {
+  it('SHEET_MERGES_FIELD is the single shared constant across modules', () => {
+    expect(SHEET_MERGES_FIELD).toBe('sheetMerges')
+    expect(RESTORE_MERGES_FIELD).toBe(SHEET_MERGES_FIELD)
+  })
+
+  it('decodeSheetMergesSnapshot extracts + validates the merges', () => {
+    const state = mergesState({ 'default:0:0:1:1': true })
+    expect(decodeSheetMergesSnapshot(state)).toEqual({ 'default:0:0:1:1': true })
+  })
+
+  it('reconcileSheetMap restores merges alongside cells (un-merges a live-only range)', () => {
+    const k = sheetCellKey('default', 0, 0)
+    const target = mergesState({ 'default:0:0:1:1': true }, { [k]: { v: 'old' } })
+    const live = liveDocFrom(
+      mergesState({ 'default:0:0:1:1': true, 'default:5:5:6:6': true }, { [k]: { v: 'new' } }),
+    )
+    live.transact(() => reconcileSheetMap(live, target))
+    const merges = live.getMap<boolean>(SHEET_MERGES_FIELD)
+    expect(merges.has('default:5:5:6:6')).toBe(false) // live-only merge un-merged
+    expect(merges.get('default:0:0:1:1')).toBe(true) // target merge kept
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(k)).toEqual({ v: 'old' })
+  })
+
+  it('reconcileSheetMap fires (returns true) when only merges differ, cells+dims empty', () => {
+    const target = mergesState({ 'default:0:0:1:1': true })
+    const live = liveDocFrom()
+    let touched = false
+    live.transact(() => {
+      touched = reconcileSheetMap(live, target)
+    })
+    expect(touched).toBe(true)
+    expect(live.getMap<boolean>(SHEET_MERGES_FIELD).has('default:0:0:1:1')).toBe(true)
+  })
+})
+
+/** Build a Y.Doc state carrying sheetList tabs (+ optional cells). */
+function sheetListState(
+  sheets: Record<string, { name: string; order: number }>,
+  cells: Record<string, SheetCell> = {},
+): Uint8Array {
+  const doc = new Y.Doc()
+  doc.transact(() => {
+    const cellMap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
+    for (const [k, v] of Object.entries(cells)) cellMap.set(k, v)
+    const listMap = doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+    for (const [k, v] of Object.entries(sheets)) listMap.set(k, v)
+  })
+  return Y.encodeStateAsUpdate(doc)
+}
+
+describe('sheetConversion — validateSheetListEntry (fail-closed logicalId + {name,order})', () => {
+  it('accepts a well-formed tab entry', () => {
+    expect(validateSheetListEntry('default', { name: 'Sheet1', order: 0 })).toEqual({ name: 'Sheet1', order: 0 })
+    expect(validateSheetListEntry('sheet-2', { name: '数据', order: 1 })).toBeTruthy()
+  })
+
+  it('rejects a logicalId containing ":" or "!" (would collide with cell/dims/merge keys)', () => {
+    expect(() => validateSheetListEntry('a:b', { name: 'x', order: 0 })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetListEntry('a!b', { name: 'x', order: 0 })).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects missing/empty name or non-finite order', () => {
+    expect(() => validateSheetListEntry('s', { order: 0 } as never)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetListEntry('s', { name: '', order: 0 })).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetListEntry('s', { name: 'x', order: Infinity } as never)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetListEntry('s', { name: 'x' } as never)).toThrow(SheetSnapshotInvalidError)
+  })
+})
+
+describe('versionRestore — sheetList restore + decode', () => {
+  it('SHEET_LIST_FIELD is the single shared constant across modules', () => {
+    expect(SHEET_LIST_FIELD).toBe('sheetList')
+    expect(RESTORE_LIST_FIELD).toBe(SHEET_LIST_FIELD)
+  })
+
+  it('decodeSheetListSnapshot extracts + validates the tabs', () => {
+    const state = sheetListState({ default: { name: 'Sheet1', order: 0 }, s2: { name: 'Data', order: 1 } })
+    expect(decodeSheetListSnapshot(state)).toEqual({ default: { name: 'Sheet1', order: 0 }, s2: { name: 'Data', order: 1 } })
+  })
+
+  it('reconcileSheetMap restores tabs (drops a live-only tab, rolls back a renamed one)', () => {
+    const target = sheetListState({ default: { name: 'Sheet1', order: 0 } })
+    const live = liveDocFrom(
+      sheetListState({ default: { name: 'RENAMED', order: 0 }, s2: { name: 'Extra', order: 1 } }),
+    )
+    live.transact(() => reconcileSheetMap(live, target))
+    const list = live.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+    expect(list.has('s2')).toBe(false) // live-only tab dropped
+    expect((list.get('default') as StoredSheetMeta).name).toBe('Sheet1') // rename rolled back
+  })
+
+  it('reconcileSheetMap fires (returns true) when only sheetList differs, cells+dims empty', () => {
+    const target = sheetListState({ default: { name: 'Sheet1', order: 0 } })
+    const live = liveDocFrom()
+    let touched = false
+    live.transact(() => {
+      touched = reconcileSheetMap(live, target)
+    })
+    expect(touched).toBe(true)
+    expect(live.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).has('default')).toBe(true)
+  })
+})
+
+describe('sheetList — reserved logicalId hazard (prototype-pollution / write-but-not-readable)', () => {
+  // A tab keyed `__proto__`/`constructor`/`prototype` used to be accepted by
+  // LIST_KEY_RE, then vanish on read (plain-object `out["__proto__"]=meta` mutates
+  // the prototype instead of adding an own key) and defeat `key in obj` reconcile
+  // membership. Fixed three ways: (1) validate rejects reserved ids, (2) read maps
+  // use Object.create(null), (3) reconcile uses Object.hasOwn. Lock all three in.
+  it('validateSheetListEntry rejects reserved object-prototype logicalIds', () => {
+    for (const id of ['__proto__', 'constructor', 'prototype']) {
+      expect(() => validateSheetListEntry(id, { name: 'Evil', order: 0 })).toThrow(
+        SheetSnapshotInvalidError,
+      )
+    }
+  })
+
+  it('validateSheetListEntry rejects control chars / DEL in a logicalId', () => {
+    expect(() => validateSheetListEntry('a\nb', { name: 'x', order: 0 })).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    expect(() => validateSheetListEntry('a\u0000b', { name: 'x', order: 0 })).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    expect(() => validateSheetListEntry('a\u007fb', { name: 'x', order: 0 })).toThrow(
+      SheetSnapshotInvalidError,
+    )
+  })
+
+  it('decodeSheetListSnapshot returns a null-prototype map (a raw __proto__ tab stays an OWN key, not a silent drop)', () => {
+    // Simulate a doc that somehow already carries a __proto__ tab in the Y.Map
+    // (e.g. written before this guard existed). The decoder must throw fail-closed
+    // rather than silently drop it — and the intermediate map must be null-proto so
+    // the key is enumerable, not a prototype trap.
+    const doc = new Y.Doc()
+    doc.transact(() => {
+      const listMap = doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+      listMap.set('default', { name: 'Sheet1', order: 0 })
+      listMap.set('__proto__', { name: 'Evil', order: 1 })
+    })
+    const state = Y.encodeStateAsUpdate(doc)
+    // validation rejects the reserved id -> fail-closed (no silent drop, no 200 with missing tab)
+    expect(() => decodeSheetListSnapshot(state)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('reconcileSheetMap converges for a live-only tab named "constructor"/"toString" (Object.hasOwn, not `in`)', () => {
+    // Target has only default; live carries ghost tabs whose names collide with
+    // Object.prototype slots. With `key in {}` these would be TRUE and never
+    // deleted; Object.hasOwn correctly drops them so restore converges.
+    const target = sheetListState({ default: { name: 'Sheet1', order: 0 } })
+    const live = new Y.Doc()
+    live.transact(() => {
+      const listMap = live.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+      listMap.set('default', { name: 'Sheet1', order: 0 })
+      // set ghost tabs directly on the Y.Map (bypassing validation to simulate
+      // legacy state) whose ids are Object.prototype member names
+      listMap.set('toString', { name: 'Ghost1', order: 1 })
+    })
+    live.transact(() => reconcileSheetMap(live, target))
+    const list = live.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+    expect(list.has('toString')).toBe(false) // live-only ghost tab dropped -> converged
+    expect(list.has('default')).toBe(true)
   })
 })
 
