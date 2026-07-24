@@ -29,6 +29,7 @@ import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRep
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
+import { buildDecisionDisplay } from '../services/decisionDisplay.js'
 
 /**
  * Exact callback path. octo-server signs the canonical over the PATH of the
@@ -241,7 +242,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
       disposition: 'applied',
       state: req.decision === 'approve' ? 'approved' : 'denied',
       requester_uid: request.uid,
-      display: { title: meta.title || '文档访问申请' },
+      display: await buildDecisionDisplay(meta.title, req.operator_uid, req.acted_at),
     }
   }
 
@@ -285,7 +286,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     disposition: 'applied',
     state: req.decision === 'approve' ? 'approved' : 'denied',
     requester_uid: request.uid,
-    display: { title: meta.title || '文档访问申请' },
+    display: await buildDecisionDisplay(meta.title, req.operator_uid, req.acted_at),
   }
 }
 
