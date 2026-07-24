@@ -28,7 +28,7 @@
     "@hocuspocus/extension-redis": "^4.3.0",
     "@hocuspocus/server": "^4.1.2",
     "@napi-rs/canvas": "^1.0.2",
-    "@tiptap/extension-emoji": "^3.22.2",
+    "@tiptap/extension-emoji": "^3.28.0",
     "@types/jsdom": "^28.0.3",
     "docx": "^9.7.1",
     "dompurify": "^3.4.12",
@@ -44,7 +44,7 @@
     "markdown-it": "^14.3.0",
     "mathjax-full": "^3.2.2",
     "mathml-to-latex": "^1.8.0",
-    "mysql2": "^3.11.3",
+    "mysql2": "^3.23.1",
     "prosemirror-model": "^1.25.9",
     "prosemirror-state": "^1.4.3",
     "prosemirror-transform": "^1.10.2",
@@ -68,7 +68,7 @@
     "globals": "^17.7.0",
     "tsx": "^4.19.1",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.62.1",
+    "typescript-eslint": "^8.65.0",
     "vitest": "^2.1.2"
   },
   "overrides": {
