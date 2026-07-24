@@ -29,6 +29,7 @@ import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRep
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
+import { getOctoIdentity } from '../../auth/octoIdentity.js'
 
 /**
  * Exact callback path. octo-server signs the canonical over the PATH of the
@@ -159,6 +160,44 @@ function decisionNote(req: DecisionRequest): string {
   return typeof raw === 'string' ? raw.trim().slice(0, MAX_DECISION_NOTE_CHARS) : ''
 }
 
+// Format acted_at to "YYYY-MM-DD HH:mm" (local), matching the docs-notify card
+// timestamp format. acted_at may arrive in seconds or milliseconds depending on
+// the client clock source, so normalize by magnitude (a 2020s epoch is ~1.7e9 s
+// / ~1.7e12 ms). Empty on a missing / non-positive value.
+export function formatDecidedAt(actedAt: number): string {
+  if (!Number.isFinite(actedAt) || actedAt <= 0) return ''
+  const ms = actedAt < 1e12 ? actedAt * 1000 : actedAt
+  const d = new Date(ms)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+// buildDecisionDisplay assembles the octo-server card `display` map for a decided
+// request. octo-server's registry result card reads display.operator_name and
+// display.decided_at; when they are absent it falls back to the operator UID
+// (rendered as an opaque hex) and a blank time. Resolving the operator's display
+// name here (best-effort, same server-side path as the applicant name) and
+// formatting the decision time keeps the terminal card human-readable. getUser
+// never throws; on any miss we simply omit the field and octo-server degrades to
+// its existing fallback — no regression.
+export async function buildDecisionDisplay(
+  title: string,
+  operatorUid: string,
+  actedAt: number,
+): Promise<Record<string, string>> {
+  const display: Record<string, string> = { title: title || '文档访问申请' }
+  try {
+    const operator = await getOctoIdentity().getUser(operatorUid)
+    const name = operator?.name?.trim()
+    if (name) display.operator_name = name
+  } catch {
+    // best-effort; leave operator_name unset so octo-server keeps its fallback
+  }
+  const decidedAt = formatDecidedAt(actedAt)
+  if (decidedAt) display.decided_at = decidedAt
+  return display
+}
+
 /** Compute the authoritative decision AND apply the grant side-effect exactly once.
  *
  * The grant is gated strictly on `transitioned === true` — i.e. THIS execution is the
@@ -241,7 +280,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
       disposition: 'applied',
       state: req.decision === 'approve' ? 'approved' : 'denied',
       requester_uid: request.uid,
-      display: { title: meta.title || '文档访问申请' },
+      display: await buildDecisionDisplay(meta.title, req.operator_uid, req.acted_at),
     }
   }
 
@@ -285,7 +324,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     disposition: 'applied',
     state: req.decision === 'approve' ? 'approved' : 'denied',
     requester_uid: request.uid,
-    display: { title: meta.title || '文档访问申请' },
+    display: await buildDecisionDisplay(meta.title, req.operator_uid, req.acted_at),
   }
 }
 
